@@ -37,6 +37,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
