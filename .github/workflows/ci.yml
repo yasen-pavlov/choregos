@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main, feat/initial-implementation]
+    branches: [main]
   pull_request:
 permissions:
   contents: read
