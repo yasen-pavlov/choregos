@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}decisions · choregos{% endblock %}
+{% block content %}
+<section class="panel scroll">
+  <h2>decision log</h2>
+  <table class="grid">
+    <thead><tr><th>time</th><th>role</th><th>change</th><th>reason</th><th>actions</th></tr></thead>
+    <tbody>
+      {% for decision in decisions %}
+      <tr class="decision{% if decision.would %} would{% endif %}">
+        <td class="mono dim" title="{{ view::iso(decision.timestamp) }}">{{ view::clock(decision.timestamp) }}</td>
+        <td class="mono">{{ view::opt(decision.role) }}</td>
+        <td>{{ view::transition(decision.from, decision.to) }}</td>
+        <td>{{ decision.reason }}</td>
+        <td>{% for action in decision.actions %}<span class="action mono">{% if decision.would %}would: {% endif %}{{ action }}</span>{% else %}<span class="dim">none</span>{% endfor %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">No decisions yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

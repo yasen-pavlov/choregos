@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}bus · choregos{% endblock %}
+{% block content %}
+<form class="panel filters" method="get" action="/bus">
+  <label>LA <input name="la" value="{{ filter.la_text() }}" inputmode="numeric" size="3" placeholder="0–15"></label>
+  <label>opcode <input name="opcode" value="{{ filter.opcode_text() }}" class="mono" size="4" placeholder="82"></label>
+  <label class="check"><input type="checkbox" name="hide_decisions"{% if filter.hide_decisions %} checked{% endif %}> hide decisions</label>
+  <button type="submit">filter</button>
+  <a href="/bus">clear</a>
+  <span class="hint live">live · newest first · last 2000 frames · resyncs on reconnect</span>
+</form>
+<div class="panel scroll" hx-ext="sse" sse-connect="{{ stream_url }}">
+  {# `reset` (on every (re)connect or lag) replaces the table from the server's buffer; #}
+  {# `row` prepends one live frame or decision. #}
+  <div hidden sse-swap="reset" hx-target="#bus-rows" hx-swap="innerHTML"></div>
+  <table class="grid bus">
+    <thead><tr><th>time</th><th></th><th>from</th><th>to</th><th>op</th><th>name</th><th>operands</th></tr></thead>
+    <tbody id="bus-rows" sse-swap="row" hx-swap="afterbegin">
+      {% include "partials/bus_rows.html" %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

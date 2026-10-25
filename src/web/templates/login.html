@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}sign in · choregos{% endblock %}
+{% block content %}
+<section class="panel login">
+  <h1>choregos</h1>
+  {% if let Some(error) = error %}<div class="flash err" role="alert">{{ error }}</div>{% endif %}
+  <a class="button primary" href="/login/oidc">Sign in with single sign-on</a>
+  <p class="hint"><a href="/login/local">Local break-glass login</a></p>
+</section>
+{% endblock %}

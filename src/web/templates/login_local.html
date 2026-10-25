@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}local login · choregos{% endblock %}
+{% block content %}
+<section class="panel login">
+  <h1>choregos</h1>
+  <p class="hint">Break-glass login for when single sign-on is unavailable.</p>
+  {% if let Some(error) = error %}<div class="flash err" role="alert">{{ error }}</div>{% endif %}
+  <form method="post" action="/login/local" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>username <input name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" required autofocus></label>
+    <label>password <input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+  <p class="hint"><a href="/login">Back to single sign-on</a></p>
+</section>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}config · choregos{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>configuration</h2>
+  <p class="hint">Secrets are never shown or accepted here; they come from environment variables. Save validates, writes atomically and reloads.</p>
+  {{ form|safe }}
+</section>
+{% endblock %}
