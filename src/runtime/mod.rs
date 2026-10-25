@@ -9,7 +9,10 @@ use crate::{
     cec::{Frame, frame::physical_address, opcode},
     config::{Config, ConfigError},
     engine::{Engine, Event},
-    state::*,
+    state::{
+        AppState, BusEntryView, Command, CommandError, DecisionView, FrameDirection, FrameView,
+        HaEntityView, HaView, Mode, RoleView, Snapshot, UiEvent,
+    },
 };
 use chrono::{DateTime, Utc};
 use std::{
@@ -105,6 +108,255 @@ impl Adapters {
     }
 }
 
+struct Runtime {
+    state: AppState,
+    path: PathBuf,
+    tx: mpsc::Sender<Input>,
+    engine: Engine,
+    adapters: Option<Adapters>,
+    snapshot: Snapshot,
+    last_config: Arc<Config>,
+    last_states: String,
+    removed_roles: BTreeSet<String>,
+}
+
+impl Runtime {
+    fn new(
+        state: AppState,
+        path: PathBuf,
+        tx: mpsc::Sender<Input>,
+        engine: Engine,
+        adapters: Adapters,
+    ) -> Self {
+        Self {
+            snapshot: state.snapshot(),
+            last_config: engine.config.clone(),
+            state,
+            path,
+            tx,
+            engine,
+            adapters: Some(adapters),
+            last_states: String::new(),
+            removed_roles: BTreeSet::new(),
+        }
+    }
+
+    fn adapters(&self) -> &Adapters {
+        self.adapters
+            .as_ref()
+            .expect("adapters running outside reload")
+    }
+
+    async fn handle_input(
+        &mut self,
+        input: Input,
+        now: Instant,
+        wall: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let mut ui_events = vec![];
+        let events = match input {
+            Input::Event(event) => {
+                if let Event::Frame(frame) = &event {
+                    let view = frame_view(frame, wall, FrameDirection::Received, &self.engine);
+                    push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
+                    ui_events.push(UiEvent::Frame(view));
+                }
+                vec![event]
+            }
+            Input::Connection { mqtt, connected } => self.handle_connection(mqtt, connected),
+            Input::Request(Request::Command(command, reply)) => {
+                self.handle_command(command, reply).await
+            }
+            Input::Request(Request::SaveConfig(text, reply)) => {
+                self.handle_config_save(text, reply).await
+            }
+        };
+        self.apply_events(events, now, wall, &mut ui_events);
+        self.publish_snapshot(now, wall, ui_events)
+    }
+
+    fn handle_connection(&mut self, mqtt: bool, connected: bool) -> Vec<Event> {
+        if mqtt {
+            self.snapshot.connections.mqtt_connected = connected;
+        } else {
+            self.snapshot.connections.ha_connected = connected;
+        }
+        if mqtt && connected {
+            self.last_states.clear();
+        }
+        disconnected_events(mqtt, connected, &self.engine.config)
+    }
+
+    async fn handle_command(
+        &mut self,
+        command: Command,
+        reply: Option<oneshot::Sender<Result<(), CommandError>>>,
+    ) -> Vec<Event> {
+        let result = match validate_command(&command, &self.engine) {
+            Ok(()) => {
+                if let Command::SetMode(mode) = command {
+                    persist_mode(mode, &self.path)
+                        .await
+                        .map_err(CommandError::from)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let success = result.is_ok();
+        if success && let Command::SetMode(mode) = command {
+            self.adapters()
+                .executor
+                .active
+                .store(mode == Mode::Active, Ordering::Release);
+        }
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        } else if let Err(error) = result {
+            tracing::warn!(error = %error, "MQTT command rejected");
+        }
+        if success {
+            vec![Event::Command(command)]
+        } else {
+            vec![]
+        }
+    }
+
+    async fn handle_config_save(
+        &mut self,
+        text: String,
+        reply: oneshot::Sender<Result<(), ConfigError>>,
+    ) -> Vec<Event> {
+        match reload(&text, &self.engine.config, &self.path).await {
+            Ok(config) => {
+                self.restart_adapters(&config).await;
+                let _ = reply.send(Ok(()));
+                // ConfigReloaded updates the model; the retained Online LWT performs resync.
+                vec![
+                    Event::BridgeOffline,
+                    Event::ConfigReloaded(Arc::new(config)),
+                ]
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                vec![]
+            }
+        }
+    }
+
+    async fn restart_adapters(&mut self, config: &Config) {
+        self.removed_roles.extend(
+            self.engine
+                .config
+                .device
+                .iter()
+                .filter(|device| !config.device.iter().any(|new| new.role == device.role))
+                .map(|device| device.role.clone()),
+        );
+        self.removed_roles
+            .retain(|role| !config.device.iter().any(|device| &device.role == role));
+        self.adapters()
+            .executor
+            .active
+            .store(config.mode == Mode::Active, Ordering::Release);
+        self.adapters
+            .take()
+            .expect("adapters running before reload")
+            .stop()
+            .await;
+        self.adapters = Some(Adapters::start(
+            config,
+            self.tx.clone(),
+            &self.removed_roles.iter().cloned().collect::<Vec<_>>(),
+        ));
+        self.snapshot.connections.mqtt_connected = false;
+        self.snapshot.connections.ha_connected = false;
+        self.last_states.clear();
+    }
+
+    fn apply_events(
+        &mut self,
+        events: Vec<Event>,
+        now: Instant,
+        wall: DateTime<Utc>,
+        ui_events: &mut Vec<UiEvent>,
+    ) {
+        for event in events {
+            let actions = self.engine.handle(event, now, wall);
+            self.record_decisions(wall, ui_events);
+            for frame in self.adapters().dispatch(actions, &self.engine) {
+                let view = frame_view(&frame, wall, FrameDirection::Sent, &self.engine);
+                push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
+                ui_events.push(UiEvent::Frame(view));
+            }
+        }
+    }
+
+    fn record_decisions(&mut self, wall: DateTime<Utc>, ui_events: &mut Vec<UiEvent>) {
+        for decision in &self.engine.decisions {
+            tracing::info!(event = "decision", role = ?decision.role, from = ?decision.from, to = ?decision.to, reason = %decision.reason);
+            let view = DecisionView {
+                timestamp: wall,
+                role: decision.role.clone(),
+                from: decision.from,
+                to: decision.to,
+                reason: decision.reason.clone(),
+                actions: decision
+                    .actions
+                    .iter()
+                    .map(|action| {
+                        format!(
+                            "{}{}",
+                            if executor::suppressed(self.engine.mode(), action) {
+                                "would: "
+                            } else {
+                                ""
+                            },
+                            serde_json::to_string(action).expect("serializable action"),
+                        )
+                    })
+                    .collect(),
+                would: self.engine.mode() == Mode::Shadow,
+            };
+            push_ring(&mut self.snapshot.decisions, view.clone(), 2000);
+            ui_events.push(UiEvent::Decision(view));
+        }
+    }
+
+    fn publish_snapshot(
+        &mut self,
+        now: Instant,
+        wall: DateTime<Utc>,
+        ui_events: Vec<UiEvent>,
+    ) -> anyhow::Result<()> {
+        update_snapshot(&mut self.snapshot, &self.engine, now, wall);
+        if !Arc::ptr_eq(&self.last_config, &self.engine.config) {
+            self.state
+                .replace_config_text(self.engine.config.redacted_text()?);
+            self.last_config = self.engine.config.clone();
+        }
+        let entity_states = format!(
+            "{:?}{:?}{:?}{:?}{:?}",
+            self.snapshot.mode,
+            self.snapshot.bridge_online,
+            self.snapshot.active_role,
+            self.snapshot.conflicts.len(),
+            self.snapshot
+                .roles
+                .iter()
+                .map(|role| role.power)
+                .collect::<Vec<_>>(),
+        );
+        if entity_states != self.last_states {
+            self.adapters().executor.mqtt.states(&self.snapshot);
+            self.last_states = entity_states;
+        }
+        self.state.publish(self.snapshot.clone(), ui_events);
+        Ok(())
+    }
+}
+
 pub async fn run(config: Config, path: PathBuf) -> anyhow::Result<()> {
     let state = AppState::new(config.clone(), &path)?;
     let listener = tokio::net::TcpListener::bind(config.web.bind).await?;
@@ -114,24 +366,22 @@ pub async fn run(config: Config, path: PathBuf) -> anyhow::Result<()> {
         async move {
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
-                    let _ = stopped.wait_for(|v| *v).await;
+                    let _ = stopped.wait_for(|value| *value).await;
                 })
                 .await
         }
     });
     let (tx, mut rx) = mpsc::channel(256);
     state.attach(tx.clone());
-    let mut engine = Engine::new(config, Instant::now());
-    let mut adapters = Adapters::start(&engine.config, tx.clone(), &[]);
+    let engine = Engine::new(config, Instant::now());
+    let adapters = Adapters::start(&engine.config, tx.clone(), &[]);
     // The retained bridge LWT initiates the single startup resync.
-    let mut snapshot = state.snapshot();
-    let mut last_config = engine.config.clone();
-    let mut last_states = String::new();
-    let mut removed_roles = BTreeSet::new();
+    let mut runtime = Runtime::new(state, path, tx, engine, adapters);
     let shutdown_signal = shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {
-        let deadline = engine
+        let deadline = runtime
+            .engine
             .next_deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
         let input = tokio::select! {
@@ -139,154 +389,17 @@ pub async fn run(config: Config, path: PathBuf) -> anyhow::Result<()> {
             _ = tokio::time::sleep_until(deadline.into()) => Input::Event(Event::Tick),
             input = rx.recv() => match input { Some(input) => input, None => break },
         };
-        let now = Instant::now();
-        let wall = Utc::now();
-        let mut ui_events = vec![];
-        let events = match input {
-            Input::Event(event) => {
-                if let Event::Frame(frame) = &event {
-                    let view = frame_view(frame, wall, FrameDirection::Received, &engine);
-                    push_ring(&mut snapshot.recent_frames, view.clone(), 2000);
-                    ui_events.push(UiEvent::Frame(view));
-                }
-                vec![event]
-            }
-            Input::Connection { mqtt, connected } => {
-                if mqtt {
-                    snapshot.connections.mqtt_connected = connected;
-                } else {
-                    snapshot.connections.ha_connected = connected;
-                }
-                if mqtt && connected {
-                    last_states.clear();
-                }
-                disconnected_events(mqtt, connected, &engine.config)
-            }
-            Input::Request(Request::Command(command, reply)) => {
-                let result = match validate_command(&command, &engine) {
-                    Ok(()) => {
-                        if let Command::SetMode(mode) = command {
-                            persist_mode(mode, &path).await.map_err(CommandError::from)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    Err(error) => Err(error),
-                };
-                let success = result.is_ok();
-                if success && let Command::SetMode(mode) = command {
-                    adapters
-                        .executor
-                        .active
-                        .store(mode == Mode::Active, Ordering::Release);
-                }
-                if let Some(reply) = reply {
-                    let _ = reply.send(result);
-                } else if let Err(error) = result {
-                    tracing::warn!(error = %error, "MQTT command rejected");
-                }
-                if success {
-                    vec![Event::Command(command)]
-                } else {
-                    vec![]
-                }
-            }
-            Input::Request(Request::SaveConfig(text, reply)) => {
-                match reload(&text, &engine.config, &path).await {
-                    Ok(config) => {
-                        removed_roles.extend(
-                            engine
-                                .config
-                                .device
-                                .iter()
-                                .filter(|d| !config.device.iter().any(|new| new.role == d.role))
-                                .map(|d| d.role.clone()),
-                        );
-                        removed_roles.retain(|role| !config.device.iter().any(|d| &d.role == role));
-                        adapters
-                            .executor
-                            .active
-                            .store(config.mode == Mode::Active, Ordering::Release);
-                        adapters.stop().await;
-                        adapters = Adapters::start(
-                            &config,
-                            tx.clone(),
-                            &removed_roles.iter().cloned().collect::<Vec<_>>(),
-                        );
-                        snapshot.connections.mqtt_connected = false;
-                        snapshot.connections.ha_connected = false;
-                        last_states.clear();
-                        let _ = reply.send(Ok(()));
-                        // ConfigReloaded updates the model; the retained Online LWT performs resync.
-                        vec![
-                            Event::BridgeOffline,
-                            Event::ConfigReloaded(Arc::new(config)),
-                        ]
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        vec![]
-                    }
-                }
-            }
-        };
-        for event in events {
-            let actions = engine.handle(event, now, wall);
-            for decision in &engine.decisions {
-                tracing::info!(event = "decision", role = ?decision.role, from = ?decision.from, to = ?decision.to, reason = %decision.reason);
-                let view = DecisionView {
-                    timestamp: wall,
-                    role: decision.role.clone(),
-                    from: decision.from,
-                    to: decision.to,
-                    reason: decision.reason.clone(),
-                    actions: decision
-                        .actions
-                        .iter()
-                        .map(|a| {
-                            format!(
-                                "{}{}",
-                                if executor::suppressed(engine.mode(), a) {
-                                    "would: "
-                                } else {
-                                    ""
-                                },
-                                serde_json::to_string(a).expect("serializable action")
-                            )
-                        })
-                        .collect(),
-                    would: engine.mode() == Mode::Shadow,
-                };
-                push_ring(&mut snapshot.decisions, view.clone(), 2000);
-                ui_events.push(UiEvent::Decision(view));
-            }
-            for frame in adapters.dispatch(actions, &engine) {
-                let view = frame_view(&frame, wall, FrameDirection::Sent, &engine);
-                push_ring(&mut snapshot.recent_frames, view.clone(), 2000);
-                ui_events.push(UiEvent::Frame(view));
-            }
-        }
-        update_snapshot(&mut snapshot, &engine, now, wall);
-        if !Arc::ptr_eq(&last_config, &engine.config) {
-            state.replace_config_text(engine.config.redacted_text()?);
-            last_config = engine.config.clone();
-        }
-        let entity_states = format!(
-            "{:?}{:?}{:?}{:?}{:?}",
-            snapshot.mode,
-            snapshot.bridge_online,
-            snapshot.active_role,
-            snapshot.conflicts.len(),
-            snapshot.roles.iter().map(|r| r.power).collect::<Vec<_>>()
-        );
-        if entity_states != last_states {
-            adapters.executor.mqtt.states(&snapshot);
-            last_states = entity_states;
-        }
-        state.publish(snapshot.clone(), ui_events);
+        runtime
+            .handle_input(input, Instant::now(), Utc::now())
+            .await?;
     }
     let _ = shutdown.send(true);
-    adapters.stop().await;
+    runtime
+        .adapters
+        .take()
+        .expect("adapters running at shutdown")
+        .stop()
+        .await;
     match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
         Ok(result) => result??,
         Err(_) => {

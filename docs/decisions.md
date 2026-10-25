@@ -2,6 +2,22 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-25 — Sonar maintainability refactor
+
+- Replace production wildcard imports with the explicit opcode and state types
+  each module consumes.
+- Split configuration validation by existing sections and device matching/policy,
+  preserving validation order and error messages.
+- Dispatch engine events through named handlers; keep frame learning, identity
+  reconciliation, volume forwarding, warming and timer phases separate while
+  retaining their action/decision ordering and injected-time behavior.
+- Group runtime loop state in a private owner with input, command, connection,
+  reload, effect and snapshot methods. Adapter ownership is temporarily absent
+  only while draining/restarting during a config reload.
+- This is a behavior-preserving refactor with no public interface changes or rule
+  suppressions. Extracted engine phases reuse action buffers rather than adding
+  per-frame temporary action allocations.
+
 ## 2026-10-25 — Lead-approved core/runtime review corrections
 
 Engine review decisions:

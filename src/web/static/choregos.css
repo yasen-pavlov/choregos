@@ -76,7 +76,7 @@ main { padding: 12px; display: flex; flex-direction: column; gap: 12px; max-widt
 .banner.warming { border-color: var(--amber); background: #261f0e; color: var(--amber); }
 #flash:empty { display: none; }
 #flash { position: fixed; right: 12px; bottom: 12px; z-index: 20; max-width: min(480px, calc(100vw - 24px)); }
-.flash { padding: 6px 10px; border-radius: var(--radius); border: 1px solid; margin-bottom: 8px; }
+.flash { display: block; padding: 6px 10px; border-radius: var(--radius); border: 1px solid; margin-bottom: 8px; }
 #flash .flash { animation: toast 8s forwards; }
 @keyframes toast { 0%, 85% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
 .flash.ok { border-color: var(--green); background: #0f2416; color: #8ce0a0; }

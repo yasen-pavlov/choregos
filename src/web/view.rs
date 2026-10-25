@@ -59,7 +59,7 @@ fn ago_at(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
 pub(crate) fn opt<T: std::fmt::Display>(value: &Option<T>) -> String {
     value
         .as_ref()
-        .map_or_else(|| "—".to_owned(), |value| value.to_string())
+        .map_or_else(|| "—".to_owned(), ToString::to_string)
 }
 
 pub(crate) fn hex_bytes(bytes: &[u8]) -> String {

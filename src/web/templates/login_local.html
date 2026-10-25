@@ -7,7 +7,7 @@
   {% if let Some(error) = error %}<div class="flash err" role="alert">{{ error }}</div>{% endif %}
   <form method="post" action="/login/local" class="stack">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
-    <label>username <input name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" required autofocus></label>
+    <label>username <input name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" required></label>
     <label>password <input name="password" type="password" autocomplete="current-password" required></label>
     <button type="submit" class="primary">Sign in</button>
   </form>
