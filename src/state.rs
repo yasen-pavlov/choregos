@@ -284,7 +284,7 @@ pub struct LocalAuthConfig {
     pub password: Secret,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RolePower {
     Off,
@@ -325,6 +325,7 @@ pub struct BusEntryView {
     pub power: BusPower,
     pub last_seen: Option<DateTime<Utc>>,
     pub identified: bool,
+    pub verified: bool,
     pub matched_role: Option<String>,
 }
 
@@ -377,7 +378,7 @@ pub enum FrameDirection {
     Sent,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DecisionView {
     pub timestamp: DateTime<Utc>,
     pub role: Option<String>,

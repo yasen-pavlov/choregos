@@ -1,4 +1,6 @@
 use super::{ha::Ha, mqtt::Mqtt, wol};
+#[cfg(test)]
+use crate::action::IdentifyQueries;
 use crate::{
     action::Action,
     config::{Config, WakeConfig},
@@ -54,9 +56,17 @@ impl Executor {
             }
         };
         match action {
-            Action::Identify { la } => {
-                for opcode in [0x83, 0x8c, 0x46] {
-                    send(*la, &[opcode]);
+            Action::Identify { la, queries } => {
+                if *la < 15 && *la != config.bridge.logical_address {
+                    for (needed, opcode) in [
+                        (queries.physical, 0x83),
+                        (queries.vendor, 0x8c),
+                        (queries.osd, 0x46),
+                    ] {
+                        if needed {
+                            send(*la, &[opcode]);
+                        }
+                    }
                 }
             }
             Action::PresencePoll { la } => send(*la, &[0x8f]),
@@ -146,7 +156,13 @@ mod tests {
             assert!(suppressed(Mode::Shadow, &effect));
             assert!(!suppressed(Mode::Active, &effect));
         }
-        assert!(!suppressed(Mode::Shadow, &Action::Identify { la: 4 }));
+        assert!(!suppressed(
+            Mode::Shadow,
+            &Action::Identify {
+                la: 4,
+                queries: IdentifyQueries::ALL
+            }
+        ));
         assert!(!suppressed(Mode::Shadow, &Action::Resync));
     }
 }
@@ -180,7 +196,13 @@ mod behavior_tests {
                 active: Arc::new(AtomicBool::new(live_active)),
             };
             for (action, count) in [
-                (Action::Identify { la: 4 }, 3),
+                (
+                    Action::Identify {
+                        la: 4,
+                        queries: IdentifyQueries::ALL,
+                    },
+                    3,
+                ),
                 (Action::Resync, 5),
                 (Action::PresencePoll { la: 8 }, 1),
                 (
@@ -231,7 +253,10 @@ mod behavior_tests {
             active: Arc::new(AtomicBool::new(true)),
         };
         for action in [
-            Action::Identify { la: 4 },
+            Action::Identify {
+                la: 4,
+                queries: IdentifyQueries::ALL,
+            },
             Action::Resync,
             Action::PresencePoll { la: 8 },
             Action::CecSend {

@@ -6,7 +6,7 @@ pub mod wol;
 
 use crate::{
     action::Action,
-    cec::{Frame, frame::physical_address, opcode},
+    cec::{Frame, bus::LearnedIdentity, frame::physical_address, opcode},
     config::{Config, ConfigError},
     engine::{Engine, Event},
     state::{
@@ -15,6 +15,7 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, VecDeque},
     path::{Path, PathBuf},
@@ -108,6 +109,167 @@ impl Adapters {
     }
 }
 
+const IDENTITY_LIFETIME_DAYS: i64 = 30;
+
+#[derive(Default, Deserialize, Serialize)]
+struct PersistedState {
+    version: u32,
+    identities: Vec<LearnedIdentity>,
+    decisions: Vec<DecisionView>,
+}
+
+impl PersistedState {
+    async fn load(path: &Path, wall: DateTime<Utc>) -> Option<Self> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot read persisted state; starting empty");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(mut state) if state.version == 1 => {
+                state.identities.retain(|identity| {
+                    wall.signed_duration_since(identity.confirmed_at)
+                        <= chrono::Duration::days(IDENTITY_LIFETIME_DAYS)
+                });
+                Some(state)
+            }
+            Ok(_) => {
+                tracing::warn!("unknown persisted state version; starting empty");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "corrupt persisted state; starting empty");
+                None
+            }
+        }
+    }
+
+    fn identities_match(identities: &[LearnedIdentity], engine: &Engine) -> bool {
+        let mut current = engine.bus.entries.iter().filter(|(la, entry)| {
+            **la != engine.bus.bridge
+                && entry.confirmed_at.is_some()
+                && (entry.physical.is_some() || entry.vendor.is_some() || entry.osd.is_some())
+        });
+        identities.iter().all(|saved| {
+            current.next().is_some_and(|(&la, entry)| {
+                saved.la == la
+                    && saved.physical == entry.physical
+                    && saved.vendor == entry.vendor
+                    && saved.osd == entry.osd
+                    && saved.device_type == entry.device_type
+                    && Some(saved.confirmed_at) == entry.confirmed_at
+            })
+        }) && current.next().is_none()
+    }
+
+    fn capture(engine: &Engine, decisions: &VecDeque<DecisionView>) -> Self {
+        Self {
+            version: 1,
+            identities: engine
+                .bus
+                .entries
+                .iter()
+                .filter(|(la, entry)| {
+                    **la != engine.bus.bridge
+                        && entry.confirmed_at.is_some()
+                        && (entry.physical.is_some()
+                            || entry.vendor.is_some()
+                            || entry.osd.is_some())
+                })
+                .map(|(&la, entry)| LearnedIdentity {
+                    la,
+                    physical: entry.physical,
+                    vendor: entry.vendor,
+                    osd: entry.osd.clone(),
+                    device_type: entry.device_type,
+                    confirmed_at: entry.confirmed_at.expect("filtered confirmation time"),
+                })
+                .collect(),
+            decisions: decisions.iter().cloned().collect(),
+        }
+    }
+}
+
+const STATE_WRITE_RETRY: Duration = Duration::from_secs(60);
+
+struct StateWriter {
+    updates: watch::Sender<Option<Arc<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StateWriter {
+    fn start(path: PathBuf) -> Self {
+        let (updates, mut receiver) = watch::channel::<Option<Arc<Vec<u8>>>>(None);
+        let task = tokio::spawn(async move {
+            let mut pending = None;
+            let mut retry_at = None;
+            let mut failed = false;
+            let mut closing = false;
+            loop {
+                if pending.is_none() {
+                    if receiver.changed().await.is_err() {
+                        break;
+                    }
+                    pending = receiver.borrow_and_update().clone();
+                }
+                if let Some(deadline) = retry_at.take() {
+                    tokio::select! {
+                        result = receiver.changed(), if !closing => {
+                            if result.is_ok() {
+                                pending = receiver.borrow_and_update().clone();
+                            } else {
+                                // Shutdown: make the final attempt now rather than after the backoff.
+                                closing = true;
+                            }
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
+                let Some(bytes) = pending.as_ref() else {
+                    continue;
+                };
+                match persist_bytes(&path, bytes).await {
+                    Ok(()) => {
+                        if failed {
+                            tracing::info!("state persistence recovered");
+                        }
+                        failed = false;
+                        pending = None;
+                        if closing {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if !failed {
+                            tracing::warn!(error = %error, "cannot persist state; retrying after 60 seconds or on new state");
+                        }
+                        failed = true;
+                        if closing {
+                            break;
+                        }
+                        retry_at = Some(tokio::time::Instant::now() + STATE_WRITE_RETRY);
+                    }
+                }
+            }
+        });
+        Self { updates, task }
+    }
+
+    fn submit(&self, bytes: Vec<u8>) {
+        self.updates.send_replace(Some(Arc::new(bytes)));
+    }
+
+    async fn flush(self) {
+        drop(self.updates);
+        if let Err(error) = self.task.await {
+            tracing::warn!(error = %error, "state writer stopped unexpectedly");
+        }
+    }
+}
+
 struct Runtime {
     state: AppState,
     path: PathBuf,
@@ -117,18 +279,44 @@ struct Runtime {
     snapshot: Snapshot,
     last_states: String,
     removed_roles: BTreeSet<String>,
+    writer: Option<StateWriter>,
+    last_identities: Option<Vec<LearnedIdentity>>,
+    decisions_dirty: bool,
 }
 
 impl Runtime {
-    fn new(
+    async fn new(
         state: AppState,
         path: PathBuf,
         tx: mpsc::Sender<Input>,
-        engine: Engine,
+        config: Config,
         adapters: Adapters,
     ) -> Self {
-        Self {
-            snapshot: state.snapshot(),
+        let now = Instant::now();
+        let wall = Utc::now();
+        let state_path = path.with_file_name("choregos.state.json");
+        let restored = PersistedState::load(&state_path, wall)
+            .await
+            .unwrap_or_default();
+        let engine = Engine::new(config, now, restored.identities);
+        let mut snapshot = state.snapshot();
+        snapshot.decisions = restored.decisions.into_iter().rev().take(2000).collect();
+        snapshot.decisions.make_contiguous().reverse();
+        push_ring(
+            &mut snapshot.decisions,
+            DecisionView {
+                timestamp: wall,
+                role: None,
+                from: None,
+                to: None,
+                reason: "service_started".into(),
+                actions: vec![],
+                would: false,
+            },
+            2000,
+        );
+        let mut runtime = Self {
+            snapshot,
             state,
             path,
             tx,
@@ -136,7 +324,12 @@ impl Runtime {
             adapters: Some(adapters),
             last_states: String::new(),
             removed_roles: BTreeSet::new(),
-        }
+            writer: Some(StateWriter::start(state_path)),
+            last_identities: None,
+            decisions_dirty: true,
+        };
+        runtime.publish_snapshot(now, wall, vec![]).await;
+        runtime
     }
 
     fn adapters(&self) -> &Adapters {
@@ -170,7 +363,8 @@ impl Runtime {
             }
         };
         self.apply_events(events, now, wall, &mut ui_events);
-        self.publish_snapshot(now, wall, ui_events)
+        self.publish_snapshot(now, wall, ui_events).await;
+        Ok(())
     }
 
     fn handle_connection(&mut self, mqtt: bool, connected: bool) -> Vec<Event> {
@@ -320,16 +514,17 @@ impl Runtime {
                 would: self.engine.mode() == Mode::Shadow,
             };
             push_ring(&mut self.snapshot.decisions, view.clone(), 2000);
+            self.decisions_dirty = true;
             ui_events.push(UiEvent::Decision(view));
         }
     }
 
-    fn publish_snapshot(
+    async fn publish_snapshot(
         &mut self,
         now: Instant,
         wall: DateTime<Utc>,
         ui_events: Vec<UiEvent>,
-    ) -> anyhow::Result<()> {
+    ) {
         update_snapshot(&mut self.snapshot, &self.engine, now, wall);
         let entity_states = format!(
             "{:?}{:?}{:?}{:?}{:?}",
@@ -347,8 +542,28 @@ impl Runtime {
             self.adapters().executor.mqtt.states(&self.snapshot);
             self.last_states = entity_states;
         }
+        if self.decisions_dirty
+            || self
+                .last_identities
+                .as_ref()
+                .is_none_or(|saved| !PersistedState::identities_match(saved, &self.engine))
+        {
+            let saved = PersistedState::capture(&self.engine, &self.snapshot.decisions);
+            match serde_json::to_vec(&saved) {
+                Ok(bytes) => {
+                    self.writer
+                        .as_ref()
+                        .expect("state writer running")
+                        .submit(bytes);
+                    self.last_identities = Some(saved.identities);
+                    self.decisions_dirty = false;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot encode persisted state; continuing")
+                }
+            }
+        }
         self.state.publish(self.snapshot.clone(), ui_events);
-        Ok(())
     }
 
     async fn run_loop(
@@ -368,6 +583,9 @@ impl Runtime {
                 input = rx.recv() => match input { Some(input) => input, None => break },
             };
             self.handle_input(input, Instant::now(), Utc::now()).await?;
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.flush().await;
         }
         Ok(())
     }
@@ -389,10 +607,9 @@ pub async fn run(config: Config, config_text: String, path: PathBuf) -> anyhow::
     });
     let (tx, mut rx) = mpsc::channel(256);
     state.attach(tx.clone());
-    let engine = Engine::new(config, Instant::now());
-    let adapters = Adapters::start(&engine.config, tx.clone(), &[]);
+    let adapters = Adapters::start(&config, tx.clone(), &[]);
     // The retained bridge LWT initiates the single startup resync.
-    let mut runtime = Runtime::new(state, path, tx, engine, adapters);
+    let mut runtime = Runtime::new(state, path, tx, config, adapters).await;
     runtime.run_loop(&mut rx, shutdown_signal()).await?;
     let _ = shutdown.send(true);
     runtime
@@ -453,6 +670,7 @@ fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandErr
         Command::SendRaw { to, data } if *to > 15 || data.is_empty() || data.len() > 15 => {
             Some("invalid CEC destination or payload length")
         }
+        Command::Identify(la) if *la == engine.bus.bridge => Some("cannot identify the bridge"),
         Command::Takeover(role) | Command::Standby(role) if !engine.roles.contains_key(role) => {
             Some("unknown role")
         }
@@ -499,12 +717,12 @@ async fn reload(text: &str, current: &Config, path: &Path) -> Result<Config, Con
     let mut config = Config::parse(text)?;
     validate_reload(&config, current)?;
     config.secrets = current.secrets.clone();
-    persist_text(text, path).await?;
+    persist_bytes(path, text.as_bytes()).await?;
     Ok(config)
 }
 #[cfg(test)]
 pub async fn persist(config: &Config, path: &Path) -> Result<(), ConfigError> {
-    persist_text(&config.redacted_text()?, path).await
+    persist_bytes(path, config.redacted_text()?.as_bytes()).await
 }
 async fn persist_mode(mode: Mode, path: &Path) -> Result<String, ConfigError> {
     #[derive(serde::Deserialize)]
@@ -515,10 +733,10 @@ async fn persist_mode(mode: Mode, path: &Path) -> Result<String, ConfigError> {
     Config::parse(&text)?;
     let span: ModeSpan = toml::from_str(&text).map_err(|_| ConfigError::Parse)?;
     text.replace_range(span.mode.span(), &format!("\"{mode}\""));
-    persist_text(&text, path).await?;
+    persist_bytes(path, text.as_bytes()).await?;
     Ok(text)
 }
-async fn persist_text(text: &str, path: &Path) -> Result<(), ConfigError> {
+async fn persist_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     use tokio::io::AsyncWriteExt;
     let parent = path
         .parent()
@@ -532,7 +750,7 @@ async fn persist_text(text: &str, path: &Path) -> Result<(), ConfigError> {
             .mode(0o600)
             .open(&temporary)
             .await?;
-        file.write_all(text.as_bytes()).await?;
+        file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
         tokio::fs::rename(&temporary, path).await?;
@@ -541,7 +759,7 @@ async fn persist_text(text: &str, path: &Path) -> Result<(), ConfigError> {
         }
         .await
         {
-            tracing::warn!(error = %error, "config renamed but directory sync failed; crash durability is not guaranteed");
+            tracing::warn!(error = %error, "file renamed but directory sync failed; crash durability is not guaranteed");
         }
         Ok::<(), std::io::Error>(())
     }
@@ -579,7 +797,7 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
                 vendor: entry.and_then(|e| e.vendor).map(|v| format!("{v:06X}")),
                 osd: entry.and_then(|e| e.osd.clone()),
                 last_event: engine.roles[&device.role].last_event.clone(),
-                last_seen: entry.map(|e| timestamp(e.last_seen)),
+                last_seen: entry.and_then(|e| e.last_seen).map(timestamp),
                 conflicted: engine.identity.blocked.contains(&device.role),
             }
         })
@@ -595,8 +813,9 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
             vendor: entry.vendor.map(|v| format!("{v:06X}")),
             osd: entry.osd.clone(),
             power: entry.power,
-            last_seen: Some(timestamp(entry.last_seen)),
+            last_seen: entry.last_seen.map(timestamp),
             identified: entry.identified,
+            verified: entry.verified,
             matched_role: engine
                 .identity
                 .roles
@@ -701,9 +920,10 @@ mod tests {
     #[test]
     fn rejects_unsafe_manual_commands_before_acknowledging() {
         let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let engine = Engine::new(config, Instant::now());
+        let engine = Engine::new(config, Instant::now(), vec![]);
         for command in [
             Command::Identify(15),
+            Command::Identify(engine.bus.bridge),
             Command::SendRaw {
                 to: 16,
                 data: vec![0x36],
@@ -798,7 +1018,7 @@ mod review_tests {
             [Event::BridgeOffline]
         ));
         assert!(disconnected_events(true, true, &config).is_empty());
-        let mut engine = Engine::new(config.clone(), now);
+        let mut engine = Engine::new(config.clone(), now, vec![]);
         engine.handle(
             Event::HaState {
                 entity: config.tv.entity.clone(),
@@ -838,7 +1058,7 @@ mod review_tests {
         let mut config = config();
         config.mode = Mode::Active;
         let now = Instant::now();
-        let engine = Engine::new(config, now);
+        let engine = Engine::new(config, now, vec![]);
         let (mqtt, mut eventloop) = mqtt::Mqtt::test_transport(true, 16);
         let (ha, _) = ha::Ha::fake();
         let executor = Arc::new(executor::Executor {
@@ -910,5 +1130,112 @@ mod review_tests {
         assert_eq!(received.try_recv().unwrap(), vec![Action::WakeTv]);
         assert_eq!(received.try_recv().unwrap(), vec![Action::WakeTv]);
         assert_eq!(received.try_recv().unwrap(), vec![Action::WakeTv]);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Logs {
+        fn count(&self, message: &str) -> usize {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .matches(message)
+                .count()
+        }
+    }
+
+    async fn eventually(predicate: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !predicate() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "writer did not converge"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_limits_failure_warnings_and_retries_at_sixty_seconds_or_new_state() {
+        let logs = Logs(Arc::new(Mutex::new(vec![])));
+        let output = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || output.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.state.json");
+        std::fs::create_dir(&path).unwrap();
+        let writer = StateWriter::start(path.clone());
+        writer.submit(b"first".to_vec());
+        eventually(|| logs.count("cannot persist state") == 1).await;
+        std::fs::remove_dir(&path).unwrap();
+        tokio::time::advance(Duration::from_secs(59)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!path.exists(), "writer retried before 60 seconds");
+        assert_eq!(logs.count("cannot persist state"), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        eventually(|| std::fs::read(&path).is_ok_and(|bytes| bytes == b"first")).await;
+        eventually(|| logs.count("state persistence recovered") == 1).await;
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        writer.submit(b"second".to_vec());
+        eventually(|| logs.count("cannot persist state") == 2).await;
+        std::fs::remove_dir(&path).unwrap();
+        writer.submit(b"superseded".to_vec());
+        writer.submit(b"newest".to_vec());
+        eventually(|| std::fs::read(&path).is_ok_and(|bytes| bytes == b"newest")).await;
+        writer.flush().await;
+        assert_eq!(logs.count("cannot persist state"), 2);
+        assert_eq!(logs.count("state persistence recovered"), 2);
+    }
+
+    #[tokio::test]
+    async fn identity_expiry_keeps_exactly_thirty_days_but_drops_older_confirmations() {
+        let wall: DateTime<Utc> = "2026-10-25T12:00:00Z".parse().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.state.json");
+        let identities = [0, 1]
+            .into_iter()
+            .map(|seconds| LearnedIdentity {
+                la: 4 + seconds as u8,
+                physical: Some(0x2100 + seconds as u16 * 0x100),
+                vendor: Some(0x0010fa),
+                osd: Some("Streamer".into()),
+                device_type: Some(4),
+                confirmed_at: wall
+                    - chrono::Duration::days(30)
+                    - chrono::Duration::seconds(seconds),
+            })
+            .collect();
+        let saved = PersistedState {
+            version: 1,
+            identities,
+            decisions: vec![],
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&saved).unwrap())
+            .await
+            .unwrap();
+        let restored = PersistedState::load(&path, wall).await.unwrap();
+        assert_eq!(restored.identities.len(), 1);
+        assert_eq!(restored.identities[0].la, 4);
     }
 }

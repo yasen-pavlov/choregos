@@ -22,6 +22,7 @@ pub fn resolve(devices: &[DeviceConfig], bus: &BusModel) -> Resolution {
                 .iter()
                 .filter(|(la, entry)| {
                     **la != bus.bridge
+                        && entry.verified
                         && matches.osd.as_ref().is_none_or(|osd| {
                             entry.osd.as_deref().map(str::trim) == Some(osd.trim())
                         })
@@ -72,15 +73,17 @@ mod tests {
     #[test]
     fn ambiguous_roles_and_addresses_are_blocked() {
         let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-        let mut bus = BusModel::new(0, 10);
+        let mut bus = BusModel::new(0, 10, crate::action::IdentifyQueries::ALL);
         for la in [4, 8] {
             bus.handle(
                 &Frame::from_hex(la, 0, "474170706C65205456").unwrap(),
                 Instant::now(),
+                chrono::DateTime::UNIX_EPOCH,
             );
             bus.handle(
                 &Frame::from_hex(la, 15, "870010FA").unwrap(),
                 Instant::now(),
+                chrono::DateTime::UNIX_EPOCH,
             );
         }
         assert!(resolve(&config.device, &bus).blocked.contains("streamer"));

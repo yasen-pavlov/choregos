@@ -40,8 +40,8 @@ primary replay fixture.
 
 - No receiver/TV/Sonos/Kodi protocol implementations: Home Assistant already
   has working integrations; choregos calls HA services.
-- No persistence of bus state across restarts: the bus is re-interrogated on
-  start (§5.6).
+- No persistence of live power or active-source state: the bus is
+  re-interrogated on start (§5.6); learned identities and decisions are retained.
 - No CEC frame decoding beyond what the engine needs (a name table for the UI
   is fine; no full CEC stack).
 - No plugin system. The TV wake path is a two-variant enum, not a plugin.
@@ -205,10 +205,10 @@ prints the resolved config with secrets redacted.
 
 ### 5.1 Bus model
 `BusModel` keeps one entry per logical address 0–14:
-`{physical: Option<u16>, device_type: Option<u8>, vendor: Option<u32>, osd: Option<String>, power: Unknown|On|Standby|Transition, last_seen: Instant, identified: bool}`
+`{physical: Option<u16>, device_type: Option<u8>, vendor: Option<u32>, osd: Option<String>, power: Unknown|On|Standby|Transition, last_seen: Option<Instant>, verified: bool, confirmed_at: Option<DateTime<Utc>>, identified: bool}`
 plus `active_source: Option<u16>` (physical address) and the bridge's own LA.
 Learning rules (all from received frames; sender = `From`):
-- `84 PP PP TT` Report Physical Address (bcast) → physical, device_type, last_seen.
+- `84 PP PP TT` Report Physical Address (bcast) → physical, device_type, last_seen, verified = true, confirmed_at = injected wall time.
 - `87 VV VV VV` Device Vendor ID (bcast) → vendor.
 - `47 <ascii>` Set OSD Name → osd.
 - `82 PP PP` Active Source (bcast) → active_source = PP PP, sender power = On.
@@ -216,13 +216,16 @@ Learning rules (all from received frames; sender = `From`):
 - `36` Standby from a device (to TV or bcast) → sender power = Standby. (From the TV/bridge to others it is a command, not a report.)
 - `90 SS` Report Power Status → sender power per SS (00 On, 01 Standby, 02 →On, 03 →Standby).
 - `04` Image View On / `0D` Text View On (to TV) → sender power = On.
-- Any frame from an LA whose entry is not `identified` and is not the bridge → emit `Action::Identify(la)` (rate-limited by `identify_retry_s`), which sends `83`, `8C`, `46` to that LA. `identified` = physical known and (osd or vendor known).
-- A new `84` from an LA with a different physical address replaces the entry (the device moved or a different device took the LA).
+- An entry is `identified` only when verified, physical address is known and every `osd`/`vendor` key used by any configured device match rule is known. Recompute the required key set on config reload. Query only missing required keys (`83` PA, `8C` vendor, `46` OSD); unverified restored entries request all three keys. Manual identify requests all three and updates its last-query instant; the bridge and LA 15 are never queried.
+- Retry on ticks only while the bridge is online. The interval is `identify_retry_s * 2^attempts`, capped at one hour, starting at the base interval after the first query. Each unanswered retry increases attempts; any frame from that LA or bridge-online/resync resets attempts. Resync also clears each last-query instant, allowing replies to trigger missing-key identification immediately.
+- A differing PA in `84` or broadcast `82` replaces the LA entry and clears its buffered signals. A differing known vendor/OSD clears the other non-PA keys and signals, retains PA only as unverified, and requires fresh `84` confirmation before role matching.
 - Entries age out of `power = On` only via explicit events or presence polling; never by time alone.
 
 ### 5.2 Identity → role
-A role matches an LA entry when every key in its `match` table matches
-(`osd` exact after trimming, `vendor` hex, `physical` dotted). If two roles
+A role matches a verified LA entry when every key in its `match` table matches
+(`osd` exact after trimming, `vendor` hex, `physical` dotted). Restored entries
+are ignored until a received `84` confirms the stored PA; power signals received
+before verification remain buffered. If two roles
 match one LA, or one role matches two LAs, the engine records a `Conflict`
 decision, exposes it in the UI/HA, and takes **no power actions** for the
 roles involved until resolved. Unmatched LAs appear as "unidentified" devices.
@@ -245,6 +248,35 @@ Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_pl
 
 ### 5.6 Startup / resync
 On start and on bridge LWT `Online`: send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
+Resync additionally sends `83` immediately to each unverified restored LA.
+
+#### Persisted state
+
+The runtime loads versioned `choregos.state.json` from the config file's directory.
+Version 1 contains only learned identities (`la`, `physical`, `vendor`, `osd`,
+`device_type`, `confirmed_at`) and the newest 2000 `DecisionView` entries, newest
+last; no frames, credentials or live power state. Only identities confirmed by
+an `84` are persisted; empty entries and the bridge LA are excluded. On load,
+drop confirmations older than the fixed 30-day lifetime. Missing files start
+empty; corrupt or unknown versions warn and start empty without failing startup.
+
+`Engine::new(config, now, restored)` receives the seed without I/O. Restored
+entries have Unknown power, no last-seen time, and verified = false; their
+restore instant anchors the first retry deadline. Duplicate restored physical
+addresses keep the earlier LA. Only a matching received `84` verifies cached
+keys and enables role matching; a differing PA replaces the cached identity.
+The devices page labels unverified entries `restored` rather than inventing a
+last-seen time. The runtime appends `service_started` after restored decisions.
+
+Snapshot publication serializes only changed identity/decision state and hands
+it to a single-slot watch channel. One writer task performs atomic replacement
+off the event loop, with newest state winning over queued older snapshots.
+Reuse config-save temp-file/fsync/rename/directory-fsync behavior: rename commits
+the write; post-rename directory-fsync failure warns without reporting failure.
+On write failure warn once, retry after 60 seconds or immediately on new state,
+and log recovery once when writing succeeds again. Shutdown flushes the newest
+state; a persistently failing final attempt warns and cannot guarantee durability.
+Replay never opens the state file.
 
 ### 5.7 Presence polling (`presence = "poll"`)
 While the role is On: every `presence_poll_s` send `8F` to its LA. A `90 xx` reply (or any frame from that LA) resets the miss counter; `presence_misses` consecutive polls without any frame from the LA → role Off (with decision reason `presence_timeout`) and bus entry power Unknown, retaining its learned identity. Silence is not an observed standby report. Polling stops when Off.
@@ -287,7 +319,7 @@ Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; loca
 
 ## 7. Operations
 
-- Docker: multi-stage build, static musl binary, `FROM gcr.io/distroless/static`, non-root, `/healthz` healthcheck, config mounted at `/config/choregos.toml`, secrets via env. Published as `ghcr.io/yasen-pavlov/choregos` on tags, and `:edge` on every push to `main`.
+- Docker: multi-stage build, static musl binary, `FROM gcr.io/distroless/static`, non-root, `/healthz` healthcheck; writable `/config` holds `choregos.toml` and `choregos.state.json`, secrets via env. Published as `ghcr.io/yasen-pavlov/choregos` on tags, and `:edge` on every push to `main`.
 - `deploy/docker-compose.yml`: standalone example (host port, config directory mount, env secrets, health check). Integration into a specific stack (reverse proxy, log driver, networks) is left to the operator.
 - Logging: `tracing` JSON to stdout; decision log lines are structured (`event=decision role=… from=… to=… reason=…`).
 - CI (GitHub Actions): fmt, clippy `-D warnings`, test, `cargo llvm-cov --lcov`, SonarCloud (`sonar.projectKey=yasen-pavlov_choregos`, fork-PR guard), docker build (no push) on PR; release workflow on `v*` tags and `main` pushes: build + push multi-arch image; git-cliff notes and GitHub release only on tags. Dependabot for cargo + actions.

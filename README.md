@@ -49,7 +49,8 @@ hosts, entities, sources and matching rules with your own. Secrets are accepted
 Every provided `match` key must match: `osd` (trimmed exact name), `vendor` (six
 hex digits), `physical` (four dotted hex digits, e.g. `2.1.0.0`). At least one is
 required. A role matching multiple logical addresses, or multiple roles matching
-one address, is a conflict. Bus state is learned again after restart, not saved.
+one address, is a conflict. Learned identities and the decision log survive restart;
+live power and active-source state are rebuilt from bus replies.
 Role IDs must match `[a-z0-9_]+` and may not be `bridge`, `mode`, `conflicts`,
 `active_source` or `all_off` (reserved MQTT discovery/state names).
 
@@ -74,6 +75,28 @@ restart: the editor rejects these changes explicitly to prevent authenticated
 users redirecting credentials to a different host or environment-secret name.
 Edit those sections in the mounted config while stopped.
 
+### Persisted state
+
+The runtime keeps `choregos.state.json` beside the config file (in Docker,
+`/config/choregos.state.json`). This versioned JSON file contains only learned
+CEC identities (logical/physical address, vendor, OSD name, device type and last
+`84` confirmation time) and the newest 2000 decisions, including `service_started`
+restart boundaries. Empty entries and the bridge are not saved; identities
+without an `84` confirmation are memory-only, and confirmations older than 30
+days are dropped on load. No frames, credentials, live power or active-source
+state are saved. Restored identities remain unverified and do not match roles
+until `84` confirms the cached PA. Resync queries PA immediately; intervening
+power signals stay buffered. Unverified devices show `restored`, not a last-seen
+time. Missing-key retries back off to one hour and pause while the bridge is offline.
+
+Updates are coalesced to the newest state and written atomically by one background
+writer, not the CEC event loop; shutdown flushes the last state. Missing, corrupt
+or unsupported-version files start empty. Write failures warn once, retry after
+60 seconds or on new state, and log recovery without stopping the service.
+It is safe to delete the file while stopped to discard
+learned identities and decision history; the next start re-interrogates the bus.
+Replay neither reads nor writes this state file.
+
 ### MQTT exposure
 
 Bridge inputs are `tele/<bridge.topic>/SENSOR`, `tele/<bridge.topic>/LWT` and
@@ -95,7 +118,7 @@ production; `latest` follows tagged releases only.
 mkdir -p config
 cp choregos.example.toml config/choregos.toml
 # Edit config/choregos.toml and export the environment variables listed above.
-# Give the container's uid write permission to the directory for atomic saves.
+# Give the container's uid write permission for config saves and persisted state.
 sudo chown -R 65532:65532 config
 docker run --rm --name choregos -p 8095:8095 \
   --cap-drop ALL --security-opt no-new-privileges --read-only \
@@ -119,9 +142,10 @@ and mode. The container health check verifies the web process responds with a
 valid health object; it does not restart a healthy process solely because an
 external system is offline. Put the UI behind HTTPS. A standalone compose example
 is in [`deploy/docker-compose.yml`](deploy/docker-compose.yml); merge it into
-your own stack as needed. Direct WoL requires `network_mode: host` (instead of
-`ports:`), or use the `http` wake variant with a LAN wake service — Linux bridge
-networking does not normally forward directed broadcast packets to the TV.
+your own stack as needed. Direct WoL from a bridge network works when the
+configured broadcast address is a directed broadcast (e.g. `192.168.1.255`)
+that the router forwards to the TV's network. Otherwise use `network_mode: host`
+(instead of `ports:`) or the `http` wake variant with a LAN wake service.
 
 ## Shadow mode
 

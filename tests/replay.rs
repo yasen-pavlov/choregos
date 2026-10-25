@@ -1,5 +1,5 @@
 use choregos::{
-    action::Action,
+    action::{Action, IdentifyQueries},
     cec::Frame,
     config::Config,
     engine::{Engine, Event},
@@ -20,6 +20,7 @@ fn setup() -> (Engine, Instant) {
     let mut engine = Engine::new(
         Config::parse(include_str!("../choregos.example.toml")).unwrap(),
         now,
+        vec![],
     );
     engine.handle(Event::BridgeOnline, now, wall());
     (engine, now)
@@ -279,7 +280,8 @@ fn presence_misses_require_unanswered_polls_and_any_frame_resets() {
     assert_eq!(entry.power, BusPower::Unknown);
     assert_eq!(entry.physical, identity.physical);
     assert_eq!(entry.osd, identity.osd);
-    assert!(entry.identified);
+    assert_eq!(entry.vendor, identity.vendor);
+    assert_eq!(entry.identified, identity.identified);
     assert_eq!(engine.identity.roles["console_a"], 8);
     assert!(
         !engine
@@ -407,7 +409,14 @@ fn bridge_resync_defers_due_polls_without_spinning_or_losing_roles() {
     engine.handle(Event::BridgeOffline, now + Duration::from_secs(3), wall());
     assert!(!engine.bridge_online);
     engine.handle(Event::BridgeOnline, now + Duration::from_secs(4), wall());
-    assert_eq!(engine.next_deadline(), Some(now + Duration::from_secs(7)));
+    assert_eq!(engine.next_deadline(), Some(now + Duration::from_secs(4)));
+    let identification = engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert!(
+        identification
+            .iter()
+            .all(|action| matches!(action, Action::Identify { .. }))
+    );
+    assert!(!identification.is_empty());
     assert!(
         engine
             .handle(Event::Tick, now + Duration::from_secs(5), wall())
@@ -470,7 +479,8 @@ fn bridge_offline_pauses_presence_and_resync_resets_outstanding_misses() {
         assert!(
             engine
                 .handle(Event::Tick, now + Duration::from_secs(second), wall())
-                .is_empty()
+                .iter()
+                .all(|action| matches!(action, Action::Identify { .. }))
         );
         assert_eq!(engine.roles["console_a"].power, RolePower::On);
     }
@@ -661,4 +671,304 @@ fn optimistic_off_preserves_observed_ha_timestamps() {
         assert_eq!(engine.ha[entity].state, "off");
         assert_eq!(engine.ha[entity].changed, Some(observed));
     }
+}
+
+#[test]
+fn missing_vendor_retries_on_ticks_and_releases_buffered_active_source() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 4, 15, "84210004");
+    frame(&mut engine, now, 4, 0, "4753747265616D6572");
+    frame(&mut engine, now, 4, 15, "822100");
+    assert!(!engine.bus.entries[&4].identified);
+    assert!(!engine.identity.roles.contains_key("streamer"));
+    let retry = Duration::from_secs(engine.config.timing.identify_retry_s);
+    let vendor_only = Action::Identify {
+        la: 4,
+        queries: IdentifyQueries {
+            vendor: true,
+            ..IdentifyQueries::default()
+        },
+    };
+    for interval in 1..=3 {
+        let due = now + retry * ((1 << interval) - 1);
+        assert_eq!(engine.next_deadline(), Some(due));
+        assert!(
+            engine
+                .handle(Event::Tick, due - Duration::from_millis(1), wall())
+                .is_empty()
+        );
+        assert_eq!(
+            engine.handle(Event::Tick, due, wall()).as_slice(),
+            std::slice::from_ref(&vendor_only)
+        );
+    }
+    let actions = frame(&mut engine, now + retry * 7, 4, 15, "870010FA");
+    assert!(engine.bus.entries[&4].identified);
+    assert_eq!(engine.identity.roles["streamer"], 4);
+    assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    assert!(actions.contains(&Action::WakeTv));
+    assert_eq!(engine.decisions[0].reason, "ActiveSource");
+    assert!(
+        !engine
+            .handle(Event::Tick, now + retry * 8, wall())
+            .iter()
+            .any(|action| matches!(action, Action::Identify { .. }))
+    );
+}
+
+#[test]
+fn identification_requirements_follow_config_reload_without_optional_vendor_queries() {
+    let now = Instant::now();
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    config
+        .device
+        .retain(|device| device.matches.vendor.is_none());
+    let mut engine = Engine::new(config.clone(), now, vec![]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    frame(&mut engine, now, 1, 15, "84220001");
+    frame(&mut engine, now, 1, 0, "474B6F6469");
+    assert!(engine.bus.entries[&1].identified);
+    let retry = Duration::from_secs(config.timing.identify_retry_s);
+    assert!(engine.handle(Event::Tick, now + retry, wall()).is_empty());
+    let with_vendor = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    engine.handle(
+        Event::ConfigReloaded(std::sync::Arc::new(with_vendor)),
+        now + retry,
+        wall(),
+    );
+    assert!(!engine.bus.entries[&1].identified);
+    assert_eq!(
+        engine.handle(Event::Tick, now + retry, wall()),
+        [Action::Identify {
+            la: 1,
+            queries: IdentifyQueries {
+                vendor: true,
+                ..IdentifyQueries::default()
+            },
+        }]
+    );
+    engine.handle(
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+        now + retry,
+        wall(),
+    );
+    assert!(engine.bus.entries[&1].identified);
+    assert!(
+        !engine
+            .handle(Event::Tick, now + retry * 2, wall())
+            .iter()
+            .any(|action| matches!(action, Action::Identify { .. }))
+    );
+}
+
+#[test]
+fn identify_queries_only_missing_keys_but_manual_identify_requests_all() {
+    let (mut engine, now) = setup();
+    assert_eq!(
+        frame(&mut engine, now, 4, 15, "870010FA"),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries {
+                physical: true,
+                vendor: false,
+                osd: true
+            },
+        }]
+    );
+    frame(&mut engine, now, 4, 0, "4753747265616D6572");
+    let retry = Duration::from_secs(engine.config.timing.identify_retry_s);
+    assert_eq!(
+        engine.handle(Event::Tick, now + retry, wall()),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries {
+                physical: true,
+                ..IdentifyQueries::default()
+            },
+        }]
+    );
+    assert_eq!(
+        engine.handle(Event::Command(Command::Identify(4)), now + retry, wall()),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries::ALL
+        },]
+    );
+    for la in [0, 15] {
+        assert!(
+            engine
+                .handle(Event::Command(Command::Identify(la)), now + retry, wall())
+                .is_empty()
+        );
+        frame(&mut engine, now + retry, la, 15, "870010FA");
+    }
+    let actions = engine.handle(Event::Tick, now + retry * 2, wall());
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::Identify { la: 0 | 15, .. }))
+    );
+}
+
+fn restored_identity(la: u8, physical: u16) -> choregos::cec::bus::LearnedIdentity {
+    choregos::cec::bus::LearnedIdentity {
+        la,
+        physical: Some(physical),
+        vendor: Some(0x0010fa),
+        osd: Some("Streamer".into()),
+        device_type: Some(4),
+        confirmed_at: wall(),
+    }
+}
+
+#[test]
+fn restored_identity_buffers_power_until_confirming_physical_report() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    assert!(!engine.identity.roles.contains_key("streamer"));
+    assert!(!engine.bus.entries[&4].identified);
+    assert!(!engine.bus.entries[&4].verified);
+    assert_eq!(engine.bus.entries[&4].last_seen, None);
+    assert_eq!(engine.bus.entries[&4].power, BusPower::Unknown);
+    let resync = engine.handle(Event::BridgeOnline, now, wall());
+    assert!(resync.contains(&Action::Identify {
+        la: 4,
+        queries: IdentifyQueries {
+            physical: true,
+            ..IdentifyQueries::default()
+        },
+    }));
+    assert!(!frame(&mut engine, now, 4, 15, "822100").contains(&Action::WakeTv));
+    assert!(!engine.identity.roles.contains_key("streamer"));
+    let actions = frame(&mut engine, now, 4, 15, "84210004");
+    assert!(actions.contains(&Action::WakeTv));
+    assert_eq!(engine.identity.roles["streamer"], 4);
+    assert!(engine.bus.entries[&4].verified);
+    assert!(engine.bus.entries[&4].identified);
+    assert_eq!(engine.bus.entries[&4].last_seen, Some(now));
+    assert_eq!(engine.bus.entries[&4].confirmed_at, Some(wall()));
+}
+
+#[test]
+fn mismatching_active_source_replaces_restored_identity_and_old_signals() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    frame(&mut engine, now, 4, 15, "822300");
+    assert_eq!(engine.bus.entries[&4].physical, Some(0x2300));
+    assert_eq!(engine.bus.entries[&4].vendor, None);
+    assert_eq!(engine.bus.entries[&4].osd, None);
+    assert!(!engine.identity.roles.contains_key("streamer"));
+    assert_eq!(engine.identity.roles["console_a"], 4);
+}
+
+#[test]
+fn restored_conflicts_wait_for_verification_and_duplicate_physical_is_skipped() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(
+        config,
+        now,
+        vec![
+            restored_identity(4, 0x2100),
+            restored_identity(8, 0x2500),
+            restored_identity(11, 0x2100),
+        ],
+    );
+    assert_eq!(engine.bus.entries.len(), 2);
+    assert!(engine.identity.conflicts.is_empty());
+    engine.handle(Event::BridgeOnline, now, wall());
+    frame(&mut engine, now, 4, 15, "84210004");
+    frame(&mut engine, now, 8, 15, "84250004");
+    assert!(engine.identity.blocked.contains("streamer"));
+    assert_eq!(engine.identity.conflicts.len(), 1);
+    assert!(!frame(&mut engine, now, 4, 15, "822100").contains(&Action::WakeTv));
+}
+
+#[test]
+fn vendor_change_discards_other_keys_and_requires_fresh_physical_confirmation() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 4, 15, "822100");
+    frame(&mut engine, now, 4, 15, "87080046");
+    let entry = &engine.bus.entries[&4];
+    assert_eq!(entry.physical, Some(0x2100));
+    assert_eq!(entry.osd, None);
+    assert_eq!(entry.device_type, None);
+    assert!(!entry.verified);
+    assert!(!entry.identified);
+    assert!(!engine.identity.roles.contains_key("console_b"));
+    let actions = frame(&mut engine, now, 4, 15, "84210004");
+    assert_eq!(engine.identity.roles["console_b"], 4);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert!(!actions.contains(&Action::WakeTv));
+}
+
+#[test]
+fn identification_backoff_caps_at_an_hour_resets_on_frames_and_pauses_offline() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 4, 15, "84210004");
+    let mut due = now;
+    for delay in [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600, 3600] {
+        due += Duration::from_secs(delay);
+        assert_eq!(engine.next_deadline(), Some(due));
+        assert!(
+            engine
+                .handle(Event::Tick, due - Duration::from_millis(1), wall())
+                .is_empty()
+        );
+        assert_eq!(engine.handle(Event::Tick, due, wall()).len(), 1);
+    }
+    frame(&mut engine, due, 4, 0, "");
+    assert_eq!(engine.next_deadline(), Some(due + Duration::from_secs(10)));
+    engine.handle(Event::BridgeOffline, due, wall());
+    assert_eq!(engine.next_deadline(), None);
+    assert!(
+        engine
+            .handle(Event::Tick, due + Duration::from_secs(20), wall())
+            .is_empty()
+    );
+    engine.handle(Event::BridgeOnline, due + Duration::from_secs(20), wall());
+    let actions = frame(&mut engine, due + Duration::from_secs(20), 4, 0, "");
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(actions[0], Action::Identify { .. }));
+}
+
+#[test]
+fn osd_change_clears_vendor_and_does_not_replay_previous_occupants_power_signal() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 4, 15, "822100");
+    frame(&mut engine, now, 4, 0, "474B6F6469");
+    assert_eq!(engine.bus.entries[&4].vendor, None);
+    assert!(!engine.bus.entries[&4].verified);
+    assert!(!engine.identity.roles.contains_key("kodi"));
+    frame(&mut engine, now, 4, 15, "84210004");
+    assert_eq!(engine.identity.roles["kodi"], 4);
+    assert_eq!(engine.roles["kodi"].power, RolePower::Off);
+}
+
+#[test]
+fn manual_identification_defers_automatic_retry_from_the_manual_query_instant() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 4, 15, "84210004");
+    engine.handle(
+        Event::Command(Command::Identify(4)),
+        now + Duration::from_secs(9),
+        wall(),
+    );
+    assert!(
+        engine
+            .handle(Event::Tick, now + Duration::from_secs(10), wall())
+            .is_empty()
+    );
+    assert_eq!(engine.next_deadline(), Some(now + Duration::from_secs(19)));
+    assert!(matches!(
+        engine
+            .handle(Event::Tick, now + Duration::from_secs(19), wall())
+            .as_slice(),
+        [Action::Identify { la: 4, .. }]
+    ));
 }

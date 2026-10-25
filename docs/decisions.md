@@ -2,6 +2,40 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-25 — Restart resilience and directed-broadcast WoL
+
+- Identification requires PA plus the union of OSD/vendor keys used by configured
+  match rules, recomputed on reload. Only missing keys are queried on frames and
+  timer deadlines; retries back off exponentially to one hour and pause while
+  the bridge is offline. Frames and resync reset backoff; resync clears query
+  timestamps so its replies are not suppressed by pre-reconnect timing.
+  Manual identify requests all keys, excluding the bridge and LA 15, and records
+  its query instant to avoid an immediate automatic duplicate.
+- Keep disk I/O out of the engine with constructor-injected learned identities,
+  not a runtime restore event. Restore Unknown power, no last-seen time and
+  verified=false. Cached roles must wait for an `84` confirming the stored PA;
+  buffer intervening power signals, and send `83` at resync immediately.
+  This prevents stale vendor/OSD data from misclassifying an LA's new occupant.
+  Duplicate restored physical addresses keep the earlier LA.
+- Treat differing Active Source PA like differing Report Physical Address.
+  A changed vendor/OSD invalidates the other non-PA keys and old signals and
+  requires a new `84`; otherwise a swapped device can inherit stale role evidence.
+- Runtime-owned version-1 `choregos.state.json` beside the config retains only
+  learned identities and the newest 2000 redacted decisions, plus a runtime-added
+  `service_started` boundary per start. Replay uses only the pure engine and
+  therefore never opens the state file. Corrupt/unknown files warn and reset.
+  Persist only 84-confirmed identities, excluding bridge/empty entries, with an
+  injected-wall `confirmed_at`; drop confirmations older than 30 days on load
+  so unplugged historical devices cannot live in the cache indefinitely.
+- Serialize changed state into a single-slot watch channel and let one writer
+  perform atomic I/O off the event loop. Newest state wins, so slow fsync cannot
+  block CEC replies or grow a queue. Failed writes warn once and retry after 60
+  seconds or on a new state; recovery logs once. Shutdown flushes the last state.
+  Reuse config's path-and-bytes writer with rename as the commit point.
+- Correct the earlier m9 deployment restriction: direct WoL works from a bridge
+  container with a directed broadcast (e.g. `192.168.1.255`) when the router
+  forwards it. Host networking or HTTP wake remain alternatives otherwise.
+
 ## 2026-10-25 — Shadow-operation core papercuts
 
 - Presence timeout marks the retained bus entry Unknown as well as its role
@@ -118,8 +152,9 @@ Runtime review decisions:
   discovery uses `default_entity_id`, not deprecated `object_id`.
 - m8: mode persistence replaces only the TOML mode value using its parsed span,
   preserving comments, order, and unrelated manual edits.
-- m9: bridge-network deployments must use HTTP wake; direct WoL requires host
-  networking. README and compose explain this deployment prerequisite.
+- m9 (corrected by the restart-resilience decision above): bridge-network direct
+  WoL works with a directed broadcast the router forwards. Use host networking
+  or HTTP wake otherwise; README and compose describe the alternatives.
 - m10: remove no-op PersistMode; Resync is payload-free with fixed query expansion;
   share Config using Arc; the retained bridge LWT initiates startup resync once.
 - `fake_tv.replies` defaults true. Firmware-owned directed replies can be disabled

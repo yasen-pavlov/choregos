@@ -3,7 +3,6 @@ use super::{Adapters, Runtime};
 use crate::{
     cec::Frame,
     config::{Config, WakeConfig},
-    engine::Engine,
     state::{AppState, Command, FrameDirection, Mode, RolePower, Snapshot},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -12,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
@@ -379,22 +378,7 @@ impl Harness {
             1,
         );
         tokio::fs::write(&path, &text).await.unwrap();
-        let state = AppState::new(config.clone(), text);
-        let (tx, mut rx) = mpsc::channel(256);
-        state.attach(tx.clone());
-        let engine = Engine::new(config.clone(), Instant::now());
-        let adapters = Adapters::start(&config, tx.clone(), &[]);
-        let mut runtime = Runtime::new(state.clone(), path.clone(), tx, engine, adapters);
-        let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let result = runtime
-                .run_loop(&mut rx, async {
-                    let _ = stopped.await;
-                })
-                .await;
-            runtime.adapters.take().unwrap().stop().await;
-            result
-        });
+        let (state, stop, task) = Self::start_runtime(&config, &path, text).await;
         let harness = Self {
             state,
             config,
@@ -431,6 +415,49 @@ impl Harness {
         .await;
         harness
     }
+    async fn start_runtime(
+        config: &Config,
+        path: &std::path::Path,
+        text: String,
+    ) -> (
+        AppState,
+        oneshot::Sender<()>,
+        JoinHandle<anyhow::Result<()>>,
+    ) {
+        let state = AppState::new(config.clone(), text);
+        let (tx, mut rx) = mpsc::channel(256);
+        state.attach(tx.clone());
+        let adapters = Adapters::start(config, tx.clone(), &[]);
+        let mut runtime = Runtime::new(
+            state.clone(),
+            path.to_path_buf(),
+            tx,
+            config.clone(),
+            adapters,
+        )
+        .await;
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = runtime
+                .run_loop(&mut rx, async {
+                    let _ = stopped.await;
+                })
+                .await;
+            runtime.adapters.take().unwrap().stop().await;
+            result
+        });
+        (state, stop, task)
+    }
+
+    async fn restart_runtime(&mut self) {
+        self.stop_runtime().await;
+        let text = tokio::fs::read_to_string(&self.path).await.unwrap();
+        let (state, stop, task) = Self::start_runtime(&self.config, &self.path, text).await;
+        self.state = state;
+        self.stop = Some(stop);
+        self.task = Some(task);
+    }
+
     async fn publish_wake(&self) {
         let before = self.state.snapshot().recent_frames.len();
         for line in include_str!("../../fixtures/capture-streamer-wake.jsonl").lines() {
@@ -470,7 +497,7 @@ impl Harness {
             .unwrap()
             .unwrap();
     }
-    async fn shutdown(&mut self) {
+    async fn stop_runtime(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -481,6 +508,9 @@ impl Harness {
                 .unwrap()
                 .unwrap();
         }
+    }
+    async fn shutdown(&mut self) {
+        self.stop_runtime().await;
         self.ha.shutdown().await;
         self.broker.shutdown().await;
     }
@@ -761,4 +791,214 @@ async fn broker_restart_reinterrogates_the_bridge_and_ha_disconnect_invalidates_
     .await;
     assert!(snapshot.connections.mqtt_connected);
     harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_restores_history_but_waits_for_physical_verification_to_match_roles() {
+    let mut harness = Harness::start().await;
+    harness.publish_wake().await;
+    let previous = wait_snapshot(&harness.state, |snapshot| {
+        snapshot
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "takeover_settled")
+    })
+    .await;
+    harness.restart_runtime().await;
+    let restored = harness.state.snapshot();
+    let streamer = restored
+        .roles
+        .iter()
+        .find(|role| role.role == "streamer")
+        .unwrap();
+    assert_eq!(streamer.logical_address, None);
+    let entry = restored
+        .bus
+        .iter()
+        .find(|entry| entry.logical_address == 4)
+        .unwrap();
+    assert!(!entry.verified);
+    assert_eq!(entry.last_seen, None);
+    assert_eq!(streamer.power, RolePower::Off);
+    assert_eq!(
+        restored
+            .bus
+            .iter()
+            .find(|entry| entry.logical_address == 4)
+            .unwrap()
+            .power,
+        crate::state::BusPower::Unknown
+    );
+    assert!(restored.active_role.is_none());
+    assert!(
+        !restored
+            .recent_frames
+            .iter()
+            .any(|frame| frame.direction == FrameDirection::Received)
+    );
+    assert_eq!(restored.decisions.len(), previous.decisions.len() + 1);
+    assert!(
+        restored
+            .decisions
+            .iter()
+            .take(previous.decisions.len())
+            .eq(&previous.decisions)
+    );
+    let boundary = restored.decisions.back().unwrap();
+    assert_eq!(boundary.reason, "service_started");
+    assert!(!boundary.would);
+    assert!(boundary.actions.is_empty());
+    wait_snapshot(&harness.state, |snapshot| {
+        snapshot.recent_frames.iter().any(|frame| {
+            frame.direction == FrameDirection::Sent && frame.data == "83" && frame.to == 4
+        })
+    })
+    .await;
+    harness
+        .peer
+        .publish(
+            &format!("tele/{}/SENSOR", harness.config.bridge.topic),
+            false,
+            serde_json::to_vec(&json!({"HdmiReceived":{"From":4,"To":15,"Data":"84210004"}}))
+                .unwrap(),
+        )
+        .await;
+    wait_snapshot(&harness.state, |snapshot| {
+        snapshot
+            .roles
+            .iter()
+            .any(|role| role.role == "streamer" && role.logical_address == Some(4))
+    })
+    .await;
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_or_unknown_state_starts_empty_without_failing_runtime() {
+    let mut harness = Harness::start().await;
+    harness.publish_wake().await;
+    for invalid in [
+        b"not JSON".as_slice(),
+        br#"{"version":2,"identities":[],"decisions":[]}"#.as_slice(),
+    ] {
+        harness.stop_runtime().await;
+        tokio::fs::write(harness.path.with_file_name("choregos.state.json"), invalid)
+            .await
+            .unwrap();
+        harness.restart_runtime().await;
+        let snapshot = harness.state.snapshot();
+        assert!(snapshot.bus.is_empty());
+        assert!(
+            snapshot
+                .roles
+                .iter()
+                .all(|role| role.logical_address.is_none())
+        );
+        assert_eq!(snapshot.decisions.len(), 1);
+        assert_eq!(snapshot.decisions[0].reason, "service_started");
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_writes_ignore_ordinary_frames_and_shutdown_flushes_latest_decision() {
+    use std::os::unix::fs::MetadataExt;
+    let mut harness = Harness::start().await;
+    harness.publish_wake().await;
+    wait_snapshot(&harness.state, |snapshot| {
+        snapshot
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "takeover_settled")
+    })
+    .await;
+    let path = harness.path.with_file_name("choregos.state.json");
+    wait_persisted(&path, |saved| {
+        saved
+            .decisions
+            .last()
+            .is_some_and(|decision| decision.reason == "takeover_settled")
+    })
+    .await;
+    let inode = tokio::fs::metadata(&path).await.unwrap().ino();
+    let publish_poll = || async {
+        let before = harness.state.snapshot().recent_frames.len();
+        harness
+            .peer
+            .publish(
+                &format!("tele/{}/SENSOR", harness.config.bridge.topic),
+                false,
+                serde_json::to_vec(&json!({"HdmiReceived":{"From":4,"To":0,"Data":""}})).unwrap(),
+            )
+            .await;
+        wait_snapshot(&harness.state, |snapshot| {
+            snapshot.recent_frames.len() > before
+        })
+        .await;
+    };
+    publish_poll().await;
+    assert_eq!(tokio::fs::metadata(&path).await.unwrap().ino(), inode);
+    harness.command(Command::Identify(4)).await;
+    wait_snapshot(&harness.state, |snapshot| {
+        snapshot
+            .decisions
+            .back()
+            .is_some_and(|decision| decision.reason == "command_identify")
+    })
+    .await;
+    harness.stop_runtime().await;
+    let saved: super::PersistedState =
+        serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+    assert_eq!(saved.decisions.last().unwrap().reason, "command_identify");
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restored_decision_ring_keeps_newest_entries_and_restart_boundary() {
+    let mut harness = Harness::start().await;
+    harness.stop_runtime().await;
+    let mut decision = harness.state.snapshot().decisions[0].clone();
+    let decisions = (0..2005)
+        .map(|index| {
+            decision.reason = format!("decision_{index}");
+            decision.clone()
+        })
+        .collect();
+    let saved = super::PersistedState {
+        version: 1,
+        identities: vec![],
+        decisions,
+    };
+    tokio::fs::write(
+        harness.path.with_file_name("choregos.state.json"),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .await
+    .unwrap();
+    harness.restart_runtime().await;
+    let snapshot = harness.state.snapshot();
+    assert_eq!(snapshot.decisions.len(), 2000);
+    assert_eq!(snapshot.decisions.front().unwrap().reason, "decision_6");
+    assert_eq!(snapshot.decisions[1998].reason, "decision_2004");
+    assert_eq!(snapshot.decisions.back().unwrap().reason, "service_started");
+    harness.shutdown().await;
+}
+
+async fn wait_persisted(
+    path: &std::path::Path,
+    predicate: impl Fn(&super::PersistedState) -> bool,
+) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(bytes) = tokio::fs::read(path).await
+                && let Ok(saved) = serde_json::from_slice(&bytes)
+                && predicate(&saved)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("state file did not converge");
 }
