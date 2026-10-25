@@ -355,6 +355,27 @@ impl Runtime {
         self.state.publish(self.snapshot.clone(), ui_events);
         Ok(())
     }
+
+    async fn run_loop(
+        &mut self,
+        rx: &mut mpsc::Receiver<Input>,
+        shutdown: impl Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        tokio::pin!(shutdown);
+        loop {
+            let deadline = self
+                .engine
+                .next_deadline()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
+            let input = tokio::select! {
+                _ = &mut shutdown => break,
+                _ = tokio::time::sleep_until(deadline.into()) => Input::Event(Event::Tick),
+                input = rx.recv() => match input { Some(input) => input, None => break },
+            };
+            self.handle_input(input, Instant::now(), Utc::now()).await?;
+        }
+        Ok(())
+    }
 }
 
 pub async fn run(config: Config, path: PathBuf) -> anyhow::Result<()> {
@@ -377,22 +398,7 @@ pub async fn run(config: Config, path: PathBuf) -> anyhow::Result<()> {
     let adapters = Adapters::start(&engine.config, tx.clone(), &[]);
     // The retained bridge LWT initiates the single startup resync.
     let mut runtime = Runtime::new(state, path, tx, engine, adapters);
-    let shutdown_signal = shutdown_signal();
-    tokio::pin!(shutdown_signal);
-    loop {
-        let deadline = runtime
-            .engine
-            .next_deadline()
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
-        let input = tokio::select! {
-            _ = &mut shutdown_signal => break,
-            _ = tokio::time::sleep_until(deadline.into()) => Input::Event(Event::Tick),
-            input = rx.recv() => match input { Some(input) => input, None => break },
-        };
-        runtime
-            .handle_input(input, Instant::now(), Utc::now())
-            .await?;
-    }
+    runtime.run_loop(&mut rx, shutdown_signal()).await?;
     let _ = shutdown.send(true);
     runtime
         .adapters
@@ -657,6 +663,8 @@ fn frame_view(
     }
 }
 
+#[cfg(test)]
+mod loop_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
