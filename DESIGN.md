@@ -284,7 +284,7 @@ Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; loca
 ## 7. Operations
 
 - Docker: multi-stage build, static musl binary, `FROM gcr.io/distroless/static`, non-root, `/healthz` healthcheck, config mounted at `/config/choregos.toml`, secrets via env. Published as `ghcr.io/yasen-pavlov/choregos` on tags.
-- Compose snippet for `the host compose stack` in `deploy/docker-compose.snippet.yml` (networks `main` + `system_main`, `VIRTUAL_HOST=choregos.example.com`, Splunk logging anchor, health check).
+- `deploy/docker-compose.yml`: standalone example (host port, config directory mount, env secrets, health check). Integration into a specific stack (reverse proxy, log driver, networks) is left to the operator.
 - Logging: `tracing` JSON to stdout; decision log lines are structured (`event=decision role=… from=… to=… reason=…`).
 - CI (GitHub Actions): fmt, clippy `-D warnings`, test, `cargo llvm-cov --lcov`, SonarCloud (`sonar.projectKey=yasen-pavlov_choregos`, fork-PR guard), docker build (no push) on PR; release workflow on `v*` tags: build + push multi-arch image, git-cliff notes, GitHub release. Dependabot for cargo + actions.
 - Versioning: `Cargo.toml` stays `0.0.0`; tags drive versions.

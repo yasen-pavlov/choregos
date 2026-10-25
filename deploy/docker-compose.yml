@@ -1,0 +1,31 @@
+# Standalone example. Copy choregos.example.toml to ./choregos/choregos.toml,
+# put the secrets in a .env file next to this compose file, then `docker compose up -d`.
+#
+# Wake-on-LAN: with the default bridge network, use tv.wake.kind = "http".
+# Direct WoL (kind = "wol") needs `network_mode: host` instead of `ports:`.
+services:
+  choregos:
+    image: ghcr.io/yasen-pavlov/choregos:latest
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "8095:8095"
+    # Mount the directory, not a single file: saves use atomic rename, and the
+    # directory must be writable by uid 65532 for UI config edits.
+    volumes:
+      - ./choregos:/config
+    environment:
+      CHOREGOS_MQTT_PASSWORD: "${CHOREGOS_MQTT_PASSWORD:?required}"
+      CHOREGOS_HA_TOKEN: "${CHOREGOS_HA_TOKEN:?required}"
+      CHOREGOS_SESSION_SECRET: "${CHOREGOS_SESSION_SECRET:?required}"
+      CHOREGOS_OIDC_CLIENT_SECRET: "${CHOREGOS_OIDC_CLIENT_SECRET:?required}"
+      CHOREGOS_LOCAL_PASSWORD: "${CHOREGOS_LOCAL_PASSWORD:?required}"
+    healthcheck:
+      test: [CMD, /usr/local/bin/choregos, healthz, --url, "http://127.0.0.1:8095/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -114,13 +114,11 @@ choregos healthz --url http://127.0.0.1:8095/healthz
 `/healthz` is unauthenticated and reports MQTT/HA connections, bridge availability
 and mode. The container health check verifies the web process responds with a
 valid health object; it does not restart a healthy process solely because an
-external system is offline. Put the UI behind HTTPS. A complete host-stack
-example with external networks, reverse-proxy variables and Splunk logging is in
-[`deploy/docker-compose.snippet.yml`](deploy/docker-compose.snippet.yml).
-Direct WoL requires `network_mode: host` (remove the compose `networks` setting
-and adapt the reverse proxy to the host port), or use the `http` wake variant
-with a LAN wake service. Linux bridge networking does not normally forward
-directed broadcast packets to the TV.
+external system is offline. Put the UI behind HTTPS. A standalone compose example
+is in [`deploy/docker-compose.yml`](deploy/docker-compose.yml); merge it into
+your own stack as needed. Direct WoL requires `network_mode: host` (instead of
+`ports:`), or use the `http` wake variant with a LAN wake service — Linux bridge
+networking does not normally forward directed broadcast packets to the TV.
 
 ## Shadow mode
 
