@@ -3,7 +3,7 @@ use choregos::{
     cec::Frame,
     config::Config,
     engine::{Engine, Event},
-    state::{Command, RolePower},
+    state::{BusPower, Command, RolePower},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -39,12 +39,19 @@ fn identify_atv(engine: &mut Engine, now: Instant) {
 fn service(action: &Action, wanted: &str) -> bool {
     matches!(action, Action::HaCall { service, .. } if service == wanted)
 }
-fn ha(engine: &mut Engine, now: Instant, entity: String, state: &str) {
+fn ha(
+    engine: &mut Engine,
+    now: Instant,
+    entity: String,
+    state: &str,
+    changed: Option<DateTime<Utc>>,
+) {
     engine.handle(
         Event::HaState {
             entity,
             state: state.into(),
             attrs: BTreeMap::new(),
+            changed,
         },
         now,
         wall(),
@@ -69,6 +76,7 @@ fn capture_replays_power_release_and_both_volume_branches() {
             start,
             sonos,
             if sonos_playing { "playing" } else { "paused" },
+            None,
         );
         let mut transitions = vec![];
         let mut effects = vec![];
@@ -170,7 +178,7 @@ fn takeover_is_ordered_idempotent_and_settled() {
     frame(&mut engine, now, 1, 0, "474B6F6469");
     frame(&mut engine, now, 1, 15, "822200");
     let sonos = engine.config.sonos.entity.clone();
-    ha(&mut engine, now, sonos, "playing");
+    ha(&mut engine, now, sonos, "playing", None);
     let actions = frame(&mut engine, now, 4, 0, "04");
     assert!(matches!(actions[0], Action::WakeTv));
     assert!(service(&actions[1], "media_stop")); // Kodi first
@@ -243,6 +251,10 @@ fn warming_blocks_power_until_reply_or_timeout() {
 fn presence_misses_require_unanswered_polls_and_any_frame_resets() {
     let (mut engine, now) = setup();
     frame(&mut engine, now, 8, 15, "84230004");
+    frame(&mut engine, now, 8, 15, "47436F6E736F6C652041");
+    frame(&mut engine, now, 8, 15, "822300");
+    let identity = engine.bus.entries[&8].clone();
+    assert_eq!(identity.power, BusPower::On);
     assert_eq!(engine.roles["console_a"].power, RolePower::On);
     assert!(
         engine
@@ -254,6 +266,7 @@ fn presence_misses_require_unanswered_polls_and_any_frame_resets() {
     engine.handle(Event::Tick, now + Duration::from_secs(15), wall());
     engine.handle(Event::Tick, now + Duration::from_secs(20), wall());
     assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert_eq!(engine.bus.entries[&8].power, BusPower::On);
     engine.handle(Event::Tick, now + Duration::from_secs(25), wall());
     assert_eq!(engine.roles["console_a"].power, RolePower::Off);
     assert!(
@@ -262,12 +275,21 @@ fn presence_misses_require_unanswered_polls_and_any_frame_resets() {
             .iter()
             .any(|d| d.reason == "presence_timeout")
     );
+    let entry = &engine.bus.entries[&8];
+    assert_eq!(entry.power, BusPower::Unknown);
+    assert_eq!(entry.physical, identity.physical);
+    assert_eq!(entry.osd, identity.osd);
+    assert!(entry.identified);
+    assert_eq!(engine.identity.roles["console_a"], 8);
     assert!(
         !engine
             .handle(Event::Tick, now + Duration::from_secs(30), wall())
             .iter()
             .any(|a| matches!(a, Action::PresencePoll { .. }))
     );
+    frame(&mut engine, now + Duration::from_secs(31), 8, 15, "822300");
+    assert_eq!(engine.bus.entries[&8].power, BusPower::On);
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
 }
 
 #[test]
@@ -305,7 +327,7 @@ fn fake_tv_and_volume_mute_are_address_scoped() {
         }]
     );
     let sonos = engine.config.sonos.entity.clone();
-    ha(&mut engine, now, sonos, "playing");
+    ha(&mut engine, now, sonos, "playing", None);
     assert!(
         frame(&mut engine, now, 4, 5, "4443")
             .iter()
@@ -327,12 +349,13 @@ fn preset_uses_injected_timezone_and_existing_receiver_source_is_preserved() {
             entity: receiver,
             state: "on".into(),
             attrs,
+            changed: None,
         },
         now,
         wall(),
     );
     let tv = engine.config.tv.entity.clone();
-    ha(&mut engine, now, tv, "on");
+    ha(&mut engine, now, tv, "on", None);
     let actions = frame(&mut engine, now, 4, 0, "04");
     assert!(!actions.contains(&Action::WakeTv));
     assert!(!actions.iter().any(|a| service(a, "turn_on")));
@@ -535,7 +558,7 @@ fn quick_rewake_ignores_ha_on_values_stale_from_before_our_off_actions() {
         engine.config.tv.entity.clone(),
         engine.config.receiver.entity.clone(),
     ] {
-        ha(&mut engine, now, entity, "on");
+        ha(&mut engine, now, entity, "on", None);
     }
     frame(&mut engine, now, 4, 0, "04");
     frame(&mut engine, now + Duration::from_secs(1), 4, 0, "36");
@@ -588,4 +611,54 @@ fn manual_takeover_actions_are_recorded_once_not_as_a_duplicate_command_decision
     );
     assert_eq!(engine.decisions.len(), 1);
     assert_eq!(engine.decisions[0].reason, "manual_takeover");
+}
+
+#[test]
+fn ha_changed_prefers_ha_then_stamps_transitions_but_not_attribute_updates() {
+    let (mut engine, now) = setup();
+    let entity = engine.config.tv.entity.clone();
+    let provided = wall() - chrono::Duration::minutes(5);
+    ha(&mut engine, now, entity.clone(), "on", Some(provided));
+    assert_eq!(engine.ha[&entity].changed, Some(provided));
+
+    ha(&mut engine, now, entity.clone(), "off", None);
+    assert_eq!(engine.ha[&entity].changed, Some(wall()));
+
+    let attrs = BTreeMap::from([("volume_level".into(), serde_json::json!(0.5))]);
+    engine.handle(
+        Event::HaState {
+            entity: entity.clone(),
+            state: "off".into(),
+            attrs: attrs.clone(),
+            changed: None,
+        },
+        now,
+        wall() + chrono::Duration::seconds(1),
+    );
+    assert_eq!(engine.ha[&entity].changed, Some(wall()));
+    assert_eq!(engine.ha[&entity].attrs, attrs);
+
+    ha(&mut engine, now, entity.clone(), "off", Some(provided));
+    assert_eq!(engine.ha[&entity].changed, Some(provided));
+}
+
+#[test]
+fn optimistic_off_preserves_observed_ha_timestamps() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 8, 15, "84230004");
+    let observed = wall() - chrono::Duration::minutes(5);
+    for (entity, state) in [
+        (engine.config.tv.entity.clone(), "on"),
+        (engine.config.receiver.entity.clone(), "off"),
+    ] {
+        ha(&mut engine, now, entity, state, Some(observed));
+    }
+    frame(&mut engine, now, 8, 15, "36");
+    let delay = Duration::from_secs(engine.config.timing.off_delay_s);
+    let expired = wall() + chrono::Duration::from_std(delay).unwrap();
+    engine.handle(Event::Tick, now + delay, expired);
+    for entity in [&engine.config.tv.entity, &engine.config.receiver.entity] {
+        assert_eq!(engine.ha[entity].state, "off");
+        assert_eq!(engine.ha[entity].changed, Some(observed));
+    }
 }

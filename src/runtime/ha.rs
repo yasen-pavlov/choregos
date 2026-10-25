@@ -1,5 +1,6 @@
 use super::Input;
 use crate::{config::Config, engine::Event};
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
@@ -210,10 +211,15 @@ async fn forward_state(
             .as_object()
             .map(|a| a.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
+        let changed = value["last_changed"]
+            .as_str()
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
         tx.send(Input::Event(Event::HaState {
             entity: entity.into(),
             state: state.into(),
             attrs,
+            changed,
         }))
         .await?;
     }
@@ -267,7 +273,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(request["type"], expected);
                 let result = if expected == "get_states" {
-                    json!([{"entity_id":entity,"state":"on","attributes":{"source":"HDMI"}}])
+                    json!([{"entity_id":entity,"state":"on","attributes":{"source":"HDMI"},"last_changed":"2026-10-25T12:00:00+02:00"}])
                 } else {
                     Value::Null
                 };
@@ -280,7 +286,23 @@ mod tests {
                 .unwrap();
             }
             ws.send(Message::Text(json!({"type":"event","event":{"data":{"new_state":{"entity_id":"sensor.unrelated","state":"ignored"}}}}).to_string().into())).await.unwrap();
-            ws.send(Message::Text(json!({"type":"event","event":{"data":{"new_state":{"entity_id":entity,"state":"off","attributes":{}}}}}).to_string().into())).await.unwrap();
+            for (state, changed) in [
+                ("off", Some("2026-10-25T10:01:00Z")),
+                ("on", Some("not-a-timestamp")),
+                ("off", None),
+            ] {
+                let mut new_state = json!({"entity_id":entity,"state":state,"attributes":{}});
+                if let Some(changed) = changed {
+                    new_state["last_changed"] = json!(changed);
+                }
+                ws.send(Message::Text(
+                    json!({"type":"event","event":{"data":{"new_state":new_state}}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
             let call: Value =
                 serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(call["type"], "call_service");
@@ -300,12 +322,22 @@ mod tests {
         let (ha, task) = Ha::start(&config, tx);
         let test = async {
             let mut states = vec![];
-            while states.len() < 2 {
-                if let Input::Event(Event::HaState { state, .. }) = rx.recv().await.unwrap() {
-                    states.push(state);
+            while states.len() < 4 {
+                if let Input::Event(Event::HaState { state, changed, .. }) =
+                    rx.recv().await.unwrap()
+                {
+                    states.push((state, changed));
                 }
             }
-            assert_eq!(states, ["on", "off"]);
+            assert_eq!(
+                states,
+                [
+                    ("on".into(), Some("2026-10-25T10:00:00Z".parse().unwrap())),
+                    ("off".into(), Some("2026-10-25T10:01:00Z".parse().unwrap())),
+                    ("on".into(), None),
+                    ("off".into(), None),
+                ]
+            );
             ha.call("media_player", "turn_on", &config.tv.entity, json!({}))
                 .await
                 .unwrap();

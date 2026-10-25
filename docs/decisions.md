@@ -2,6 +2,48 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-25 — Shadow-operation core papercuts
+
+- Presence timeout marks the retained bus entry Unknown as well as its role
+  Off. Silence is not an observed standby report; retaining identity supports
+  discovery and the next normal power-on frame without inventing bus evidence.
+- HA state timestamps preserve parsed RFC 3339 `last_changed` values in UTC.
+  Missing/invalid timestamps fall back to injected wall time only when the
+  state string changes; attribute-only updates keep the previous timestamp.
+  Optimistic TV/receiver off writes preserve the last HA-observed timestamp:
+  a command is not an observation that the physical device changed state.
+- The config editor retains the actual file text at startup, after successful
+  saves, and after mode-only span replacement. Snapshot publication no longer
+  regenerates TOML, so saving does not discard comments/order or add the
+  `check-config` environment-secret footer. `Config.secrets` is serde-skipped
+  in both directions, its secret wrappers are not deserializable, and config
+  tables deny unknown fields: supported credential values come only from
+  environment resolution, not TOML. Operators must still never put secrets in
+  arbitrary comments or public string settings.
+  Startup reads the file once and passes the parsed config and original text
+  together through the runtime to the infallible `AppState::new(config, text)`;
+  there is no normalized-text fallback or second-read race.
+- Atomic rename is the config-save commit point. Directory fsync failures
+  after rename warn about crash durability but report success, keeping the
+  running model/editor synchronized with the already-replaced file. Failures
+  before rename still reject the save.
+- Engine transition coverage stays together in `tests/replay.rs`, reusing its
+  event helpers instead of introducing a duplicate unit-test harness.
+- Native amd64/arm64 digest builds also publish `:edge` for `main`; semver and
+  `latest` remain tag-only and GitHub release notes/releases are tag-only.
+  Per-ref non-cancelling concurrency keeps each manifest build intact without
+  conflating independent refs; image inspection uses metadata's actual version.
+
+## 2026-10-25 — Shadow `would:` prefix rendered once
+
+- The runtime's per-action `would: ` prefix in `DecisionView.actions` is the
+  single source of truth; `/decisions` and the `/bus` stream no longer add a
+  second template-level prefix (shadow rows showed `would: would: …`).
+- `DecisionView.would` still marks the whole row (amber arrow). The dashed amber
+  action style now applies only to actions whose string starts with `would: `,
+  so identification, resync and presence actions on a shadow row, which do run,
+  are not shown as suppressed.
+
 ## 2026-10-25 — Real-adapter runtime coverage
 
 - Extract the production scheduling loop into a private method accepting a

@@ -12,7 +12,7 @@ use crate::{
     },
     config::{Config, PowerEvent, Presence, Takeover},
     identity::{self, Resolution},
-    state::{Command, Mode, RolePower},
+    state::{BusPower, Command, Mode, RolePower},
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::{Value, json};
@@ -31,6 +31,7 @@ pub enum Event {
         entity: String,
         state: String,
         attrs: BTreeMap<String, Value>,
+        changed: Option<DateTime<Utc>>,
     },
     Tick,
     Command(Command),
@@ -59,6 +60,7 @@ impl Default for RoleState {
 pub struct HaState {
     pub state: String,
     pub attrs: BTreeMap<String, Value>,
+    pub changed: Option<DateTime<Utc>>,
 }
 
 pub struct Engine {
@@ -131,7 +133,8 @@ impl Engine {
                 entity,
                 state,
                 attrs,
-            } => self.handle_ha_state(entity, state, attrs),
+                changed,
+            } => self.handle_ha_state(entity, state, attrs, changed, wall),
             Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
             Event::Frame(frame) => self.handle_frame(frame, now),
             Event::Command(command) => self.handle_command(command, now),
@@ -165,8 +168,22 @@ impl Engine {
         entity: String,
         state: String,
         attrs: BTreeMap<String, Value>,
+        changed: Option<DateTime<Utc>>,
+        wall: DateTime<Utc>,
     ) -> Vec<Action> {
-        self.ha.insert(entity, HaState { state, attrs });
+        let previous = self.ha.get(&entity);
+        let changed = changed.or_else(|| match previous {
+            Some(previous) if previous.state == state => previous.changed,
+            _ => Some(wall),
+        });
+        self.ha.insert(
+            entity,
+            HaState {
+                state,
+                attrs,
+                changed,
+            },
+        );
         vec![]
     }
 
@@ -644,7 +661,10 @@ impl Engine {
             Action::ha("media_player", "turn_off", &self.config.receiver.entity),
         ];
         for entity in [&self.config.tv.entity, &self.config.receiver.entity] {
-            self.ha.entry(entity.clone()).or_default().state = "off".into();
+            let cached = self.ha.entry(entity.clone()).or_default();
+            if cached.state != "off" {
+                cached.state = "off".into();
+            }
         }
         self.record(None, None, None, "off_timer_expired", actions.clone());
         actions
@@ -716,6 +736,9 @@ impl Engine {
             }
             if state.misses >= self.config.timing.presence_misses {
                 self.signals.remove(&la);
+                if let Some(entry) = self.bus.entries.get_mut(&la) {
+                    entry.power = BusPower::Unknown;
+                }
                 actions.extend(self.transition(&role, RolePower::Off, "presence_timeout", now));
             } else {
                 state.awaiting = true;

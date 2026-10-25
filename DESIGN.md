@@ -247,7 +247,7 @@ Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_pl
 On start and on bridge LWT `Online`: send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
 
 ### 5.7 Presence polling (`presence = "poll"`)
-While the role is On: every `presence_poll_s` send `8F` to its LA. A `90 xx` reply (or any frame from that LA) resets the miss counter; `presence_misses` consecutive polls without any frame from the LA → role Off (with decision reason `presence_timeout`). Polling stops when Off.
+While the role is On: every `presence_poll_s` send `8F` to its LA. A `90 xx` reply (or any frame from that LA) resets the miss counter; `presence_misses` consecutive polls without any frame from the LA → role Off (with decision reason `presence_timeout`) and bus entry power Unknown, retaining its learned identity. Silence is not an observed standby report. Polling stops when Off.
 
 ### 5.8 Fake TV replies (frames addressed to the bridge LA)
 `fake_tv.replies` defaults to `true`. Set it to `false` when bridge firmware handles directed `8F`/`9F`/`46`/`91` requests itself; the service still handles broadcast `85` replies. Never reply to unregistered senders (LA 15).
@@ -268,7 +268,11 @@ Everything else: no reply (Feature Abort is a firmware concern).
 Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT). Entities: `binary_sensor.choregos_<role>` (power, per role), `sensor.choregos_active_source` (role name or `none`), `select.choregos_mode` (shadow/active), `button.choregos_all_off`, `binary_sensor.choregos_bridge` (bridge LWT), `sensor.choregos_conflicts` (count). Commands arrive on `choregos/cmd/<entity>`. State topics `choregos/state/<name>` retained.
 
 ### 5.12 Events into the engine
-`Frame`, `BridgeOnline/Offline`, `HaState{entity, state, attrs}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | ForceIdentify(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`Frame`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | ForceIdentify(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+HA's parsed `last_changed` takes precedence; absent/invalid timestamps use injected
+wall time on state-string changes, otherwise retain the cached timestamp.
+Optimistic state writes preserve the last HA-observed timestamp; sending a
+command does not establish when the device actually changed state.
 
 ## 6. Web UI (axum + askama + htmx + SSE; no JS build step)
 
@@ -277,16 +281,16 @@ Pages (all behind auth):
 - `/bus` Live bus: SSE stream of frames (decoded: from/to names, opcode name, operands) interleaved with decisions; filters by LA/opcode; last 2000 kept in memory (ring buffer in `AppState`).
 - `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "send identify" per LA.
 - `/decisions` Decision log with reasons and resulting actions (and `would:` entries in shadow mode).
-- `/config` Current TOML (secrets redacted), edit + validate + save (atomic), reload.
+- `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
 Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; local username/password break-glass form at `/login/local`; signed session cookie (`tower-sessions` or axum-extra signed cookies); CSRF for POSTs via same-site cookie + hidden token. Visual design: dark, dense, monospace for bus data; mocked before implementation (see `docs/ui.md` once written).
 
 ## 7. Operations
 
-- Docker: multi-stage build, static musl binary, `FROM gcr.io/distroless/static`, non-root, `/healthz` healthcheck, config mounted at `/config/choregos.toml`, secrets via env. Published as `ghcr.io/yasen-pavlov/choregos` on tags.
+- Docker: multi-stage build, static musl binary, `FROM gcr.io/distroless/static`, non-root, `/healthz` healthcheck, config mounted at `/config/choregos.toml`, secrets via env. Published as `ghcr.io/yasen-pavlov/choregos` on tags, and `:edge` on every push to `main`.
 - `deploy/docker-compose.yml`: standalone example (host port, config directory mount, env secrets, health check). Integration into a specific stack (reverse proxy, log driver, networks) is left to the operator.
 - Logging: `tracing` JSON to stdout; decision log lines are structured (`event=decision role=… from=… to=… reason=…`).
-- CI (GitHub Actions): fmt, clippy `-D warnings`, test, `cargo llvm-cov --lcov`, SonarCloud (`sonar.projectKey=yasen-pavlov_choregos`, fork-PR guard), docker build (no push) on PR; release workflow on `v*` tags: build + push multi-arch image, git-cliff notes, GitHub release. Dependabot for cargo + actions.
+- CI (GitHub Actions): fmt, clippy `-D warnings`, test, `cargo llvm-cov --lcov`, SonarCloud (`sonar.projectKey=yasen-pavlov_choregos`, fork-PR guard), docker build (no push) on PR; release workflow on `v*` tags and `main` pushes: build + push multi-arch image; git-cliff notes and GitHub release only on tags. Dependabot for cargo + actions.
 - Versioning: `Cargo.toml` stays `0.0.0`; tags drive versions.
 
 ## 8. Interfaces between slices
@@ -295,10 +299,11 @@ Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; loca
 // src/state.rs  (core owns; ui reads)
 pub struct AppState { inner: Arc<Inner> }
 impl AppState {
+    pub fn new(config: Config, config_text: String) -> Self; // config and text from the same file read
     pub fn snapshot(&self) -> Snapshot;                 // cheap clone of everything the UI renders
     pub fn subscribe(&self) -> broadcast::Receiver<UiEvent>; // Frame | Decision only
     pub async fn command(&self, cmd: Command) -> Result<(), CommandError>;
-    pub fn config_text(&self) -> String;                // redacted TOML
+    pub fn config_text(&self) -> String;                // current file text; environment secrets never serialized
     pub async fn save_config(&self, text: &str) -> Result<(), ConfigError>; // validate + atomic write + reload
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
@@ -316,7 +321,7 @@ All `*View` structs are plain `Clone + Serialize` data (no `Instant`s; use
 
 ## 9. Testing contract
 
-- `src/cec/*`, `src/identity.rs`, `src/engine.rs`: unit tests, no I/O. The engine is driven by `Event`s with an injected `now`.
+- `src/cec/*`, `src/identity.rs`: unit tests, no I/O. Engine behavior tests live in `tests/replay.rs`, driven by `Event`s with injected monotonic and wall times.
 - `tests/replay.rs`: feeds `fixtures/*.jsonl` through `BusModel` + `Engine` with the reference config and asserts the decision sequence (Kodi off → streaming box on → takeover actions → streaming box off → off-timer → TV/receiver off → streaming box on again → volume keys forwarded only when Sonos playing).
 - Runtime adapters (`mqtt`, `ha`, `wol`): thin; tested with a local broker (`rumqttd` in-process) and a fake HA websocket server in tests where cheap, otherwise exercised by the lead's smoke run against the real stack in shadow mode.
 - Web: handler tests with `axum::body` + a fake `AppState` for the pages; auth middleware tests (unauthenticated → redirect, local login happy path, CSRF rejection).
