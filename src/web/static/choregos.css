@@ -147,7 +147,7 @@ tr.decision .dir { color: var(--green); }
 tr.decision.would .dir { color: var(--amber); }
 .reason { color: var(--dim); margin: 0 6px; }
 .action { display: inline-block; margin: 1px 4px 1px 0; padding: 0 6px; border: 1px solid var(--line); border-radius: var(--radius); }
-tr.would .action { border-style: dashed; color: var(--amber); }
+.action.would { border-style: dashed; color: var(--amber); }
 tr.unidentified td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
 tr.conflicted td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 

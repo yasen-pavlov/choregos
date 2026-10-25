@@ -110,7 +110,6 @@ username = "admin"
 struct Harness {
     app: Router,
     state: AppState,
-    dir: tempfile::TempDir,
 }
 
 fn harness(issuer: &str) -> Harness {
@@ -118,7 +117,8 @@ fn harness(issuer: &str) -> Harness {
 }
 
 fn harness_at(issuer: &str, public_url: &str) -> Harness {
-    let mut config = Config::parse(&config_text(issuer, public_url)).expect("test config is valid");
+    let text = config_text(issuer, public_url);
+    let mut config = Config::parse(&text).expect("test config is valid");
     config
         .resolve_secrets(|name| {
             Some(match name {
@@ -127,12 +127,10 @@ fn harness_at(issuer: &str, public_url: &str) -> Harness {
             })
         })
         .expect("test secrets resolve");
-    let dir = tempfile::tempdir().expect("temp dir");
-    let state = AppState::new(config, dir.path().join("choregos.toml")).expect("state");
+    let state = AppState::new(config, text);
     Harness {
         app: router(state.clone()),
         state,
-        dir,
     }
 }
 
@@ -363,8 +361,8 @@ async fn logout_ends_the_session() {
 async fn invalid_config_is_reported_inline_and_not_saved() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, csrf) = h.login().await;
+    let saved = h.state.config_text();
     let page = body(h.get("/config", Some(&cookie)).await).await;
-    assert!(page.contains("[REDACTED]"));
     assert!(!page.contains(PASSWORD));
 
     let response = h
@@ -379,7 +377,7 @@ async fn invalid_config_is_reported_inline_and_not_saved() {
     let html = body(response).await;
     assert!(html.contains("invalid TOML configuration"));
     assert!(html.contains("mode = [&#34;&#60;b&#62;") || html.contains("mode = [&quot;&lt;b&gt;"));
-    assert!(!h.dir.path().join("choregos.toml").exists());
+    assert_eq!(h.state.config_text(), saved);
 
     let valid = config_text(UNREACHABLE_ISSUER, PUBLIC_URL);
     let encoded: String = openidconnect::url::form_urlencoded::Serializer::new(String::new())
@@ -393,7 +391,7 @@ async fn invalid_config_is_reported_inline_and_not_saved() {
             .await
             .contains("Configuration is valid (not saved).")
     );
-    assert!(!h.dir.path().join("choregos.toml").exists());
+    assert_eq!(h.state.config_text(), saved);
 }
 
 #[tokio::test]
@@ -561,6 +559,61 @@ fn frame(from: u8, to: u8, opcode: u8, opcode_name: &str) -> FrameView {
     }
 }
 
+/// A shadow-mode decision as the runtime records it: the suppressed action carries the
+/// runtime's `would: ` prefix, the identification query (never suppressed) carries none.
+fn shadow_decision() -> DecisionView {
+    DecisionView {
+        timestamp: chrono::Utc::now(),
+        role: Some("streamer".to_owned()),
+        from: Some(RolePower::Off),
+        to: Some(RolePower::On),
+        reason: "test_reason".to_owned(),
+        actions: vec![
+            "would: media_player.turn_on media_player.test_receiver".to_owned(),
+            "cec.give_osd_name 4".to_owned(),
+        ],
+        would: true,
+    }
+}
+
+/// Class tokens of the element whose text starts at the first occurrence of `text`.
+fn classes_around<'a>(html: &'a str, text: &str) -> Vec<&'a str> {
+    let at = html
+        .find(text)
+        .unwrap_or_else(|| panic!("{text:?} is rendered"));
+    let open = html[..at].rfind('<').expect("text sits inside an element");
+    html[open..at]
+        .split_once("class=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or_else(Vec::new, |(classes, _)| {
+            classes.split_whitespace().collect()
+        })
+}
+
+/// The suppressed action reads `would: ` exactly once and is marked `would`; the identify
+/// action, which runs even in shadow mode, has neither.
+fn assert_shadow_actions(html: &str) {
+    let suppressed = "would: media_player.turn_on media_player.test_receiver";
+    let identify = "cec.give_osd_name 4";
+    assert!(html.contains(suppressed));
+    assert!(!html.contains("would: would:"));
+    assert!(classes_around(html, suppressed).contains(&"would"));
+    let before_identify = &html[..html.find(identify).expect("identify action is rendered")];
+    assert!(!before_identify.ends_with("would: "));
+    assert!(!classes_around(html, identify).contains(&"would"));
+}
+
+#[tokio::test]
+async fn decisions_page_shows_the_runtime_would_prefix_once() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend([shadow_decision()]);
+    h.state.publish(snapshot, []);
+    let page = body(h.get("/decisions", Some(&cookie)).await).await;
+    assert_shadow_actions(&page);
+}
+
 #[tokio::test]
 async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
     let h = harness(UNREACHABLE_ISSUER);
@@ -581,15 +634,6 @@ async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
         "text/event-stream"
     );
     let mut stream = response.into_body().into_data_stream();
-    let decision = DecisionView {
-        timestamp: chrono::Utc::now(),
-        role: Some("streamer".to_owned()),
-        from: Some(RolePower::Off),
-        to: Some(RolePower::On),
-        reason: "test_reason".to_owned(),
-        actions: vec!["media_player.turn_on media_player.test_receiver".to_owned()],
-        would: true,
-    };
     h.state.publish(
         snapshot,
         [
@@ -597,7 +641,7 @@ async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
             UiEvent::Frame(history),
             UiEvent::Frame(frame(1, 0, 0x36, "Standby")),
             UiEvent::Frame(frame(4, 0, 0x04, "Image View On")),
-            UiEvent::Decision(decision),
+            UiEvent::Decision(shadow_decision()),
         ],
     );
     let mut received = String::new();
@@ -621,7 +665,7 @@ async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
         "LA filter applies to the stream"
     );
     assert!(received.contains("off → on"));
-    assert!(received.contains("would: media_player.turn_on"));
+    assert_shadow_actions(&received);
 }
 
 #[tokio::test]

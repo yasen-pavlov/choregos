@@ -115,7 +115,6 @@ struct Runtime {
     engine: Engine,
     adapters: Option<Adapters>,
     snapshot: Snapshot,
-    last_config: Arc<Config>,
     last_states: String,
     removed_roles: BTreeSet<String>,
 }
@@ -130,7 +129,6 @@ impl Runtime {
     ) -> Self {
         Self {
             snapshot: state.snapshot(),
-            last_config: engine.config.clone(),
             state,
             path,
             tx,
@@ -197,6 +195,7 @@ impl Runtime {
                 if let Command::SetMode(mode) = command {
                     persist_mode(mode, &self.path)
                         .await
+                        .map(|text| self.state.replace_config_text(text))
                         .map_err(CommandError::from)
                 } else {
                     Ok(())
@@ -230,6 +229,7 @@ impl Runtime {
     ) -> Vec<Event> {
         match reload(&text, &self.engine.config, &self.path).await {
             Ok(config) => {
+                self.state.replace_config_text(text);
                 self.restart_adapters(&config).await;
                 let _ = reply.send(Ok(()));
                 // ConfigReloaded updates the model; the retained Online LWT performs resync.
@@ -331,11 +331,6 @@ impl Runtime {
         ui_events: Vec<UiEvent>,
     ) -> anyhow::Result<()> {
         update_snapshot(&mut self.snapshot, &self.engine, now, wall);
-        if !Arc::ptr_eq(&self.last_config, &self.engine.config) {
-            self.state
-                .replace_config_text(self.engine.config.redacted_text()?);
-            self.last_config = self.engine.config.clone();
-        }
         let entity_states = format!(
             "{:?}{:?}{:?}{:?}{:?}",
             self.snapshot.mode,
@@ -378,8 +373,8 @@ impl Runtime {
     }
 }
 
-pub async fn run(config: Config, path: PathBuf) -> anyhow::Result<()> {
-    let state = AppState::new(config.clone(), &path)?;
+pub async fn run(config: Config, config_text: String, path: PathBuf) -> anyhow::Result<()> {
+    let state = AppState::new(config.clone(), config_text);
     let listener = tokio::net::TcpListener::bind(config.web.bind).await?;
     let (shutdown, mut stopped) = watch::channel(false);
     let mut server = tokio::spawn({
@@ -442,6 +437,7 @@ fn disconnected_events(mqtt: bool, connected: bool, config: &Config) -> Vec<Even
             entity,
             state: "unknown".into(),
             attrs: Default::default(),
+            changed: None,
         })
         .collect()
 }
@@ -510,7 +506,7 @@ async fn reload(text: &str, current: &Config, path: &Path) -> Result<Config, Con
 pub async fn persist(config: &Config, path: &Path) -> Result<(), ConfigError> {
     persist_text(&config.redacted_text()?, path).await
 }
-async fn persist_mode(mode: Mode, path: &Path) -> Result<(), ConfigError> {
+async fn persist_mode(mode: Mode, path: &Path) -> Result<String, ConfigError> {
     #[derive(serde::Deserialize)]
     struct ModeSpan {
         mode: toml::Spanned<Mode>,
@@ -519,7 +515,8 @@ async fn persist_mode(mode: Mode, path: &Path) -> Result<(), ConfigError> {
     Config::parse(&text)?;
     let span: ModeSpan = toml::from_str(&text).map_err(|_| ConfigError::Parse)?;
     text.replace_range(span.mode.span(), &format!("\"{mode}\""));
-    persist_text(&text, path).await
+    persist_text(&text, path).await?;
+    Ok(text)
 }
 async fn persist_text(text: &str, path: &Path) -> Result<(), ConfigError> {
     use tokio::io::AsyncWriteExt;
@@ -539,7 +536,13 @@ async fn persist_text(text: &str, path: &Path) -> Result<(), ConfigError> {
         file.sync_all().await?;
         drop(file);
         tokio::fs::rename(&temporary, path).await?;
-        tokio::fs::File::open(parent).await?.sync_all().await?;
+        if let Err(error) = async {
+            tokio::fs::File::open(parent).await?.sync_all().await
+        }
+        .await
+        {
+            tracing::warn!(error = %error, "config renamed but directory sync failed; crash durability is not guaranteed");
+        }
         Ok::<(), std::io::Error>(())
     }
     .await;
@@ -610,7 +613,7 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
                 .map(|v| v.state.clone())
                 .unwrap_or_else(|| "unknown".into()),
             attributes: value.map(|v| v.attrs.clone()).unwrap_or_default(),
-            last_changed: None,
+            last_changed: value.and_then(|v| v.changed),
         }
     };
     snapshot.ha = HaView {
@@ -801,6 +804,7 @@ mod review_tests {
                 entity: config.tv.entity.clone(),
                 state: "on".into(),
                 attrs: Default::default(),
+                changed: None,
             },
             now,
             wall,

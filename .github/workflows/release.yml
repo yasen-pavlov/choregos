@@ -1,7 +1,11 @@
 name: Release
 on:
   push:
+    branches: [main]
     tags: ['v*']
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 permissions:
   contents: read
 env:
@@ -32,6 +36,11 @@ jobs:
         id: meta
         with:
           images: ${{ env.IMAGE }}
+          tags: |
+            type=edge,branch=main
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
       - uses: docker/build-push-action@v7
         id: build
         with:
@@ -80,22 +89,27 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
+            type=edge,branch=main
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "$IMAGE@sha256:%s " *)
-          docker buildx imagetools inspect "$IMAGE:${GITHUB_REF_NAME#v}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
       - uses: orhun/git-cliff-action@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         id: cliff
         with:
           config: cliff.toml
           args: --latest --strip header
       - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}

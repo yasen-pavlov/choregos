@@ -16,7 +16,7 @@
   <td colspan="5">
     <strong>{{ view::opt(decision.role) }}</strong> {{ view::transition(decision.from, decision.to) }}
     <span class="reason">{{ decision.reason }}</span>
-    {% for action in decision.actions %}<span class="action mono">{% if decision.would %}would: {% endif %}{{ action }}</span>{% endfor %}
+    {% for action in decision.actions %}<span class="action mono{% if action.starts_with("would: ") %} would{% endif %}">{{ action }}</span>{% endfor %}
   </td>
 </tr>
 {% endmatch %}

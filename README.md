@@ -65,7 +65,9 @@ cargo run -- run --config choregos.toml
 ```
 
 The config command resolves environment inputs but prints only redacted public
-settings. Live config saves validate before atomic replacement and reload.
+settings. The live editor shows the current file verbatim, including comments
+and ordering; saves validate before atomic replacement and reload. Secrets come
+only from environment variables, never from TOML.
 Mode changes replace only the mode value, preserving comments/order and unrelated
 manual edits. `web`, `mqtt`, `home_assistant`, and `tv.wake` changes require a
 restart: the editor rejects these changes explicitly to prevent authenticated
@@ -86,7 +88,8 @@ namespace is supported.
 ## Running with Docker
 
 Images are published to `ghcr.io/yasen-pavlov/choregos` on `v*` tags for amd64 and
-arm64. Pin a release tag for production; `latest` follows tagged releases.
+arm64, with `:edge` updated on every push to `main`. Pin a release tag for
+production; `latest` follows tagged releases only.
 
 ```sh
 mkdir -p config

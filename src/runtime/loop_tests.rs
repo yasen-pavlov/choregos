@@ -373,13 +373,13 @@ impl Harness {
             .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("choregos.toml");
-        let text = config.redacted_text().unwrap().replacen(
+        let text = toml::to_string_pretty(&config).unwrap().replacen(
             "mode = \"shadow\"",
             "mode = \"shadow\" # preserve this operator comment",
             1,
         );
-        tokio::fs::write(&path, text).await.unwrap();
-        let state = AppState::new(config.clone(), &path).unwrap();
+        tokio::fs::write(&path, &text).await.unwrap();
+        let state = AppState::new(config.clone(), text);
         let (tx, mut rx) = mpsc::channel(256);
         state.attach(tx.clone());
         let engine = Engine::new(config.clone(), Instant::now());
@@ -577,10 +577,17 @@ async fn app_commands_persist_mode_execute_takeover_and_reload_configuration_thr
     harness.command(Command::Standby("streamer".into())).await;
     wait_snapshot(&harness.state, |snapshot| !role_on(snapshot)).await;
     let original = tokio::fs::read_to_string(&harness.path).await.unwrap();
+    assert!(original.contains("# preserve this operator comment"));
+    assert!(!original.contains("# Environment secrets"));
+    assert_eq!(harness.state.config_text(), original);
     harness.command(Command::SetMode(Mode::Active)).await;
     wait_snapshot(&harness.state, |snapshot| snapshot.mode == Mode::Active).await;
     assert_eq!(
         tokio::fs::read_to_string(&harness.path).await.unwrap(),
+        original.replacen("mode = \"shadow\"", "mode = \"active\"", 1)
+    );
+    assert_eq!(
+        harness.state.config_text(),
         original.replacen("mode = \"shadow\"", "mode = \"active\"", 1)
     );
     harness.peer.wait_state("mode", "active").await;
@@ -614,13 +621,14 @@ async fn app_commands_persist_mode_execute_takeover_and_reload_configuration_thr
     let mut changed = Config::parse(&harness.state.config_text()).unwrap();
     changed.timing.off_delay_s = 0;
     changed.device.retain(|device| device.role != "console_b");
-    tokio::time::timeout(
-        WAIT,
-        harness.state.save_config(&changed.redacted_text().unwrap()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let submitted = format!(
+        "# preserve this operator comment after save\n{}",
+        toml::to_string_pretty(&changed).unwrap()
+    );
+    tokio::time::timeout(WAIT, harness.state.save_config(&submitted))
+        .await
+        .unwrap()
+        .unwrap();
     wait_snapshot(&harness.state, |snapshot| {
         snapshot.connections.mqtt_connected
             && snapshot.connections.ha_connected
@@ -645,6 +653,19 @@ async fn app_commands_persist_mode_execute_takeover_and_reload_configuration_thr
             .timing
             .off_delay_s,
         0
+    );
+    assert_eq!(harness.state.config_text(), submitted);
+    assert_eq!(
+        tokio::fs::read_to_string(&harness.path).await.unwrap(),
+        submitted
+    );
+    harness.command(Command::SetMode(Mode::Shadow)).await;
+    wait_snapshot(&harness.state, |snapshot| snapshot.mode == Mode::Shadow).await;
+    let switched = submitted.replacen("mode = \"active\"", "mode = \"shadow\"", 1);
+    assert_eq!(harness.state.config_text(), switched);
+    assert_eq!(
+        tokio::fs::read_to_string(&harness.path).await.unwrap(),
+        switched
     );
     harness
         .peer

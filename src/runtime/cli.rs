@@ -10,10 +10,12 @@ use std::{
 };
 
 pub async fn run(path: std::path::PathBuf) -> anyhow::Result<()> {
-    super::run(config::load(&path)?, path).await
+    let (config, text) = config::load(&path)?;
+    super::run(config, text, path).await
 }
 pub fn check_config(path: &Path) -> anyhow::Result<String> {
-    Ok(config::load(path)?.redacted_text()?)
+    let (config, _) = config::load(path)?;
+    Ok(config.redacted_text()?)
 }
 pub async fn healthz(url: &str) -> anyhow::Result<()> {
     let response = openidconnect::reqwest::Client::builder()

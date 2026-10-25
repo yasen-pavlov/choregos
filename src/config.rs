@@ -246,10 +246,11 @@ pub struct LocalLoginConfig {
     pub username: String,
 }
 
-pub fn load(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
-    let mut config = Config::parse(&std::fs::read_to_string(path)?)?;
+pub fn load(path: impl AsRef<Path>) -> Result<(Config, String), ConfigError> {
+    let text = std::fs::read_to_string(path)?;
+    let mut config = Config::parse(&text)?;
     config.resolve_secrets(|name| std::env::var(name).ok())?;
-    Ok(config)
+    Ok((config, text))
 }
 
 impl Config {

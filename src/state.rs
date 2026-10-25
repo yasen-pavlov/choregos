@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -40,12 +39,11 @@ struct Inner {
     config_text: std::sync::RwLock<String>,
     runtime: std::sync::RwLock<Option<tokio::sync::mpsc::Sender<crate::runtime::Input>>>,
     auth: AuthConfig,
-    _config_path: PathBuf,
 }
 
 impl AppState {
     /// Build an initially disconnected, warming state without any network I/O.
-    pub fn new(config: Config, config_path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+    pub fn new(config: Config, config_text: String) -> Self {
         let connections = Health {
             mqtt_connected: false,
             ha_connected: false,
@@ -105,16 +103,15 @@ impl AppState {
             },
         };
         let (events, _) = broadcast::channel(256);
-        Ok(Self {
+        Self {
             inner: Arc::new(Inner {
                 snapshot: std::sync::RwLock::new(snapshot),
                 events,
-                config_text: std::sync::RwLock::new(config.redacted_text()?),
+                config_text: std::sync::RwLock::new(config_text),
                 runtime: std::sync::RwLock::new(None),
                 auth,
-                _config_path: config_path.into(),
             }),
-        })
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
