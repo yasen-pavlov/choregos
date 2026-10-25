@@ -2,6 +2,37 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-25 — Real-adapter runtime coverage
+
+- Extract the production scheduling loop into a private method accepting a
+  shutdown future. Production supplies the existing OS-signal future; tests use
+  a one-shot, exercising the same channel/timer dispatch and snapshot updates.
+- Runtime tests use rumqttd's actual Router/Server inside an owned Tokio runtime
+  because `Broker::start` exposes no shutdown handle. Dropping that runtime
+  closes the listener and every connection for actual disconnect/reconnect tests.
+- Loopback HA authenticates, returns initial states and acknowledges/records
+  services. All wake packets target an ephemeral loopback UDP socket; environment
+  credentials and installation endpoints are never used.
+- Timing reload is observed through the config view and the resulting snapshot
+  decisions at the new deadline; the public snapshot DTO is not expanded merely
+  for coverage. Tests use bounded observations and explicit input barriers.
+
+## 2026-10-25 — Sonar maintainability refactor
+
+- Replace production wildcard imports with the explicit opcode and state types
+  each module consumes.
+- Split configuration validation by existing sections and device matching/policy,
+  preserving validation order and error messages.
+- Dispatch engine events through named handlers; keep frame learning, identity
+  reconciliation, volume forwarding, warming and timer phases separate while
+  retaining their action/decision ordering and injected-time behavior.
+- Group runtime loop state in a private owner with input, command, connection,
+  reload, effect and snapshot methods. Adapter ownership is temporarily absent
+  only while draining/restarting during a config reload.
+- This is a behavior-preserving refactor with no public interface changes or rule
+  suppressions. Extracted engine phases reuse action buffers rather than adding
+  per-frame temporary action allocations.
+
 ## 2026-10-25 — Lead-approved core/runtime review corrections
 
 Engine review decisions:

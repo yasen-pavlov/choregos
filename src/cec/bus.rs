@@ -1,6 +1,9 @@
 use super::{
     frame::{Frame, decode_osd},
-    opcode::*,
+    opcode::{
+        ACTIVE_SOURCE, DEVICE_VENDOR_ID, IMAGE_VIEW_ON, INACTIVE_SOURCE, REPORT_PHYSICAL_ADDRESS,
+        REPORT_POWER_STATUS, SET_OSD_NAME, STANDBY, TEXT_VIEW_ON,
+    },
 };
 use crate::{action::Action, state::BusPower};
 use std::{

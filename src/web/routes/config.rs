@@ -14,11 +14,13 @@ use crate::{
     web::{WebError, WebState, auth::Ctx, render, view::Layout},
 };
 
+/// The full page includes `partials/config_form.html`, so it carries the same fields.
 #[derive(Template)]
 #[template(path = "config.html")]
 struct ConfigTemplate {
     layout: Option<Layout>,
-    form: ConfigForm,
+    text: String,
+    message: Option<Message>,
 }
 
 /// The editor fragment; POST responses replace only this.
@@ -53,10 +55,8 @@ pub(crate) async fn page(State(web): State<WebState>, ctx: Ctx) -> Result<Html<S
     let snapshot = web.app.snapshot();
     render(&ConfigTemplate {
         layout: Some(Layout::new(ctx, "config", &snapshot)),
-        form: ConfigForm {
-            text: web.app.config_text(),
-            message: None,
-        },
+        text: web.app.config_text(),
+        message: None,
     })
 }
 

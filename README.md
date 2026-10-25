@@ -151,8 +151,12 @@ capture starts with Kodi standby and ends with volume presses. Both Sonos
 playing and paused branches are tested with injected HA events.
 
 Unit and replay tests use injected time; MQTT tests run an in-process local
-`rumqttd` broker, HA tests use a loopback fake websocket. Tests never need a real
-home-theater installation. CI runs formatting, clippy, tests and LLVM LCOV,
+`rumqttd` broker, HA tests use a loopback fake websocket. Runtime acceptance tests
+drive the production loop against both adapters, including shadow suppression,
+mode/config persistence, retained discovery/state, broker restart and HA disconnect.
+The broker's listener and connections are owned by a disposable test runtime,
+so reconnect tests genuinely close sockets rather than inject connection flags.
+Tests never need a real home-theater installation. CI runs formatting, clippy, tests and LLVM LCOV,
 then uploads coverage to SonarCloud for same-repository PRs and main pushes.
 Docker builds run on PRs without pushing. Releases use git-cliff notes; the
 package version stays `0.0.0`, with release identity provided by tags.

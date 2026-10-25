@@ -4,6 +4,6 @@
 <section class="panel">
   <h2>configuration</h2>
   <p class="hint">Secrets are never shown or accepted here; they come from environment variables. Save validates, writes atomically and reloads.</p>
-  {{ form|safe }}
+  {% include "partials/config_form.html" %}
 </section>
 {% endblock %}

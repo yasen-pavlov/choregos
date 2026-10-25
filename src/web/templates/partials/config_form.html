@@ -1,6 +1,7 @@
 <form id="config-form" class="config">
-  {% if let Some(message) = message %}<div class="flash {% if message.ok %}ok{% else %}err{% endif %}" role="status">{{ message.text }}</div>{% endif %}
-  <textarea name="config" class="mono" spellcheck="false" autocomplete="off" rows="40" aria-label="configuration TOML">{{ text }}</textarea>
+  {% if let Some(message) = message %}<output class="flash {% if message.ok %}ok{% else %}err{% endif %}">{{ message.text }}</output>{% endif %}
+  <label for="config-text">configuration TOML</label>
+  <textarea id="config-text" name="config" class="mono" spellcheck="false" autocomplete="off" rows="40">{{ text }}</textarea>
   <div class="buttons">
     <button type="button" hx-post="/config" hx-vals='{"action":"validate"}' hx-target="#config-form" hx-swap="outerHTML">validate</button>
     <button type="button" class="primary" hx-post="/config" hx-vals='{"action":"save"}' hx-target="#config-form" hx-swap="outerHTML" hx-confirm="Save and reload the configuration?">save</button>

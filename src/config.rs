@@ -307,6 +307,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_devices()?;
+        self.validate_timing()?;
+        self.validate_fake_tv()?;
+        if self.bridge.logical_address > 14 {
+            return invalid("bridge logical address must be in 0..=14");
+        }
+        if let WakeConfig::Wol { mac, .. } = &self.tv.wake {
+            parse_mac(mac)?;
+        }
+        self.validate_presets()
+    }
+
+    fn validate_devices(&self) -> Result<(), ConfigError> {
         let mut roles = HashSet::new();
         let mut sources = HashSet::new();
         for device in &self.device {
@@ -327,28 +340,12 @@ impl Config {
             if device.source.is_empty() || !sources.insert(device.source.as_str()) {
                 return invalid("device sources must be nonempty and unique");
             }
-            let rule = &device.matches;
-            if rule.osd.as_ref().is_none_or(|osd| osd.trim().is_empty())
-                && rule.vendor.is_none()
-                && rule.physical.is_none()
-            {
-                return invalid("each device requires at least one nonempty match key");
-            }
-            if let Some(vendor) = &rule.vendor
-                && (vendor.len() != 6 || !vendor.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            {
-                return invalid("vendor must be exactly six hexadecimal digits");
-            }
-            if let Some(physical) = &rule.physical {
-                parse_physical(physical)?;
-            }
-            if device.presence == Presence::Poll && device.kind != DeviceKind::Playback {
-                return invalid("poll presence requires playback kind");
-            }
-            if device.takeover == Takeover::HaMediaStop && device.media_player.is_none() {
-                return invalid("ha_media_stop takeover requires media_player");
-            }
+            device.validate_matching_and_policy()?;
         }
+        Ok(())
+    }
+
+    fn validate_timing(&self) -> Result<(), ConfigError> {
         if self.timing.presence_poll_s == 0
             || self.timing.presence_misses == 0
             || self.timing.identify_retry_s == 0
@@ -357,6 +354,10 @@ impl Config {
                 "presence_poll_s, presence_misses and identify_retry_s must be positive",
             );
         }
+        Ok(())
+    }
+
+    fn validate_fake_tv(&self) -> Result<(), ConfigError> {
         if self.fake_tv.power_status != "always_on" || self.fake_tv.cec_version != "1.4" {
             return invalid("fake_tv supports only always_on power and CEC version 1.4");
         }
@@ -366,12 +367,10 @@ impl Config {
         {
             return invalid("fake_tv.osd_name must contain 1–14 ASCII bytes");
         }
-        if self.bridge.logical_address > 14 {
-            return invalid("bridge logical address must be in 0..=14");
-        }
-        if let WakeConfig::Wol { mac, .. } = &self.tv.wake {
-            parse_mac(mac)?;
-        }
+        Ok(())
+    }
+
+    fn validate_presets(&self) -> Result<(), ConfigError> {
         if self.presets.timezone.parse::<chrono_tz::Tz>().is_err() {
             return invalid("presets timezone must be an IANA timezone");
         }
@@ -391,6 +390,33 @@ impl Config {
         }
         if cursor != 24 * 60 {
             return invalid("preset slots must cover 24 hours without gaps or overlap");
+        }
+        Ok(())
+    }
+}
+
+impl DeviceConfig {
+    fn validate_matching_and_policy(&self) -> Result<(), ConfigError> {
+        let rule = &self.matches;
+        if rule.osd.as_ref().is_none_or(|osd| osd.trim().is_empty())
+            && rule.vendor.is_none()
+            && rule.physical.is_none()
+        {
+            return invalid("each device requires at least one nonempty match key");
+        }
+        if let Some(vendor) = &rule.vendor
+            && (vendor.len() != 6 || !vendor.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return invalid("vendor must be exactly six hexadecimal digits");
+        }
+        if let Some(physical) = &rule.physical {
+            parse_physical(physical)?;
+        }
+        if self.presence == Presence::Poll && self.kind != DeviceKind::Playback {
+            return invalid("poll presence requires playback kind");
+        }
+        if self.takeover == Takeover::HaMediaStop && self.media_player.is_none() {
+            return invalid("ha_media_stop takeover requires media_player");
         }
         Ok(())
     }
