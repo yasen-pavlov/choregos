@@ -1,7 +1,7 @@
 use crate::{
-    action::{Action, Decision},
+    action::{Action, Decision, IdentifyQueries},
     cec::{
-        bus::BusModel,
+        bus::{BusModel, LearnedIdentity},
         frame::Frame,
         opcode::{
             ACTIVE_SOURCE, CEC_VERSION, DEVICE_VENDOR_ID, GET_CEC_VERSION, GET_MENU_LANGUAGE,
@@ -79,19 +79,23 @@ pub struct Engine {
     signals: BTreeMap<u8, Vec<PowerEvent>>,
 }
 impl Engine {
-    pub fn new(config: Config, now: Instant) -> Self {
+    pub fn new(config: Config, now: Instant, restored: Vec<LearnedIdentity>) -> Self {
         let roles = config
             .device
             .iter()
             .map(|d| (d.role.clone(), RoleState::default()))
             .collect();
+        let mut bus = BusModel::new(
+            config.bridge.logical_address,
+            config.timing.identify_retry_s,
+            Self::required_queries(&config),
+        );
+        bus.restore(restored, now);
+        let identity = identity::resolve(&config.device, &bus);
         Self {
-            bus: BusModel::new(
-                config.bridge.logical_address,
-                config.timing.identify_retry_s,
-            ),
+            bus,
             config: Arc::new(config),
-            identity: Resolution::default(),
+            identity,
             roles,
             ha: BTreeMap::new(),
             active_role: None,
@@ -104,16 +108,38 @@ impl Engine {
             signals: BTreeMap::new(),
         }
     }
+    fn required_queries(config: &Config) -> IdentifyQueries {
+        IdentifyQueries {
+            physical: true,
+            vendor: config
+                .device
+                .iter()
+                .any(|device| device.matches.vendor.is_some()),
+            osd: config
+                .device
+                .iter()
+                .any(|device| device.matches.osd.is_some()),
+        }
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
+        let identify = self
+            .bridge_online
+            .then(|| self.bus.next_identify_deadline())
+            .flatten();
         if self.warming {
-            return Some(self.warm_until);
+            return [Some(self.warm_until), identify]
+                .into_iter()
+                .flatten()
+                .min();
         }
         self.roles
             .iter()
-            .filter(|(role, _)| !self.identity.blocked.contains(*role))
+            .filter(|(role, _)| self.bridge_online && !self.identity.blocked.contains(*role))
             .filter_map(|(_, r)| r.poll_at)
             .chain(self.off_at)
             .chain(self.settle.as_ref().map(|s| s.0))
+            .chain(identify)
             .min()
     }
     pub fn handle(&mut self, event: Event, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
@@ -136,8 +162,9 @@ impl Engine {
                 changed,
             } => self.handle_ha_state(entity, state, attrs, changed, wall),
             Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
-            Event::Frame(frame) => self.handle_frame(frame, now),
+            Event::Frame(frame) => self.handle_frame(frame, now, wall),
             Event::Command(command) => self.handle_command(command, now),
+            Event::Tick if self.bridge_online => self.bus.retry_identification(now),
             Event::Tick => vec![],
         };
         if was_warming && !self.warming {
@@ -204,6 +231,7 @@ impl Engine {
             self.bus = BusModel::new(
                 self.config.bridge.logical_address,
                 self.config.timing.identify_retry_s,
+                Self::required_queries(&self.config),
             );
             self.signals.clear();
             self.active_role = None;
@@ -211,8 +239,10 @@ impl Engine {
                 *role = RoleState::default();
             }
         } else {
-            self.bus
-                .set_identify_retry(self.config.timing.identify_retry_s);
+            self.bus.configure_identification(
+                self.config.timing.identify_retry_s,
+                Self::required_queries(&self.config),
+            );
         }
         self.identity = identity::resolve(&self.config.device, &self.bus);
         self.warming = true;
@@ -220,27 +250,20 @@ impl Engine {
         vec![]
     }
 
-    fn handle_frame(&mut self, frame: Frame, now: Instant) -> Vec<Action> {
+    fn handle_frame(&mut self, frame: Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
         let previous_roles = self.identity.roles.clone();
-        let mut actions = self.learn_frame(&frame, now);
+        let mut actions = self.learn_frame(&frame, now, wall);
         self.reconcile_frame_roles(&previous_roles, &frame, now, &mut actions);
         actions.extend(self.fake_tv(&frame));
         self.forward_volume(&frame, &mut actions);
         actions
     }
 
-    fn learn_frame(&mut self, frame: &Frame, now: Instant) -> Vec<Action> {
-        if frame.opcode == Some(REPORT_PHYSICAL_ADDRESS)
-            && self
-                .bus
-                .entries
-                .get(&frame.from)
-                .and_then(|e| e.physical)
-                .is_some_and(|pa| Some(pa) != frame.physical())
-        {
+    fn learn_frame(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
+        if self.bus.replaces_identity(frame) {
             self.signals.remove(&frame.from);
         }
-        let actions = self.bus.handle(frame, now);
+        let actions = self.bus.handle(frame, now, wall);
         self.signals
             .retain(|la, _| self.bus.entries.contains_key(la));
         if self.warming
@@ -407,8 +430,12 @@ impl Engine {
                 self.record(None, None, None, "command_set_mode", vec![]);
             }
             Command::Identify(la) => {
-                if la < 15 {
-                    actions.push(Action::Identify { la });
+                if la < 15 && la != self.bus.bridge {
+                    self.bus.manual_identify(la, now);
+                    actions.push(Action::Identify {
+                        la,
+                        queries: IdentifyQueries::ALL,
+                    });
                 }
             }
             Command::SendRaw { to, data } => {
@@ -477,11 +504,24 @@ impl Engine {
     fn resync(&mut self, now: Instant) -> Vec<Action> {
         self.warming = true;
         self.warm_until = now + Duration::from_secs(3);
+        self.bus.reset_identification(now);
         for role in self.roles.values_mut() {
             role.awaiting = false;
             role.misses = 0;
         }
-        vec![Action::Resync]
+        let mut actions = vec![Action::Resync];
+        for (&la, entry) in &self.bus.entries {
+            if !entry.verified && la < 15 && la != self.bus.bridge {
+                actions.push(Action::Identify {
+                    la,
+                    queries: IdentifyQueries {
+                        physical: true,
+                        ..IdentifyQueries::default()
+                    },
+                });
+            }
+        }
+        actions
     }
     fn signal(&self, frame: &Frame) -> Option<PowerEvent> {
         match frame.opcode {

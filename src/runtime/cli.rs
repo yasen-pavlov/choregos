@@ -42,7 +42,7 @@ pub fn replay_file(config: &Path, fixture: &Path, output: &mut impl Write) -> an
 }
 pub fn replay(config: Config, text: &str, output: &mut impl Write) -> anyhow::Result<()> {
     let start = Instant::now();
-    let mut engine = Engine::new(config, start);
+    let mut engine = Engine::new(config, start, vec![]);
     let mut epoch = None;
     let mut last = None;
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -113,6 +113,30 @@ mod tests {
         assert!(
             text.lines()
                 .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+    }
+    #[test]
+    fn replay_file_never_creates_or_changes_runtime_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("choregos.toml");
+        let fixture = directory.path().join("capture.jsonl");
+        let state = directory.path().join("choregos.state.json");
+        std::fs::write(&config, include_str!("../../choregos.example.toml")).unwrap();
+        std::fs::write(
+            &fixture,
+            include_str!("../../fixtures/capture-streamer-wake.jsonl"),
+        )
+        .unwrap();
+        let mut output = vec![];
+        replay_file(&config, &fixture, &mut output).unwrap();
+        assert!(!state.exists());
+        std::fs::write(&state, b"existing runtime state").unwrap();
+        replay_file(&config, &fixture, &mut output).unwrap();
+        assert_eq!(std::fs::read(&state).unwrap(), b"existing runtime state");
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("takeover_settled")
         );
     }
     #[tokio::test]

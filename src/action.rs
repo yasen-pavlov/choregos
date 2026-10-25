@@ -1,11 +1,32 @@
 use crate::state::RolePower;
 use serde::Serialize;
 
+/// Read-only identity queries, selected independently for each missing key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct IdentifyQueries {
+    pub physical: bool,
+    pub vendor: bool,
+    pub osd: bool,
+}
+
+impl IdentifyQueries {
+    pub const ALL: Self = Self {
+        physical: true,
+        vendor: true,
+        osd: true,
+    };
+
+    pub fn is_empty(self) -> bool {
+        !self.physical && !self.vendor && !self.osd
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
     Identify {
         la: u8,
+        queries: IdentifyQueries,
     },
     Resync,
     PresencePoll {

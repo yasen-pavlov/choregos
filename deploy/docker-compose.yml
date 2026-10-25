@@ -1,8 +1,9 @@
 # Standalone example. Copy choregos.example.toml to ./choregos/choregos.toml,
 # put the secrets in a .env file next to this compose file, then `docker compose up -d`.
 #
-# Wake-on-LAN: with the default bridge network, use tv.wake.kind = "http".
-# Direct WoL (kind = "wol") needs `network_mode: host` instead of `ports:`.
+# Wake-on-LAN: bridge-network direct WoL works with a directed broadcast
+# (e.g. 192.168.1.255) that the router forwards to the TV network. Otherwise
+# use `network_mode: host` instead of `ports:`, or tv.wake.kind = "http".
 services:
   choregos:
     image: ghcr.io/yasen-pavlov/choregos:latest
@@ -14,7 +15,7 @@ services:
     ports:
       - "8095:8095"
     # Mount the directory, not a single file: saves use atomic rename, and the
-    # directory must be writable by uid 65532 for UI config edits.
+    # directory must be writable by uid 65532 for config edits and choregos.state.json.
     volumes:
       - ./choregos:/config
     environment:
