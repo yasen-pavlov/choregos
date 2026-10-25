@@ -1,0 +1,7 @@
+/target
+/choregos.toml
+*.env
+.env*
+
+# internal lab setup (real values, never committed)
+/local/
