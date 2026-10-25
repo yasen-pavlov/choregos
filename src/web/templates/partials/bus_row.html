@@ -1,0 +1,22 @@
+{% match row %}
+{% when BusRow::Frame(frame) %}
+<tr class="frame {{ view::direction(frame.direction) }}">
+  <td class="mono dim" title="{{ view::iso(frame.timestamp) }}">{{ view::clock(frame.timestamp) }}</td>
+  <td class="dir">{{ view::direction(frame.direction) }}</td>
+  <td><span class="mono la">{{ frame.from }}</span> {{ frame.from_name }}</td>
+  <td><span class="mono la">{{ frame.to }}</span> {{ frame.to_name }}</td>
+  <td class="mono op">{{ view::opcode(frame.opcode) }}</td>
+  <td>{{ frame.opcode_name }}</td>
+  <td class="mono">{{ view::hex_bytes(frame.params) }}</td>
+</tr>
+{% when BusRow::Decision(decision) %}
+<tr class="decision{% if decision.would %} would{% endif %}">
+  <td class="mono dim" title="{{ view::iso(decision.timestamp) }}">{{ view::clock(decision.timestamp) }}</td>
+  <td class="dir">⇒</td>
+  <td colspan="5">
+    <strong>{{ view::opt(decision.role) }}</strong> {{ view::transition(decision.from, decision.to) }}
+    <span class="reason">{{ decision.reason }}</span>
+    {% for action in decision.actions %}<span class="action mono">{% if decision.would %}would: {% endif %}{{ action }}</span>{% endfor %}
+  </td>
+</tr>
+{% endmatch %}

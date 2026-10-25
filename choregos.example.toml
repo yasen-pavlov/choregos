@@ -1,0 +1,115 @@
+mode = "shadow"            # shadow | active   (also switchable at runtime; persisted back to this file)
+
+[mqtt]
+host = "mqtt.lan"
+port = 1883
+username = "choregos"
+# password: env CHOREGOS_MQTT_PASSWORD
+client_id = "choregos"
+
+[bridge]                  # the Tasmota CEC device
+topic = "tasmota_cec"  # tele/<topic>/SENSOR, cmnd/<topic>/HdmiSend, stat/<topic>/RESULT, tele/<topic>/LWT
+logical_address = 0       # what the bridge claims; frames To:<this> are "to the TV"
+
+[home_assistant]
+url = "http://homeassistant.lan:8123"
+# token: env CHOREGOS_HA_TOKEN  (long-lived access token)
+
+[tv]
+entity = "media_player.tv"
+wake = { kind = "wol", mac = "AA:BB:CC:DD:EE:FF", broadcast = "192.168.10.255", port = 9 }
+# or: wake = { kind = "http", url = "http://wol-service.lan:8090/api/wake/<device-id>", header = "Authorization", token_env = "CHOREGOS_WAKE_TOKEN" }
+
+[receiver]
+entity = "media_player.receiver"
+select_source = true      # call media_player.select_source on takeover (the receiver may also follow <Active Source> itself)
+
+[presets]                 # HA scripts, chosen by local time
+timezone = "Europe/Berlin"
+[[presets.slot]]
+from = "09:00"
+to = "21:00"
+script = "script.listening_day"
+[[presets.slot]]
+from = "21:00"
+to = "24:00"
+script = "script.listening_evening"
+[[presets.slot]]
+from = "00:00"
+to = "09:00"
+script = "script.listening_night"
+
+[sonos]
+entity = "media_player.sonos"
+mute_switch = "switch.sonos_mute"
+volume_from = ["streamer"]        # roles whose remote volume keys are forwarded while Sonos is playing
+
+[timing]
+off_delay_s = 3                   # last device off → TV/receiver off
+takeover_settle_ms = 2000         # receiver turn_on → select_source → preset
+presence_poll_s = 5               # for roles with presence = "poll"
+presence_misses = 2
+identify_retry_s = 10
+
+[fake_tv]
+replies = true                  # false if bridge firmware owns directed TV replies; broadcast Active Source stays enabled
+power_status = "always_on"        # reply <Report Power Status: On> to <Give Device Power Status>
+cec_version = "1.4"
+osd_name = "Choregos"
+
+[[device]]
+role = "streamer"                 # unique id, also HA entity suffix
+name = "Streaming box"
+kind = "playback"
+match = { vendor = "0010FA" }     # any listed key must match (osd > vendor > physical priority for conflicts)
+source = "Streamer"               # receiver source name for select_source
+on = ["image_view_on", "text_view_on", "active_source", "power_on"]
+off = ["standby", "inactive_source", "power_standby"]
+takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | none
+presence = "events"               # events | poll  (poll: send <Give Device Power Status> every presence_poll_s while on)
+
+[[device]]
+role = "kodi"
+name = "Kodi box"
+kind = "recording"
+match = { osd = "Kodi" }
+source = "Kodi"
+on = ["image_view_on", "active_source"]
+off = ["standby", "inactive_source", "power_standby"]
+takeover = "ha_media_stop"
+media_player = "media_player.kodi"
+presence = "events"
+
+[[device]]
+role = "console_b"
+name = "Console B"
+kind = "playback"
+match = { vendor = "080046" }      # Sony (unverified — confirm in shadow mode; fallback physical = "2.4.0.0")
+source = "Console B"
+on = ["image_view_on", "text_view_on", "active_source", "power_on"]
+off = ["standby", "inactive_source", "power_standby"]
+takeover = "cec_standby"
+presence = "events"
+
+[[device]]
+role = "console_a"
+name = "Console A"
+kind = "playback"
+match = { physical = "2.3.0.0" }   # vendor unknown until seen in shadow mode (receiver input 3); switch to vendor/osd once learned
+source = "Console A"
+on = ["report_physical_address", "image_view_on", "active_source"]
+off = ["standby", "inactive_source"]
+takeover = "cec_standby"
+presence = "poll"
+
+[web]
+bind = "0.0.0.0:8095"
+public_url = "https://choregos.example.com"
+# session secret: env CHOREGOS_SESSION_SECRET (≥32 bytes)
+[web.oidc]
+issuer = "https://auth.example.com/application/o/choregos/"
+client_id = "choregos"
+# client secret: env CHOREGOS_OIDC_CLIENT_SECRET
+[web.local_login]
+username = "admin"
+# password: env CHOREGOS_LOCAL_PASSWORD (break-glass; argon2-hashed in memory at startup)

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}devices · choregos{% endblock %}
+{% block content %}
+<section class="panel scroll">
+  <h2>bus table</h2>
+  <table class="grid">
+    <thead><tr><th>LA</th><th>PA</th><th>type</th><th>vendor</th><th>OSD</th><th>power</th><th>seen</th><th>role</th><th></th></tr></thead>
+    <tbody>
+      {% for entry in snapshot.bus %}
+      <tr{% if !entry.identified %} class="unidentified"{% endif %}>
+        <td class="mono">{{ entry.logical_address }}</td>
+        <td class="mono">{{ view::opt(entry.physical_address) }}</td>
+        <td>{{ view::device_type(entry.device_type) }}</td>
+        <td class="mono">{{ view::opt(entry.vendor) }}</td>
+        <td>{{ view::opt(entry.osd) }}</td>
+        <td><span class="pill power-{{ view::bus_power(entry.power) }}">{{ view::bus_power(entry.power) }}</span></td>
+        <td class="dim">{{ view::ago(entry.last_seen) }}</td>
+        <td>{% if let Some(role) = entry.matched_role %}<span class="mono">{{ role }}</span>{% else if entry.identified %}<span class="dim">unmatched</span>{% else %}<span class="warn">unidentified</span>{% endif %}</td>
+        <td><button class="small" hx-post="/actions/identify/{{ entry.logical_address }}" hx-target="#flash">identify</button></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="empty">No devices seen on the bus yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel scroll">
+  <h2>roles</h2>
+  <table class="grid">
+    <thead><tr><th>role</th><th>name</th><th>receiver source</th><th>LA</th><th>PA</th><th>power</th></tr></thead>
+    <tbody>
+      {% for role in snapshot.roles %}
+      <tr{% if role.conflicted %} class="conflicted"{% endif %}>
+        <td class="mono">{{ role.role }}</td>
+        <td>{{ role.name }}</td>
+        <td>{{ role.source }}</td>
+        <td class="mono">{{ view::opt(role.logical_address) }}</td>
+        <td class="mono">{{ view::opt(role.physical_address) }}</td>
+        <td><span class="pill power-{{ view::role_power(role.power) }}">{{ view::role_power(role.power) }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>send raw frame</h2>
+  <form class="filters" hx-post="/actions/send-raw" hx-target="#flash" hx-confirm="Send this raw CEC frame?">
+    <label>to LA <input name="to" inputmode="numeric" size="3" placeholder="4" required></label>
+    <label>data <input name="data" class="mono" size="24" placeholder="8F" required></label>
+    <button type="submit">send</button>
+    <span class="hint">opcode + operands in hex; in shadow mode this is logged as <span class="mono">would:</span> only.</span>
+  </form>
+</section>
+{% endblock %}

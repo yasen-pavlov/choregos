@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="htmx-config" content='{"allowEval":false,"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
+<title>{% block title %}choregos{% endblock %}</title>
+<link rel="stylesheet" href="/static/{{ crate::web::STYLESHEET }}">
+<script src="/static/{{ crate::web::HTMX_JS }}" defer></script>
+<script src="/static/{{ crate::web::HTMX_SSE_JS }}" defer></script>
+</head>
+{% if let Some(layout) = layout %}
+<body hx-headers='{"X-CSRF-Token": "{{ layout.csrf }}"}'>
+<header class="top">
+  <a class="brand" href="/">choregos</a>
+  <nav>
+    <a href="/"{% if layout.page == "dashboard" %} aria-current="page"{% endif %}>dashboard</a>
+    <a href="/bus"{% if layout.page == "bus" %} aria-current="page"{% endif %}>bus</a>
+    <a href="/devices"{% if layout.page == "devices" %} aria-current="page"{% endif %}>devices</a>
+    <a href="/decisions"{% if layout.page == "decisions" %} aria-current="page"{% endif %}>decisions</a>
+    <a href="/config"{% if layout.page == "config" %} aria-current="page"{% endif %}>config</a>
+  </nav>
+  <div id="status" class="status">
+    <span class="badge {% if layout.is_active() %}mode-active{% else %}mode-shadow{% endif %}" title="operating mode">{{ layout.mode }}</span>
+    {% if layout.warming %}<span class="badge warming" title="waiting for the bus to answer the startup resync">warming</span>{% endif %}
+    <span class="conn {% if layout.health.bridge_online %}up{% else %}down{% endif %}" title="CEC bridge {% if layout.health.bridge_online %}online{% else %}offline{% endif %}">bridge</span>
+    <span class="conn {% if layout.health.mqtt_connected %}up{% else %}down{% endif %}" title="MQTT {% if layout.health.mqtt_connected %}connected{% else %}disconnected{% endif %}">mqtt</span>
+    <span class="conn {% if layout.health.ha_connected %}up{% else %}down{% endif %}" title="Home Assistant {% if layout.health.ha_connected %}connected{% else %}disconnected{% endif %}">ha</span>
+  </div>
+  <form class="session" method="post" action="/logout">
+    <input type="hidden" name="_csrf" value="{{ layout.csrf }}">
+    <span class="user">{{ layout.user.name }} <span class="dim">{{ layout.user.method.label() }}</span></span>
+    <button type="submit" class="link">log out</button>
+  </form>
+</header>
+<div id="flash" aria-live="polite"></div>
+{% else %}
+<body class="bare">
+{% endif %}
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

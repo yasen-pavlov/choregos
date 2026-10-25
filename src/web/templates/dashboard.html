@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}dashboard · choregos{% endblock %}
+{% block content %}
+{# Every 5 s: replace this section and, out of band, the header's #status badges (both rendered #}
+{# from the same snapshot). Controls carry stable ids so htmx restores keyboard focus. #}
+<section id="dashboard" hx-get="/" hx-trigger="every 5s" hx-select="#dashboard" hx-select-oob="#status" hx-swap="outerHTML" hx-disinherit="*">
+  {% if !snapshot.conflicts.is_empty() %}
+  <div class="banner conflict" role="alert">
+    <strong>{{ snapshot.conflicts.len() }} identity conflict(s)</strong> — no power actions for the roles involved.
+    <ul>
+      {% for conflict in snapshot.conflicts %}
+      <li><span class="mono">{{ conflict.roles.join(", ") }}</span> on LA <span class="mono">{{ conflict.logical_addresses|join(", ") }}</span>: {{ conflict.reason }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  {% if snapshot.warming %}
+  <div class="banner warming">Warming up: waiting for the bus to answer the resync; no power actions yet.</div>
+  {% endif %}
+
+  <div class="panel controls">
+    <div class="group">
+      <span class="label">mode</span>
+      <div class="segmented">
+        <button id="mode-shadow" hx-post="/actions/mode" hx-vals='{"mode":"shadow"}' hx-target="#flash"{% if snapshot.mode == crate::state::Mode::Shadow %} disabled aria-pressed="true"{% endif %}>shadow</button>
+        <button id="mode-active" class="go-active" hx-post="/actions/mode" hx-vals='{"mode":"active"}' hx-target="#flash"
+          hx-confirm="Switch to ACTIVE mode? choregos will start switching the TV, receiver and devices."{% if snapshot.mode == crate::state::Mode::Active %} disabled aria-pressed="true"{% endif %}>active</button>
+      </div>
+    </div>
+    <div class="group">
+      <span class="label">bridge</span>
+      <span class="conn {% if snapshot.bridge_online %}up{% else %}down{% endif %}">{% if snapshot.bridge_online %}online{% else %}offline{% endif %}</span>
+    </div>
+    <div class="group">
+      <span class="label">active source</span>
+      <strong>{% if let Some(name) = active_name %}{{ name }}{% else %}<span class="dim">none</span>{% endif %}</strong>
+    </div>
+    <div class="group end">
+      <button id="all-off" class="danger" hx-post="/actions/all-off" hx-target="#flash" hx-confirm="Turn everything off?">all off</button>
+    </div>
+  </div>
+
+  <div class="cards">
+    {% for role in snapshot.roles %}
+    <article class="card power-{{ view::role_power(role.power) }}{% if role.conflicted %} conflicted{% endif %}{% if snapshot.active_role.as_deref() == Some(role.role.as_str()) %} active{% endif %}">
+      <header>
+        <h3>{{ role.name }}</h3>
+        <span class="pill power-{{ view::role_power(role.power) }}">{{ view::role_power(role.power) }}</span>
+      </header>
+      <dl class="kv">
+        <dt>role</dt><dd class="mono">{{ role.role }}{% if role.conflicted %} <span class="warn">conflict</span>{% endif %}</dd>
+        <dt>LA / PA</dt><dd class="mono">{{ view::opt(role.logical_address) }} / {{ view::opt(role.physical_address) }}</dd>
+        <dt>vendor</dt><dd class="mono">{{ view::opt(role.vendor) }}</dd>
+        <dt>OSD</dt><dd>{{ view::opt(role.osd) }}</dd>
+        <dt>source</dt><dd>{{ role.source }}</dd>
+        <dt>last</dt><dd><span class="mono">{{ view::opt(role.last_event) }}</span> <span class="dim">{{ view::ago(role.last_seen) }}</span></dd>
+      </dl>
+      <footer>
+        <button id="takeover-{{ role.role }}" hx-post="/actions/takeover/{{ role.role|urlencode_strict }}" hx-target="#flash">takeover</button>
+        <button id="standby-{{ role.role }}" hx-post="/actions/standby/{{ role.role|urlencode_strict }}" hx-target="#flash">standby</button>
+      </footer>
+    </article>
+    {% else %}
+    <p class="empty">No roles configured.</p>
+    {% endfor %}
+  </div>
+
+  <section class="panel scroll">
+    <h2>home assistant</h2>
+    <table class="grid">
+      <thead><tr><th></th><th>entity</th><th>state</th><th>detail</th><th>changed</th></tr></thead>
+      <tbody>
+        {% for (kind, entity) in entities %}
+        <tr>
+          <td class="dim">{{ kind }}</td>
+          <td class="mono">{{ entity.entity }}</td>
+          <td><span class="pill state-{{ entity.state }}">{{ entity.state }}</span></td>
+          <td>{{ view::ha_detail(entity) }}</td>
+          <td class="dim">{{ view::ago(entity.last_changed) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</section>
+{% endblock %}

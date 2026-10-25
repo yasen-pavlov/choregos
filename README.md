@@ -1,3 +1,158 @@
 # choregos
 
-Conductor for a CEC-driven home theater. Implementation arrives via pull request.
+Choregos is a Rust home-theater conductor. It learns the HDMI-CEC bus through a
+Tasmota CEC bridge and coordinates the TV, receiver, media sources and Sonos
+through Home Assistant. Use each source's own remote; Choregos handles the room.
+
+## How it works
+
+Received CEC frames update a bus model and resolve configured roles using OSD
+name, vendor ID and/or physical address. A source waking triggers TV wake,
+release of other sources, receiver power/source selection and a time-based HA
+preset. When the last source goes off, a cancellable delay powers down the TV
+and receiver. Polling covers sources that disappear in standby. Identity
+conflicts inhibit power actions for the affected roles rather than guessing.
+
+The engine has no network I/O or clock reads. Injected time drives startup
+warming, takeover settling, identification retries and presence/off timers.
+MQTT, HA websocket and wake adapters execute its actions separately. The web UI
+provides the dashboard, bus stream, devices, decisions, config and manual actions.
+
+## Configuration
+
+Start from [`choregos.example.toml`](choregos.example.toml). Replace the example
+hosts, entities, sources and matching rules with your own. Secrets are accepted
+**only through environment variables**, never as TOML keys:
+
+- `CHOREGOS_MQTT_PASSWORD`
+- `CHOREGOS_HA_TOKEN` — Home Assistant long-lived access token
+- `CHOREGOS_SESSION_SECRET` — at least 32 bytes of random session signing material
+- `CHOREGOS_OIDC_CLIENT_SECRET`
+- `CHOREGOS_LOCAL_PASSWORD` — break-glass password; hashed by the web layer
+- The environment variable named by `tv.wake.token_env`, for HTTP wake only
+
+| Section | Settings |
+| --- | --- |
+| root | `mode`: `shadow` (recommended initially) or `active` |
+| `mqtt` | `host`, `port`, `username`, `client_id` |
+| `bridge` | Tasmota `topic` and claimed `logical_address` (0–14) |
+| `home_assistant` | HTTP(S) base `url`; connects at `/api/websocket` |
+| `tv` | HA `entity`; `wake` is `{kind="wol", mac, broadcast, port}` or `{kind="http", url, header, token_env}`. HTTP wake sends POST and uses the environment value as the complete header value. |
+| `receiver` | HA `entity`, `select_source` boolean |
+| `presets` | IANA `timezone` and `[[presets.slot]]` entries with `from`, `to` (`HH:MM`), and HA `script`. Must cover exactly 24 hours; use `24:00` only as an end. |
+| `sonos` | HA `entity`, `mute_switch`, `volume_from` list of role IDs. Volume keys are forwarded only while Sonos reports `playing`. |
+| `timing` | `off_delay_s`, `takeover_settle_ms`, `presence_poll_s`, `presence_misses`, `identify_retry_s`. Poll/retry intervals and misses must be positive. |
+| `fake_tv` | `replies=true` (default; false when bridge firmware answers directed TV requests), `power_status="always_on"`, `cec_version="1.4"`, `osd_name` (1–14 ASCII bytes). Broadcast Request Active Source remains service-owned. |
+| `device` | Array of roles: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player` |
+| `web` | `bind`, externally visible `public_url`; `web.oidc` has `issuer`, `client_id`; `web.local_login` has `username` |
+
+Every provided `match` key must match: `osd` (trimmed exact name), `vendor` (six
+hex digits), `physical` (four dotted hex digits, e.g. `2.1.0.0`). At least one is
+required. A role matching multiple logical addresses, or multiple roles matching
+one address, is a conflict. Bus state is learned again after restart, not saved.
+Role IDs must match `[a-z0-9_]+` and may not be `bridge`, `mode`, `conflicts`,
+`active_source` or `all_off` (reserved MQTT discovery/state names).
+
+
+Power events: `image_view_on`, `text_view_on`, `active_source`, `power_on`,
+`standby`, `inactive_source`, `power_standby`, `report_physical_address`.
+Takeover policies: `cec_standby`, `ha_media_stop` (requires `media_player`),
+`none`. Presence policies: `events` or `poll` (playback devices only).
+
+```sh
+cargo run -- check-config --config choregos.toml
+cargo run -- run --config choregos.toml
+```
+
+The config command resolves environment inputs but prints only redacted public
+settings. Live config saves validate before atomic replacement and reload.
+Mode changes replace only the mode value, preserving comments/order and unrelated
+manual edits. `web`, `mqtt`, `home_assistant`, and `tv.wake` changes require a
+restart: the editor rejects these changes explicitly to prevent authenticated
+users redirecting credentials to a different host or environment-secret name.
+Edit those sections in the mounted config while stopped.
+
+### MQTT exposure
+
+Bridge inputs are `tele/<bridge.topic>/SENSOR`, `tele/<bridge.topic>/LWT` and
+`stat/<bridge.topic>/RESULT`; sends use `cmnd/<bridge.topic>/HdmiSend`.
+Retained HA discovery creates role power binary sensors, active-source and
+conflict sensors, mode select, all-off button and bridge binary sensor. Node
+availability is `choregos/status`, with an `offline` last will. Retained entity
+states use `choregos/state/<name>`. Commands use `choregos/cmd/mode` (`shadow` or
+`active`) and `choregos/cmd/all_off` (button payload). One instance per broker
+namespace is supported.
+
+## Running with Docker
+
+Images are published to `ghcr.io/yasen-pavlov/choregos` on `v*` tags for amd64 and
+arm64. Pin a release tag for production; `latest` follows tagged releases.
+
+```sh
+mkdir -p config
+cp choregos.example.toml config/choregos.toml
+# Edit config/choregos.toml and export the environment variables listed above.
+# Give the container's uid write permission to the directory for atomic saves.
+sudo chown -R 65532:65532 config
+docker run --rm --name choregos -p 8095:8095 \
+  --cap-drop ALL --security-opt no-new-privileges --read-only \
+  -v "$PWD/config:/config" \
+  -e CHOREGOS_MQTT_PASSWORD -e CHOREGOS_HA_TOKEN \
+  -e CHOREGOS_SESSION_SECRET -e CHOREGOS_OIDC_CLIENT_SECRET \
+  -e CHOREGOS_LOCAL_PASSWORD \
+  ghcr.io/yasen-pavlov/choregos:latest
+```
+
+Mount the **directory**, not the single config file: atomic rename cannot replace
+a bind-mounted file. The static musl image runs as uid/gid 65532 without a shell
+or curl. Its built-in health check invokes:
+
+```sh
+choregos healthz --url http://127.0.0.1:8095/healthz
+```
+
+`/healthz` is unauthenticated and reports MQTT/HA connections, bridge availability
+and mode. The container health check verifies the web process responds with a
+valid health object; it does not restart a healthy process solely because an
+external system is offline. Put the UI behind HTTPS. A standalone compose example
+is in [`deploy/docker-compose.yml`](deploy/docker-compose.yml); merge it into
+your own stack as needed. Direct WoL requires `network_mode: host` (instead of
+`ports:`), or use the `http` wake variant with a LAN wake service — Linux bridge
+networking does not normally forward directed broadcast packets to the TV.
+
+## Shadow mode
+
+Start in `shadow`. The complete engine still runs and publishes its learned
+states and decisions, but the executor permits only read-only identification,
+startup/resync interrogation and presence `8F` polls on the CEC bus. TV wake, HA service calls, raw CEC,
+fake-TV replies and volume forwarding are suppressed and logged as `would:`
+with their action payload. Mode/config persistence and HA discovery/state
+publication remain operational. Inspect learned identities and decisions before
+switching to `active` through the UI or MQTT. The switch is saved atomically.
+
+## Development and replay
+
+Rust stable, edition 2024. No JavaScript build step. See [DESIGN.md](DESIGN.md)
+for behavior and [docs/decisions.md](docs/decisions.md) for implementation choices.
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo run -- replay fixtures/capture-streamer-wake.jsonl \
+  --config choregos.example.toml
+```
+
+Replay reads timestamps and bus/LWT payloads, advances internal timers, and
+prints JSON decisions with resulting actions. It never connects to MQTT or HA
+and needs no secrets. Unrelated fixture topics are ignored. The acceptance test
+seeds the pre-capture Kodi state and appends an explicit wake because the raw
+capture starts with Kodi standby and ends with volume presses. Both Sonos
+playing and paused branches are tested with injected HA events.
+
+Unit and replay tests use injected time; MQTT tests run an in-process local
+`rumqttd` broker, HA tests use a loopback fake websocket. Tests never need a real
+home-theater installation. CI runs formatting, clippy, tests and LLVM LCOV,
+then uploads coverage to SonarCloud for same-repository PRs and main pushes.
+Docker builds run on PRs without pushing. Releases use git-cliff notes; the
+package version stays `0.0.0`, with release identity provided by tags.
