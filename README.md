@@ -57,18 +57,27 @@ Role IDs must match `[a-z0-9_]+` and may not be `bridge`, `mode`, `conflicts`,
 
 Power events: `image_view_on`, `text_view_on`, `active_source`, `power_on`,
 `standby`, `inactive_source`, `power_standby`, `report_physical_address`.
-Takeover policies: `cec_standby`, `ha_media_stop` (requires `media_player`),
-`none`. Presence policies: `events` or `poll` (playback devices only).
+Takeover policies: `cec_standby` sends directed Standby (`36`) then a power-status
+query (`8F`); `cec_power_off_key` sends directed Power Off Function (`44 6C`),
+User Control Released (`45`), then `8F` for devices that ignore Standby during
+playback; `ha_media_stop` requires `media_player`; `none` sends no stop action.
+Presence policies: `events` or `poll` (playback devices only).
 
-Active-mode standby verification retries remain bounded even if a device is
-silent or NACKs. With patched bridge firmware, exhaustion records
-`standby_target_absent` when all standby and power-status frames were NACKed and
+Active-mode verification for both CEC stop policies retries the complete original
+sequence after each settle interval, bounded even if a device is silent or NACKs.
+With patched bridge firmware, exhaustion records
+`standby_target_absent` when every frame of the stop/query sequence was NACKed and
 none ACKed (expected for devices that leave the bus in standby), otherwise
 `standby_unconfirmed`. Extra/late NACKs never override an observed ACK. Stock
 firmware reports only queue/transmit status, not target ACKs, so unconfirmed
 standby always records `standby_unconfirmed`. Only an observed
-Standby/Transition report confirms standby; a real role On event cancels
-verification. Config reload clears pending checks. Raw CEC sends accept 1–14
+Standby/Transition report confirms standby. During pending verification, `90 xx`
+updates bus power but cannot wake the role; `04` Image View On and `0D` Text View
+On are neither role signals nor buffered signals and do not change bus power,
+preventing stray sleep-burst frames from retaking the room. `82` Active Source
+still learns normally and cancels verification when configured as an On event.
+Outside verification, view-on frames retain their normal wake behavior.
+Config reload clears pending checks. Raw CEC sends accept 1–14
 data bytes, matching the bridge firmware limit.
 
 ```sh

@@ -2,6 +2,29 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — Power-off key takeover and the stop-burst Image View On
+
+- Repeated live observations showed that the streaming box ACKs directed
+  Standby (`36`) but ignores it during playback, while honouring it at its idle
+  menu. Directed User Control Pressed: Power Off Function (`44 6C`) followed
+  by User Control Released (`45`) puts it to sleep even while playing.
+  Offer `cec_power_off_key` as an explicit per-device takeover policy rather
+  than changing Standby for every device.
+- Follow either stop sequence with Give Device Power Status (`8F`). Remember
+  the chosen sequence for bounded verification retries and ACK/NACK accounting:
+  two frames per round for `cec_standby`, three for `cec_power_off_key`.
+- The observed sleep burst is Standby (`36`), Inactive Source (`9D <PA>`),
+  then a stray Image View On (`04`), with Standby (`90 01`) when probed.
+  Treating that `04` as a wake retakes the room from the new source while the
+  displaced source is going to sleep. While verification is pending for its
+  LA, suppress `04` and `0D` as role signals and buffered signals, and leave bus
+  power unchanged. Keep the existing `90 xx` role-signal suppression while
+  continuing to learn those reports for verification.
+- Still honour broadcast Active Source (`82 <PA>`), including normal bus
+  learning and role-On cancellation of verification: an explicit source claim
+  is genuine re-wake evidence, unlike the stop-burst view-on hints. Outside
+  verification, `04` and `0D` remain normal wake signals.
+
 ## 2026-10-26 — Bound restored-identity identification traffic
 
 - Standby devices may ignore `83` while answering `46`. Re-querying all keys

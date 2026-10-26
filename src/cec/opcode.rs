@@ -37,3 +37,5 @@ opcodes! {
     REPORT_FEATURES = 0xA6 => "Report Features",
     REQUEST_CURRENT_LATENCY = 0xA7 => "Request Current Latency",
 }
+
+pub const POWER_OFF_FUNCTION: u8 = 0x6C;
