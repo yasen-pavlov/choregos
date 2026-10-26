@@ -493,8 +493,7 @@ mod tests {
         assert_eq!((to, data, ack), (8, vec![0x8f], false));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn broker_receives_frames_sends_commands_and_retains_discovery() {
+    fn start_broker() -> std::net::SocketAddr {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = socket.local_addr().unwrap();
         drop(socket);
@@ -526,16 +525,20 @@ mod tests {
         std::thread::spawn(move || {
             rumqttd::Broker::new(broker_config).start().unwrap();
         });
-        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        config.mqtt.host = "127.0.0.1".into();
-        config.mqtt.port = address.port();
-        config.bridge.topic = "test_bridge".into();
-        let (tx, mut rx) = mpsc::channel(32);
-        let (mqtt, adapter_task) = Mqtt::start(&config, tx, &[]);
-        let mut options = MqttOptions::new("observer", "127.0.0.1", address.port());
+        address
+    }
+
+    fn spawn_observer(
+        port: u16,
+    ) -> (
+        AsyncClient,
+        mpsc::Receiver<rumqttc::Publish>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut options = MqttOptions::new("observer", "127.0.0.1", port);
         options.set_keep_alive(Duration::from_secs(5));
         let (observer, mut events) = AsyncClient::new(options, 32);
-        let (publications, mut received) = mpsc::channel(64);
+        let (publications, received) = mpsc::channel(64);
         let poll = tokio::spawn(async move {
             loop {
                 match events.poll().await {
@@ -549,6 +552,81 @@ mod tests {
                 }
             }
         });
+        (observer, received, poll)
+    }
+
+    async fn next_publication(
+        received: &mut mpsc::Receiver<rumqttc::Publish>,
+        mut select: impl FnMut(&rumqttc::Publish) -> bool,
+    ) -> rumqttc::Publish {
+        loop {
+            let publish = received.recv().await.unwrap();
+            if select(&publish) {
+                return publish;
+            }
+        }
+    }
+
+    async fn assert_retained_discovery(rx: &mut mpsc::Receiver<rumqttc::Publish>, count: usize) {
+        let mut retained = 0;
+        while retained < count {
+            let p = rx.recv().await.unwrap();
+            if p.topic.starts_with("homeassistant/") {
+                assert!(p.retain);
+                retained += 1;
+            }
+        }
+    }
+
+    async fn next_input<T>(
+        rx: &mut mpsc::Receiver<Input>,
+        mut select: impl FnMut(Input) -> Option<T>,
+    ) -> T {
+        loop {
+            if let Some(value) = select(rx.recv().await.unwrap()) {
+                return value;
+            }
+        }
+    }
+
+    async fn wait_for_connack(events: &mut rumqttc::EventLoop) {
+        loop {
+            if matches!(
+                events.poll().await.unwrap(),
+                Event::Incoming(Incoming::ConnAck(_))
+            ) {
+                return;
+            }
+        }
+    }
+
+    async fn wait_for_reconnect(rx: &mut mpsc::Receiver<Input>) {
+        let mut disconnected = false;
+        loop {
+            if let Input::Connection {
+                mqtt: true,
+                connected,
+            } = rx.recv().await.unwrap()
+            {
+                if !connected {
+                    disconnected = true;
+                } else if disconnected {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_receives_frames_sends_commands_and_retains_discovery() {
+        let address = start_broker();
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.mqtt.host = "127.0.0.1".into();
+        config.mqtt.port = address.port();
+        config.bridge.topic = "test_bridge".into();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (mqtt, adapter_task) = Mqtt::start(&config, tx, &[]);
+        let (observer, mut received, poll) = spawn_observer(address.port());
         let test = async {
             // Subscribe after the adapter has advertised online, then subscribe to
             // discovery: receiving retain=true proves the broker retained it.
@@ -556,11 +634,7 @@ mod tests {
                 .subscribe("choregos/status", QoS::AtLeastOnce)
                 .await
                 .unwrap();
-            loop {
-                if received.recv().await.unwrap().payload.as_ref() == b"online" {
-                    break;
-                }
-            }
+            next_publication(&mut received, |p| p.payload.as_ref() == b"online").await;
             observer
                 .subscribe("homeassistant/+/choregos/+/config", QoS::AtLeastOnce)
                 .await
@@ -569,14 +643,7 @@ mod tests {
                 .subscribe("cmnd/test_bridge/HdmiSend", QoS::AtLeastOnce)
                 .await
                 .unwrap();
-            let mut retained = 0;
-            while retained < config.device.len() + 5 {
-                let p = received.recv().await.unwrap();
-                if p.topic.starts_with("homeassistant/") {
-                    assert!(p.retain);
-                    retained += 1;
-                }
-            }
+            assert_retained_discovery(&mut received, config.device.len() + 5).await;
             observer
                 .publish(
                     "tele/test_bridge/SENSOR",
@@ -586,23 +653,19 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            loop {
-                if let Input::Event(engine::Event::Frame(frame)) = rx.recv().await.unwrap() {
-                    assert_eq!(frame.opcode, Some(4));
-                    break;
-                }
-            }
+            let frame = next_input(&mut rx, |input| match input {
+                Input::Event(engine::Event::Frame(frame)) => Some(frame),
+                _ => None,
+            })
+            .await;
+            assert_eq!(frame.opcode, Some(4));
             assert!(mqtt.send(4, &[0x36]));
-            loop {
-                let p = received.recv().await.unwrap();
-                if p.topic == "cmnd/test_bridge/HdmiSend" {
-                    assert_eq!(
-                        serde_json::from_slice::<Value>(&p.payload).unwrap(),
-                        json!({"To":4,"Data":"36"})
-                    );
-                    break;
-                }
-            }
+            let p =
+                next_publication(&mut received, |p| p.topic == "cmnd/test_bridge/HdmiSend").await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&p.payload).unwrap(),
+                json!({"To":4,"Data":"36"})
+            );
             observer
                 .publish(
                     "stat/test_bridge/RESULT",
@@ -612,26 +675,24 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            loop {
-                if let Input::Event(engine::Event::SendResult { to, data, ack }) =
-                    rx.recv().await.unwrap()
-                {
-                    assert_eq!((to, data, ack), (4, vec![0x36], false));
-                    break;
-                }
-            }
+            let (to, data, ack) = next_input(&mut rx, |input| match input {
+                Input::Event(engine::Event::SendResult { to, data, ack }) => Some((to, data, ack)),
+                _ => None,
+            })
+            .await;
+            assert_eq!((to, data, ack), (4, vec![0x36], false));
             observer
                 .publish("choregos/cmd/mode", QoS::AtLeastOnce, false, "active")
                 .await
                 .unwrap();
-            loop {
-                if let Input::Request(super::super::Request::Command(Command::SetMode(mode), _)) =
-                    rx.recv().await.unwrap()
-                {
-                    assert_eq!(mode, Mode::Active);
-                    break;
+            let mode = next_input(&mut rx, |input| match input {
+                Input::Request(super::super::Request::Command(Command::SetMode(mode), _)) => {
+                    Some(mode)
                 }
-            }
+                _ => None,
+            })
+            .await;
+            assert_eq!(mode, Mode::Active);
 
             assert!(mqtt.send(8, &[0x8f]));
             // A second connection with the same client ID makes the broker drop the
@@ -640,38 +701,16 @@ mod tests {
                 MqttOptions::new(&config.mqtt.client_id, "127.0.0.1", address.port()),
                 8,
             );
-            loop {
-                if matches!(
-                    replacement_events.poll().await.unwrap(),
-                    Event::Incoming(Incoming::ConnAck(_))
-                ) {
-                    break;
-                }
-            }
+            wait_for_connack(&mut replacement_events).await;
             drop(replacement_events);
             drop(replacement);
-            let mut disconnected = false;
-            loop {
-                if let Input::Connection {
-                    mqtt: true,
-                    connected,
-                } = rx.recv().await.unwrap()
-                {
-                    if !connected {
-                        disconnected = true;
-                    } else if disconnected {
-                        break;
-                    }
-                }
-            }
+            wait_for_reconnect(&mut rx).await;
             // Setup publishes online after subscribing, providing a broker-side
             // barrier before sending the stale result and subsequent frame marker.
-            loop {
-                let publish = received.recv().await.unwrap();
-                if publish.topic == "choregos/status" && publish.payload.as_ref() == b"online" {
-                    break;
-                }
-            }
+            next_publication(&mut received, |p| {
+                p.topic == "choregos/status" && p.payload.as_ref() == b"online"
+            })
+            .await;
             observer
                 .publish(
                     "stat/test_bridge/RESULT",

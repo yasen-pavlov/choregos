@@ -2039,3 +2039,243 @@ fn flapping_identity_keys_preserve_exponential_backoff_even_with_physical_reconf
         }
     }
 }
+
+#[test]
+fn wake_frame_from_restored_identity_requeries_immediately() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let retry = Duration::from_secs(config.timing.identify_retry_s);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let pa_only = Action::Identify {
+        la: 4,
+        queries: IdentifyQueries {
+            physical: true,
+            ..IdentifyQueries::default()
+        },
+    };
+    assert!(
+        engine
+            .handle(Event::BridgeOnline, now, wall())
+            .contains(&pa_only)
+    );
+    let last = now + retry * 3;
+    for time in [now + retry, last] {
+        assert_eq!(
+            engine.handle(Event::Tick, time, wall()).as_slice(),
+            std::slice::from_ref(&pa_only)
+        );
+    }
+    assert_eq!(engine.next_deadline(), Some(last + retry * 4));
+    let wake = last + retry + Duration::from_secs(5);
+    assert_eq!(frame(&mut engine, wake, 4, 0, "04"), [pa_only]);
+    assert_eq!(engine.next_deadline(), Some(wake + retry));
+    assert!(
+        frame(
+            &mut engine,
+            wake + Duration::from_millis(300),
+            4,
+            15,
+            "822100",
+        )
+        .is_empty()
+    );
+    frame(
+        &mut engine,
+        wake + Duration::from_secs(1),
+        4,
+        15,
+        "84210004",
+    );
+    assert!(engine.bus.entries[&4].verified);
+    assert!(engine.bus.entries[&4].identified);
+    assert!(
+        engine
+            .handle(Event::Tick, wake + retry, wall())
+            .iter()
+            .all(|action| !matches!(action, Action::Identify { .. }))
+    );
+}
+
+#[test]
+fn wake_frame_within_base_interval_does_not_rearm() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let retry = Duration::from_secs(config.timing.identify_retry_s);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    assert!(frame(&mut engine, now + Duration::from_secs(2), 4, 0, "04").is_empty());
+    assert!(
+        engine
+            .handle(Event::Tick, now + Duration::from_secs(3), wall())
+            .is_empty()
+    );
+    assert_eq!(engine.next_deadline(), Some(now + retry));
+    assert_eq!(
+        engine.handle(Event::Tick, now + retry, wall()),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries {
+                physical: true,
+                ..IdentifyQueries::default()
+            },
+        }]
+    );
+    assert_eq!(engine.next_deadline(), Some(now + retry * 3));
+}
+
+#[test]
+fn wake_frames_from_identified_devices_never_query() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 4, 15, "84210004");
+    frame(&mut engine, now, 4, 15, "870010FA");
+    frame(&mut engine, now, 4, 0, "4753747265616D6572");
+    assert!(engine.bus.entries[&4].identified);
+    for (index, (to, data)) in [(0, "04"), (15, "822100"), (15, "85")]
+        .into_iter()
+        .enumerate()
+    {
+        let time = now + Duration::from_secs(20 * (index as u64 + 1));
+        assert!(
+            frame(&mut engine, time, 4, to, data)
+                .iter()
+                .all(|action| !matches!(action, Action::Identify { .. }))
+        );
+        assert!(
+            engine
+                .handle(Event::Tick, time + Duration::from_secs(10), wall())
+                .iter()
+                .all(|action| !matches!(action, Action::Identify { .. }))
+        );
+    }
+}
+
+#[test]
+fn wake_rearming_respects_opcode_destination_and_active_source_length() {
+    for (to, data, wakes) in [
+        (0, "04", true),
+        (0, "0D", true),
+        (15, "822100", true),
+        (15, "85", true),
+        (15, "04", false),
+        (5, "0D", false),
+        (0, "822100", false),
+        (15, "82210004", false),
+        (0, "85", false),
+        (15, "870010FA", false),
+        (0, "4753747265616D6572", false),
+        (0, "9000", false),
+        (15, "36", false),
+        (0, "9D2100", false),
+    ] {
+        let now = Instant::now();
+        let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+        engine.handle(Event::BridgeOnline, now, wall());
+        for seconds in [10, 30] {
+            engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
+        }
+        let actions = frame(&mut engine, now + Duration::from_secs(45), 4, to, data);
+        assert_eq!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Identify { la: 4, .. })),
+            wakes,
+            "to={to}, data={data}",
+        );
+    }
+}
+
+#[test]
+fn wake_rearming_after_physical_replacement_queries_missing_keys() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    for seconds in [10, 30] {
+        engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
+    }
+    assert_eq!(
+        frame(&mut engine, now + Duration::from_secs(45), 4, 15, "822500"),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries {
+                physical: false,
+                vendor: true,
+                osd: true,
+            },
+        }]
+    );
+    assert_eq!(engine.bus.entries[&4].physical, Some(0x2500));
+    assert!(!engine.bus.entries[&4].identified);
+}
+
+#[test]
+fn wake_rearming_waits_for_shared_identification_gate() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    for seconds in [10, 30] {
+        engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
+    }
+    let other_query = now + Duration::from_millis(44_500);
+    assert_eq!(
+        engine.handle(Event::Command(Command::Identify(8)), other_query, wall()),
+        [Action::Identify {
+            la: 8,
+            queries: IdentifyQueries::ALL,
+        }]
+    );
+    assert!(frame(&mut engine, now + Duration::from_secs(45), 4, 0, "04").is_empty());
+    let due = other_query + Duration::from_secs(1);
+    assert_eq!(engine.next_deadline(), Some(due));
+    assert_eq!(
+        engine.handle(Event::Tick, due, wall()),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries {
+                physical: true,
+                ..IdentifyQueries::default()
+            },
+        }]
+    );
+}
+
+#[test]
+fn active_source_flapping_rearms_at_most_once_per_base_interval() {
+    let (mut engine, now) = setup();
+    let retry = Duration::from_secs(engine.config.timing.identify_retry_s);
+    let start = now + Duration::from_secs(3);
+    let mut query_times: Vec<_> = frame(&mut engine, start, 4, 15, "84210004")
+        .into_iter()
+        .filter(|action| matches!(action, Action::Identify { la: 4, .. }))
+        .map(|_| start)
+        .collect();
+    for seconds in (3..=600).step_by(3) {
+        let time = start + Duration::from_secs(seconds);
+        while let Some(due) = engine.next_deadline().filter(|due| *due <= time) {
+            query_times.extend(
+                engine
+                    .handle(Event::Tick, due, wall())
+                    .into_iter()
+                    .filter(|action| matches!(action, Action::Identify { la: 4, .. }))
+                    .map(|_| due),
+            );
+        }
+        let data = if seconds % 6 == 3 { "822500" } else { "822100" };
+        query_times.extend(
+            frame(&mut engine, time, 4, 15, data)
+                .into_iter()
+                .filter(|action| matches!(action, Action::Identify { la: 4, .. }))
+                .map(|_| time),
+        );
+        assert!(!engine.bus.entries[&4].identified);
+    }
+    assert!(!query_times.is_empty());
+    assert!(
+        query_times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= retry),
+        "identification queries exceeded the base-interval bound: {query_times:?}",
+    );
+}

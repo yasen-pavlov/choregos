@@ -2,6 +2,32 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — Wake frames re-arm identification
+
+- A device waking shortly after service restart can remain restored/unidentified
+  for a minute or more: the startup `83` and tick retries went unanswered while
+  it was asleep, and wake announcements did not shorten the backed-off deadline.
+- After applying `04`/`0D` to the bridge, broadcast `82` with exactly two
+  operands, or broadcast `85`, re-arm identification for a non-bridge LA below
+  15 that is still unidentified. If its last query is absent or at least
+  `identify_retry_s` old (capped at one hour), clear that instant and reset
+  attempts. Compare saturating elapsed time with the capped base interval to
+  avoid overflowing an instant for extreme configured retry durations.
+  Apply the same rule after replacement: a different occupant announcing its
+  PA is awake too.
+- Use the base interval for the guard, not the backed-off interval: otherwise
+  the wake would still wait for the very deadline it should bypass. Once sent,
+  the new query records its instant, bounding a wake burst to at most one
+  re-arm per base interval per LA, even under broadcast `82` flapping;
+  silence then resumes the base interval followed by exponential backoff.
+- Keep the shared one-second send gate and request only missing required keys
+  (just `83` for a fully cached restored identity). A gated re-arm remains due
+  for a later tick. Identified entries and non-wake traffic retain their
+  existing behaviour; no configuration key or decision reason is needed.
+- Split bus handling into private duplicate-eviction, replacement, learned-key,
+  report-application and wake-classification helpers to keep cognitive
+  complexity below the Sonar limit without copying the device map.
+
 ## 2026-10-26 — Leave Request Active Source replies to the active source
 
 - Never answer broadcast Request Active Source (`85`) from the fake TV, even
