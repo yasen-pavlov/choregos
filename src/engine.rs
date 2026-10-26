@@ -494,11 +494,9 @@ impl Engine {
             }
             Command::Identify(la) => {
                 if la < 15 && la != self.bus.bridge {
-                    self.bus.manual_identify(la, now);
-                    actions.push(Action::Identify {
-                        la,
-                        queries: IdentifyQueries::ALL,
-                    });
+                    actions.extend(self.bus.manual_identify(la, now));
+                    // Accepted commands remain visible even when their send is queued.
+                    self.record(None, None, None, "command_identify", actions.clone());
                 }
             }
             Command::SendRaw { to, data } => {
@@ -567,22 +565,20 @@ impl Engine {
     fn resync(&mut self, now: Instant) -> Vec<Action> {
         self.warming = true;
         self.warm_until = now + Duration::from_secs(3);
-        self.bus.reset_identification(now);
+        let unverified = self.bus.reset_identification(now);
         for role in self.roles.values_mut() {
             role.awaiting = false;
             role.misses = 0;
         }
         let mut actions = vec![Action::Resync];
-        for (&la, entry) in &self.bus.entries {
-            if !entry.verified && la < 15 && la != self.bus.bridge {
-                actions.push(Action::Identify {
-                    la,
-                    queries: IdentifyQueries {
-                        physical: true,
-                        ..IdentifyQueries::default()
-                    },
-                });
-            }
+        for la in unverified {
+            actions.push(Action::Identify {
+                la,
+                queries: IdentifyQueries {
+                    physical: true,
+                    ..IdentifyQueries::default()
+                },
+            });
         }
         actions
     }
