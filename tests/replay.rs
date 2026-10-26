@@ -276,6 +276,137 @@ fn takeover_retries_unconfirmed_standby_in_order_then_expires() {
     assert_no_standby_decision(&engine, "streamer");
 }
 
+fn exhaust_standby_with_results(results: &[(u8, u8, bool)]) -> Engine {
+    let (mut engine, takeover, settle) = takeover_from_streamer();
+    for attempt in 0..=engine.config.timing.standby_retries {
+        let sent_at = takeover + settle * u32::from(attempt) + Duration::from_millis(1);
+        for &(to, opcode, ack) in results {
+            engine.handle(
+                Event::SendResult {
+                    to,
+                    data: vec![opcode],
+                    ack,
+                },
+                sent_at,
+                wall(),
+            );
+            assert_no_standby_decision(&engine, "streamer");
+        }
+        engine.handle(
+            Event::Tick,
+            takeover + settle * (u32::from(attempt) + 1),
+            wall(),
+        );
+        if attempt < engine.config.timing.standby_retries {
+            let retry = engine
+                .decisions
+                .iter()
+                .find(|decision| decision.reason == "standby_retry")
+                .unwrap();
+            assert_eq!(retry.actions.len(), 2);
+        }
+    }
+    engine
+}
+
+#[test]
+fn all_nacked_standby_frames_record_target_absent_after_bounded_retries() {
+    let engine = exhaust_standby_with_results(&[(4, 0x36, false), (4, 0x8f, false)]);
+    let decision = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "standby_target_absent")
+        .unwrap();
+    assert_eq!(decision.role.as_deref(), Some("streamer"));
+    assert!(decision.actions.is_empty());
+    assert_eq!(engine.bus.entries[&4].power, BusPower::On);
+}
+
+#[test]
+fn mixed_ack_standby_frames_without_power_report_remain_unconfirmed() {
+    let engine = exhaust_standby_with_results(&[(4, 0x36, false), (4, 0x8f, true)]);
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
+    }));
+}
+
+#[test]
+fn send_results_for_other_las_and_opcodes_do_not_count_as_standby_nacks() {
+    let engine =
+        exhaust_standby_with_results(&[(8, 0x36, false), (8, 0x8f, false), (4, 0x83, false)]);
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
+    }));
+}
+
+#[test]
+fn missing_standby_send_results_do_not_imply_absence() {
+    let engine = exhaust_standby_with_results(&[(4, 0x36, false)]);
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
+    }));
+}
+
+#[test]
+fn repeated_standby_with_stale_nacks_still_records_target_absent() {
+    let (mut engine, takeover, settle) = takeover_from_streamer();
+    std::sync::Arc::make_mut(&mut engine.config)
+        .timing
+        .standby_retries = 0;
+    let stopped = takeover + Duration::from_millis(1);
+    engine.handle(
+        Event::Command(Command::Standby("streamer".into())),
+        stopped,
+        wall(),
+    );
+    // Both the replaced verification's pair and the new pair finish after replacement.
+    for opcode in [0x36, 0x8f, 0x36, 0x8f] {
+        engine.handle(
+            Event::SendResult {
+                to: 4,
+                data: vec![opcode],
+                ack: false,
+            },
+            stopped,
+            wall(),
+        );
+    }
+    engine.handle(Event::Tick, stopped + settle, wall());
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_target_absent"
+    }));
+}
+
+#[test]
+fn resync_nacks_during_verification_never_override_an_observed_ack() {
+    // The extra 8F NACK belongs to resync, not to the pending standby pair.
+    let engine =
+        exhaust_standby_with_results(&[(4, 0x36, true), (4, 0x8f, false), (4, 0x8f, false)]);
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
+    }));
+}
+
+#[test]
+fn raw_cec_data_accepts_fourteen_bytes_but_rejects_fifteen() {
+    let (mut engine, now) = setup();
+    for length in [14, 15] {
+        let data = vec![0x44; length];
+        let actions = engine.handle(
+            Event::Command(Command::SendRaw {
+                to: 4,
+                data: data.clone(),
+            }),
+            now,
+            wall(),
+        );
+        assert_eq!(
+            actions.contains(&Action::CecSend { to: 4, data }),
+            length == 14
+        );
+    }
+}
+
 #[test]
 fn standby_and_transition_reports_cancel_takeover_verification() {
     for report in ["9001", "9002", "9003", "9D2100", "36"] {
@@ -535,7 +666,7 @@ fn switching_to_shadow_clears_pending_standby_verification() {
 }
 
 #[test]
-fn reload_retains_standby_verification_only_for_same_cec_standby_role_and_la() {
+fn config_reload_always_clears_pending_standby_verification() {
     for change in ["none", "policy", "identity", "shadow"] {
         let (mut engine, takeover, _) = takeover_from_streamer();
         let mut config = (*engine.config).clone();
@@ -551,13 +682,7 @@ fn reload_retains_standby_verification_only_for_same_cec_standby_role_and_la() {
             wall(),
         );
         engine.handle(Event::Tick, takeover + Duration::from_secs(3), wall());
-        if change == "none" {
-            assert!(engine.decisions.iter().any(|decision| {
-                decision.role.as_deref() == Some("streamer") && decision.reason == "standby_retry"
-            }));
-        } else {
-            assert_no_standby_decision(&engine, "streamer");
-        }
+        assert_no_standby_decision(&engine, "streamer");
     }
 }
 

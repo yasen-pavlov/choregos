@@ -25,6 +25,11 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum Event {
     Frame(Frame),
+    SendResult {
+        to: u8,
+        data: Vec<u8>,
+        ack: bool,
+    },
     BridgeOnline,
     BridgeOffline,
     HaState {
@@ -68,6 +73,9 @@ struct StandbyVerification {
     role: String,
     deadline: Instant,
     attempts: u8,
+    sent: u8,
+    acked: bool,
+    nacked: u8,
 }
 
 pub struct Engine {
@@ -177,6 +185,21 @@ impl Engine {
             } => self.handle_ha_state(entity, state, attrs, changed, wall),
             Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
             Event::Frame(frame) => self.handle_frame(frame, now, wall),
+            Event::SendResult { to, data, ack } => {
+                if matches!(data.first(), Some(&STANDBY | &GIVE_DEVICE_POWER_STATUS))
+                    && let Some(pending) = self
+                        .standby_verifications
+                        .iter_mut()
+                        .find(|pending| pending.la == to)
+                {
+                    if ack {
+                        pending.acked = true;
+                    } else {
+                        pending.nacked = pending.nacked.saturating_add(1);
+                    }
+                }
+                vec![]
+            }
             Event::Command(command) => self.handle_command(command, now),
             Event::Tick if self.bridge_online => self.bus.retry_identification(now),
             Event::Tick => vec![],
@@ -191,6 +214,17 @@ impl Engine {
             self.record(None, None, None, reason, actions.clone());
         }
         actions.extend(self.timers(now, wall));
+        for action in &actions {
+            if let Action::CecSend { to, data } = action
+                && matches!(data.first(), Some(&STANDBY | &GIVE_DEVICE_POWER_STATUS))
+                && let Some(pending) = self
+                    .standby_verifications
+                    .iter_mut()
+                    .find(|pending| pending.la == *to)
+            {
+                pending.sent = pending.sent.saturating_add(1);
+            }
+        }
         actions
     }
 
@@ -233,6 +267,7 @@ impl Engine {
         let bridge_changed = self.config.bridge.topic != config.bridge.topic
             || self.config.bridge.logical_address != config.bridge.logical_address;
         self.config = config;
+        self.standby_verifications.clear();
         self.roles
             .retain(|role, _| self.config.device.iter().any(|d| &d.role == role));
         for device in &self.config.device {
@@ -249,7 +284,6 @@ impl Engine {
                 Self::required_queries(&self.config),
             );
             self.signals.clear();
-            self.standby_verifications.clear();
             self.active_role = None;
             for role in self.roles.values_mut() {
                 *role = RoleState::default();
@@ -261,13 +295,6 @@ impl Engine {
             );
         }
         self.identity = identity::resolve(&self.config.device, &self.bus);
-        self.standby_verifications.retain(|pending| {
-            self.config.mode == Mode::Active
-                && self.config.device.iter().any(|device| {
-                    device.role == pending.role && device.takeover == Takeover::CecStandby
-                })
-                && self.identity.roles.get(&pending.role) == Some(&pending.la)
-        });
         self.warming = true;
         self.warm_until = now + Duration::from_secs(3);
         vec![]
@@ -475,7 +502,7 @@ impl Engine {
                 }
             }
             Command::SendRaw { to, data } => {
-                if to <= 15 && !data.is_empty() && data.len() <= 15 {
+                if to <= 15 && !data.is_empty() && data.len() <= 14 {
                     actions.push(Action::CecSend { to, data });
                 }
             }
@@ -706,6 +733,9 @@ impl Engine {
                         deadline: now
                             + Duration::from_millis(self.config.timing.takeover_settle_ms),
                         attempts: 0,
+                        sent: 0,
+                        acked: false,
+                        nacked: 0,
                     });
                 }
                 vec![
@@ -778,13 +808,13 @@ impl Engine {
                 index += 1;
             } else {
                 let pending = self.standby_verifications.swap_remove(index);
-                self.record(
-                    Some(pending.role),
-                    None,
-                    None,
-                    "standby_unconfirmed",
-                    vec![],
-                );
+                let reason = if pending.sent > 0 && !pending.acked && pending.nacked >= pending.sent
+                {
+                    "standby_target_absent"
+                } else {
+                    "standby_unconfirmed"
+                };
+                self.record(Some(pending.role), None, None, reason, vec![]);
             }
         }
     }

@@ -31,7 +31,17 @@ messages). The bridge publishes frames addressed to itself, to broadcast (15)
 and (patched firmware) to the audio system (5). Choregos sends frames with
 `cmnd/tasmota_cec/HdmiSend` → `{"To":<la>,"Data":"<hex>"}`; the bridge answers
 `stat/tasmota_cec/RESULT` → `{"HdmiSend":"Done"|"Sending failed"}` (stock) or
-`{"HdmiSend":{"Ack":bool}}` (patched).
+`{"HdmiSend":{"Ack":bool}}` (patched). Only the patched response reports a
+target's ACK/NACK. Stock `"Done"` means queued; `"Sending failed"` means the
+bridge refused to transmit (busy or no logical address), not a target NACK.
+The bridge answers `HdmiSend` requests in publish order. The transport correlates
+results through a bounded FIFO of 64 outstanding sends (oldest dropped on
+overflow), expiring entries older than five seconds before consuming a result.
+Every reply containing `HdmiSend` consumes an entry, including firmware error
+strings without ACK information. Clear the FIFO on bridge `Offline`/`Online`,
+MQTT disconnect/reconnect, and any config reload (which replaces the transport).
+Results only tune labels/decisions, never gate safety. Raw send data is limited
+to 14 bytes: the bridge rejects payloads of 15 bytes or more.
 `fixtures/capture-streamer-wake.jsonl` is a real capture (Kodi standby,
 streaming box wake, standby, re-announce, remote volume presses) and is the
 primary replay fixture.
@@ -243,7 +253,7 @@ In order, as `Action`s:
 3. If Sonos state is `playing`: `HaCall{media_player.media_stop, sonos.entity}`.
 4. `HaCall{media_player.turn_on, receiver}` if receiver not `on`; then after `takeover_settle_ms`: `HaCall{media_player.select_source, receiver, {source}}` if `select_source` and current receiver source ≠ `source`; then `HaCall{script.turn_on, preset_for(now)}` — the preset only runs when the receiver transitioned off→on in this takeover or the active role changed.
 Takeovers are idempotent: a repeated On for the same role with no state change does nothing.
-In active mode, CEC standby actions (including all-off and manual standby) are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA; `8F` replies during verification update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry Standby followed by Give Device Power Status up to `standby_retries` times, then record `standby_unconfirmed`; silence is not confirmation. A real role On event or blocked/remapped identity cancels verification, bridge-offline clears it, and config reload retains only matching-LA `cec_standby` roles. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
+In active mode, CEC standby actions (including all-off and manual standby) are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA; `8F` replies during verification update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry Standby followed by Give Device Power Status up to `standby_retries` times; silence or NACK is not confirmation and does not shorten retries. Each pending verification counts outgoing `36`/`8F` frames to its LA (`sent`), correlated NACKs (`nacked`), and whether any ACK was observed (`acked`). On exhaustion, record `standby_target_absent` if `sent > 0 && !acked && nacked >= sent` (expected for devices that leave the bus in standby), otherwise `standby_unconfirmed` (ACKed frames or missing results without a confirming power report). Extra/late NACKs cannot override an observed ACK. ACK-based classification requires patched bridge firmware; stock firmware without ACK information can only produce `standby_unconfirmed`. Send results for other LAs or opcodes do not affect verification. A real role On event or blocked/remapped identity cancels verification; bridge-offline or a config reload clears pending verifications. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
 
 ### 5.5 Release (role turns Off)
 Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_player.turn_off, tv}` and `HaCall{media_player.turn_off, receiver}`. If a role turned On meanwhile the timer is cancelled.
@@ -302,7 +312,13 @@ Everything else: no reply (Feature Abort is a firmware concern).
 Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT). Entities: `binary_sensor.choregos_<role>` (power, per role), `sensor.choregos_active_source` (role name or `none`), `select.choregos_mode` (shadow/active), `button.choregos_all_off`, `binary_sensor.choregos_bridge` (bridge LWT), `sensor.choregos_conflicts` (count). Commands arrive on `choregos/cmd/<entity>`. State topics `choregos/state/<name>` retained.
 
 ### 5.12 Events into the engine
-`Frame`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | ForceIdentify(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`Frame`, `SendResult{to, data, ack}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | ForceIdentify(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`SendResult` correlates patched `{"Ack":true|false}` bridge results with
+successfully queued `HdmiSend` publishes. Stock `"Done"` / `"Sending failed"`
+and other non-ACK responses consume the FIFO entry without emitting an event:
+they do not establish whether the target is present. Uncorrelated results are
+ignored. Correlated results, including resync NACKs for absent LAs, are
+debug-level logs rather than warnings.
 HA's parsed `last_changed` takes precedence; absent/invalid timestamps use injected
 wall time on state-string changes, otherwise retain the cached timestamp.
 Optimistic state writes preserve the last HA-observed timestamp; sending a
