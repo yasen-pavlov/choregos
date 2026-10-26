@@ -2,7 +2,7 @@ use super::{
     frame::{Frame, decode_osd},
     opcode::{
         ACTIVE_SOURCE, DEVICE_VENDOR_ID, IMAGE_VIEW_ON, INACTIVE_SOURCE, REPORT_PHYSICAL_ADDRESS,
-        REPORT_POWER_STATUS, SET_OSD_NAME, STANDBY, TEXT_VIEW_ON,
+        REPORT_POWER_STATUS, REQUEST_ACTIVE_SOURCE, SET_OSD_NAME, STANDBY, TEXT_VIEW_ON,
     },
 };
 use crate::{
@@ -243,11 +243,7 @@ impl BusModel {
             })
             .min()
     }
-    pub fn handle(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
-        if frame.from >= 15 {
-            return vec![];
-        }
-        let replaces = self.replaces_identity(frame);
+    fn evict_physical_duplicates(&mut self, frame: &Frame) {
         if (frame.opcode == Some(REPORT_PHYSICAL_ADDRESS) && frame.params.len() >= 3)
             || (frame.opcode == Some(ACTIVE_SOURCE) && frame.params.len() == 2 && frame.to == 15)
         {
@@ -255,42 +251,47 @@ impl BusModel {
             self.entries
                 .retain(|&la, entry| la == frame.from || entry.physical != physical);
         }
-        let entry = self
-            .entries
-            .entry(frame.from)
-            .or_insert_with(|| BusEntry::new(now));
-        if replaces {
-            if self.active_source == entry.physical {
-                self.active_source = None;
-            }
-            let physical = entry.physical;
-            let key_changed = matches!(frame.opcode, Some(DEVICE_VENDOR_ID | SET_OSD_NAME));
-            let last_identify = entry.last_identify;
-            let attempts = entry.attempts;
-            *entry = BusEntry::new(now);
-            entry.last_identify = last_identify;
-            entry.attempts = attempts;
-            if key_changed {
-                entry.physical = physical;
-                entry.verified = false;
-            }
+    }
+
+    fn replace_entry(
+        entry: &mut BusEntry,
+        frame: &Frame,
+        now: Instant,
+        active_source: &mut Option<u16>,
+    ) {
+        if *active_source == entry.physical {
+            *active_source = None;
         }
-        entry.last_seen = Some(now);
-        let learned_key = !replaces
-            && match frame.opcode {
-                Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
-                    entry.physical.is_none()
-                }
-                Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => entry.vendor.is_none(),
-                Some(SET_OSD_NAME) if !frame.params.is_empty() => entry.osd.is_none(),
-                _ => false,
-            };
-        // Restores retain confirmed_at; a PA retained after replacement does not.
-        let restored_pa_confirmed = !replaces
-            && !entry.verified
-            && entry.confirmed_at.is_some()
-            && frame.opcode == Some(REPORT_PHYSICAL_ADDRESS)
-            && frame.params.len() >= 3;
+        let physical = entry.physical;
+        let key_changed = matches!(frame.opcode, Some(DEVICE_VENDOR_ID | SET_OSD_NAME));
+        let last_identify = entry.last_identify;
+        let attempts = entry.attempts;
+        *entry = BusEntry::new(now);
+        entry.last_identify = last_identify;
+        entry.attempts = attempts;
+        if key_changed {
+            entry.physical = physical;
+            entry.verified = false;
+        }
+    }
+
+    fn learned_key(entry: &BusEntry, frame: &Frame) -> bool {
+        match frame.opcode {
+            Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => entry.physical.is_none(),
+            Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => entry.vendor.is_none(),
+            Some(SET_OSD_NAME) if !frame.params.is_empty() => entry.osd.is_none(),
+            _ => false,
+        }
+    }
+
+    fn apply_report(
+        entry: &mut BusEntry,
+        frame: &Frame,
+        wall: DateTime<Utc>,
+        replaces: bool,
+        bridge: u8,
+        active_source: &mut Option<u16>,
+    ) {
         match frame.opcode {
             Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
                 entry.physical = frame.physical();
@@ -315,21 +316,19 @@ impl BusModel {
                 if replaces {
                     entry.physical = frame.physical();
                 }
-                self.active_source = frame.physical();
+                *active_source = frame.physical();
                 entry.power = BusPower::On;
             }
-            Some(INACTIVE_SOURCE) if frame.params.len() == 2 && frame.to == self.bridge => {
-                if self.active_source == frame.physical() {
-                    self.active_source = None;
+            Some(INACTIVE_SOURCE) if frame.params.len() == 2 && frame.to == bridge => {
+                if *active_source == frame.physical() {
+                    *active_source = None;
                 }
                 entry.power = BusPower::Standby;
             }
-            Some(STANDBY)
-                if frame.from != self.bridge && (frame.to == self.bridge || frame.to == 15) =>
-            {
+            Some(STANDBY) if frame.from != bridge && (frame.to == bridge || frame.to == 15) => {
                 entry.power = BusPower::Standby;
-                if self.active_source == entry.physical {
-                    self.active_source = None;
+                if *active_source == entry.physical {
+                    *active_source = None;
                 }
             }
             Some(REPORT_POWER_STATUS) => {
@@ -340,11 +339,52 @@ impl BusModel {
                     _ => entry.power,
                 };
             }
-            Some(IMAGE_VIEW_ON | TEXT_VIEW_ON) if frame.to == self.bridge => {
+            Some(IMAGE_VIEW_ON | TEXT_VIEW_ON) if frame.to == bridge => {
                 entry.power = BusPower::On;
             }
             _ => {}
         }
+    }
+
+    fn is_wake_frame(&self, frame: &Frame) -> bool {
+        match frame.opcode {
+            Some(IMAGE_VIEW_ON | TEXT_VIEW_ON) => frame.to == self.bridge,
+            Some(ACTIVE_SOURCE) => frame.to == 15 && frame.params.len() == 2,
+            Some(REQUEST_ACTIVE_SOURCE) => frame.to == 15,
+            _ => false,
+        }
+    }
+
+    pub fn handle(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
+        if frame.from >= 15 {
+            return vec![];
+        }
+        let replaces = self.replaces_identity(frame);
+        let wake = self.is_wake_frame(frame);
+        self.evict_physical_duplicates(frame);
+        let entry = self
+            .entries
+            .entry(frame.from)
+            .or_insert_with(|| BusEntry::new(now));
+        if replaces {
+            Self::replace_entry(entry, frame, now, &mut self.active_source);
+        }
+        entry.last_seen = Some(now);
+        let learned_key = !replaces && Self::learned_key(entry, frame);
+        // Restores retain confirmed_at; a PA retained after replacement does not.
+        let restored_pa_confirmed = !replaces
+            && !entry.verified
+            && entry.confirmed_at.is_some()
+            && frame.opcode == Some(REPORT_PHYSICAL_ADDRESS)
+            && frame.params.len() >= 3;
+        Self::apply_report(
+            entry,
+            frame,
+            wall,
+            replaces,
+            self.bridge,
+            &mut self.active_source,
+        );
         let reconfirmed = !entry.verified && entry.vendor_reconfirmed && entry.osd_reconfirmed;
         if reconfirmed {
             entry.verified = true;
@@ -356,11 +396,20 @@ impl BusModel {
             entry.attempts = 0;
         }
         entry.identified = Self::missing(self.required, entry).is_empty();
-        if frame.from != self.bridge {
-            self.identify(frame.from, now).into_iter().collect()
-        } else {
-            vec![]
+        if frame.from == self.bridge {
+            return vec![];
         }
+        // Wake announcements get one fresh attempt per base interval, even after replacement.
+        if wake
+            && !entry.identified
+            && entry.last_identify.is_none_or(|last| {
+                now.saturating_duration_since(last) >= Self::delay(self.retry, 0)
+            })
+        {
+            entry.attempts = 0;
+            entry.last_identify = None;
+        }
+        self.identify(frame.from, now).into_iter().collect()
     }
 }
 
