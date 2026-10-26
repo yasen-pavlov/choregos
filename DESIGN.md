@@ -129,6 +129,7 @@ volume_from = ["streamer"]        # roles whose remote volume keys are forwarded
 [timing]
 off_delay_s = 3                   # last device off → TV/receiver off
 takeover_settle_ms = 2000         # receiver turn_on → select_source → preset
+standby_retries = 2               # bounded standby retries after each takeover_settle_ms (0–10)
 presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
@@ -238,10 +239,11 @@ duplicates (same state) are ignored (replaces today's `rbe` nodes).
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
 1. `WakeTv` if `tv.entity` state is not `on` (HA state cache; if unknown, send anyway).
-2. For every other role currently On: `takeover` action — `cec_standby` → `CecSend{to: la, data: "36"}`; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `none`.
+2. For every other role currently On: `takeover` action — `cec_standby` → `CecSend{to: la, data: "36"}` followed by `CecSend{to: la, data: "8F"}`; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `none`.
 3. If Sonos state is `playing`: `HaCall{media_player.media_stop, sonos.entity}`.
 4. `HaCall{media_player.turn_on, receiver}` if receiver not `on`; then after `takeover_settle_ms`: `HaCall{media_player.select_source, receiver, {source}}` if `select_source` and current receiver source ≠ `source`; then `HaCall{script.turn_on, preset_for(now)}` — the preset only runs when the receiver transitioned off→on in this takeover or the active role changed.
 Takeovers are idempotent: a repeated On for the same role with no state change does nothing.
+In active mode, CEC standby actions (including all-off and manual standby) are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA; `8F` replies during verification update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry Standby followed by Give Device Power Status up to `standby_retries` times, then record `standby_unconfirmed`; silence is not confirmation. A real role On event or blocked/remapped identity cancels verification, bridge-offline clears it, and config reload retains only matching-LA `cec_standby` roles. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
 
 ### 5.5 Release (role turns Off)
 Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_player.turn_off, tv}` and `HaCall{media_player.turn_off, receiver}`. If a role turned On meanwhile the timer is cancelled.
