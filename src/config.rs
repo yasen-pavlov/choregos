@@ -146,9 +146,15 @@ pub struct SonosConfig {
 pub struct TimingConfig {
     pub off_delay_s: u64,
     pub takeover_settle_ms: u64,
+    #[serde(default = "default_standby_retries")]
+    pub standby_retries: u8,
     pub presence_poll_s: u64,
     pub presence_misses: u32,
     pub identify_retry_s: u64,
+}
+
+fn default_standby_retries() -> u8 {
+    2
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -355,6 +361,9 @@ impl Config {
                 "presence_poll_s, presence_misses and identify_retry_s must be positive",
             );
         }
+        if self.timing.standby_retries > 10 {
+            return invalid("standby_retries must be at most 10");
+        }
         Ok(())
     }
 
@@ -487,6 +496,19 @@ mod tests {
 
     fn example() -> Config {
         Config::parse(include_str!("../choregos.example.toml")).expect("valid example")
+    }
+
+    #[test]
+    fn standby_retries_are_bounded_and_can_be_disabled() {
+        let mut config = example();
+        for retries in [0, 10] {
+            config.timing.standby_retries = retries;
+            assert!(config.validate().is_ok());
+        }
+        for retries in [11, u8::MAX] {
+            config.timing.standby_retries = retries;
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

@@ -266,13 +266,12 @@ fn decode(config: &Config, topic: &str, payload: &[u8]) -> Option<Input> {
         };
     }
     if topic == format!("stat/{}/RESULT", config.bridge.topic) {
-        if serde_json::from_slice::<Value>(payload)
-            .ok()?
-            .get("HdmiSend")
-            .and_then(Value::as_str)
-            == Some("Sending failed")
-        {
+        let result = serde_json::from_slice::<Value>(payload).ok()?;
+        let hdmi_send = &result["HdmiSend"];
+        if hdmi_send.as_str() == Some("Sending failed") {
             tracing::warn!("bridge rejected HdmiSend");
+        } else if hdmi_send.get("Ack").and_then(Value::as_bool) == Some(false) {
+            tracing::warn!("bridge reported HdmiSend NACK");
         }
         return None;
     }

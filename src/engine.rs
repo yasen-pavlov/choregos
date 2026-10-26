@@ -63,6 +63,13 @@ pub struct HaState {
     pub changed: Option<DateTime<Utc>>,
 }
 
+struct StandbyVerification {
+    la: u8,
+    role: String,
+    deadline: Instant,
+    attempts: u8,
+}
+
 pub struct Engine {
     pub config: Arc<Config>,
     pub bus: BusModel,
@@ -76,6 +83,7 @@ pub struct Engine {
     warm_until: Instant,
     off_at: Option<Instant>,
     settle: Option<(Instant, String, bool)>,
+    standby_verifications: Vec<StandbyVerification>,
     signals: BTreeMap<u8, Vec<PowerEvent>>,
 }
 impl Engine {
@@ -105,6 +113,7 @@ impl Engine {
             warm_until: now + Duration::from_secs(3),
             off_at: None,
             settle: None,
+            standby_verifications: vec![],
             signals: BTreeMap::new(),
         }
     }
@@ -139,6 +148,11 @@ impl Engine {
             .filter_map(|(_, r)| r.poll_at)
             .chain(self.off_at)
             .chain(self.settle.as_ref().map(|s| s.0))
+            .chain(
+                self.standby_verifications
+                    .iter()
+                    .map(|pending| pending.deadline),
+            )
             .chain(identify)
             .min()
     }
@@ -187,6 +201,7 @@ impl Engine {
 
     fn handle_bridge_offline(&mut self) -> Vec<Action> {
         self.bridge_online = false;
+        self.standby_verifications.clear();
         vec![]
     }
 
@@ -234,6 +249,7 @@ impl Engine {
                 Self::required_queries(&self.config),
             );
             self.signals.clear();
+            self.standby_verifications.clear();
             self.active_role = None;
             for role in self.roles.values_mut() {
                 *role = RoleState::default();
@@ -245,6 +261,13 @@ impl Engine {
             );
         }
         self.identity = identity::resolve(&self.config.device, &self.bus);
+        self.standby_verifications.retain(|pending| {
+            self.config.mode == Mode::Active
+                && self.config.device.iter().any(|device| {
+                    device.role == pending.role && device.takeover == Takeover::CecStandby
+                })
+                && self.identity.roles.get(&pending.role) == Some(&pending.la)
+        });
         self.warming = true;
         self.warm_until = now + Duration::from_secs(3);
         vec![]
@@ -318,6 +341,16 @@ impl Engine {
         now: Instant,
         actions: &mut Vec<Action>,
     ) {
+        // Power-status replies verify an outgoing stop; they are not user wakes.
+        // Do not buffer them either, since warming can replay buffered signals.
+        if frame.opcode == Some(REPORT_POWER_STATUS)
+            && self
+                .standby_verifications
+                .iter()
+                .any(|pending| pending.la == frame.from)
+        {
+            return;
+        }
         for role in previous_roles.keys() {
             if !self.identity.roles.contains_key(role) && !self.identity.blocked.contains(role) {
                 actions.extend(self.transition(role, RolePower::Off, "identity_lost", now));
@@ -427,6 +460,9 @@ impl Engine {
         match command {
             Command::SetMode(mode) => {
                 Arc::make_mut(&mut self.config).mode = mode;
+                if mode == Mode::Shadow {
+                    self.standby_verifications.clear();
+                }
                 self.record(None, None, None, "command_set_mode", vec![]);
             }
             Command::Identify(la) => {
@@ -448,14 +484,14 @@ impl Engine {
             }
             Command::Standby(role) => {
                 if !self.warming && !self.identity.blocked.contains(&role) {
-                    actions.extend(self.stop_role(&role));
+                    actions.extend(self.stop_role(&role, now));
                     actions.extend(self.transition(&role, RolePower::Off, "manual_standby", now));
                 }
             }
             Command::AllOff => {
                 if !self.warming {
                     for role in self.roles.keys().cloned().collect::<Vec<_>>() {
-                        actions.extend(self.stop_role(&role));
+                        actions.extend(self.stop_role(&role, now));
                         actions.extend(self.transition(&role, RolePower::Off, "all_off", now));
                     }
                     self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
@@ -589,7 +625,7 @@ impl Engine {
                 .collect::<Vec<_>>()
             {
                 if self.roles[&other].power == RolePower::On {
-                    let stop = self.stop_role(&other);
+                    let stop = self.stop_role(&other, now);
                     if !stop.is_empty() {
                         let state = self.roles.get_mut(&other).expect("configured role");
                         state.power = RolePower::Off;
@@ -649,7 +685,7 @@ impl Engine {
         );
         actions
     }
-    fn stop_role(&self, role: &str) -> Vec<Action> {
+    fn stop_role(&mut self, role: &str, now: Instant) -> Vec<Action> {
         if self.identity.blocked.contains(role) {
             return vec![];
         }
@@ -657,17 +693,32 @@ impl Engine {
             return vec![];
         };
         match device.takeover {
-            Takeover::CecStandby => self
-                .identity
-                .roles
-                .get(role)
-                .map(|&to| {
-                    vec![Action::CecSend {
-                        to,
+            Takeover::CecStandby => {
+                let Some(&la) = self.identity.roles.get(role) else {
+                    return vec![];
+                };
+                self.standby_verifications
+                    .retain(|pending| pending.la != la);
+                if self.config.mode == Mode::Active {
+                    self.standby_verifications.push(StandbyVerification {
+                        la,
+                        role: role.into(),
+                        deadline: now
+                            + Duration::from_millis(self.config.timing.takeover_settle_ms),
+                        attempts: 0,
+                    });
+                }
+                vec![
+                    Action::CecSend {
+                        to: la,
                         data: vec![STANDBY],
-                    }]
-                })
-                .unwrap_or_default(),
+                    },
+                    Action::CecSend {
+                        to: la,
+                        data: vec![GIVE_DEVICE_POWER_STATUS],
+                    },
+                ]
+            }
             Takeover::HaMediaStop => device
                 .media_player
                 .as_ref()
@@ -683,7 +734,59 @@ impl Engine {
         let mut actions = self.expire_off_timer(now);
         actions.extend(self.expire_settle_timer(now, wall));
         self.poll_presence(now, &mut actions);
+        self.verify_standby(now, &mut actions);
         actions
+    }
+
+    fn verify_standby(&mut self, now: Instant, actions: &mut Vec<Action>) {
+        let mut index = 0;
+        while index < self.standby_verifications.len() {
+            let pending = &self.standby_verifications[index];
+            if pending.deadline > now {
+                index += 1;
+                continue;
+            }
+            let cancelled = self.identity.blocked.contains(&pending.role)
+                || self.identity.roles.get(&pending.role) != Some(&pending.la)
+                || self
+                    .roles
+                    .get(&pending.role)
+                    .is_some_and(|state| state.power == RolePower::On);
+            let confirmed = self.bus.entries.get(&pending.la).is_some_and(|entry| {
+                matches!(entry.power, BusPower::Standby | BusPower::Transition)
+            });
+            if cancelled || confirmed {
+                self.standby_verifications.swap_remove(index);
+            } else if pending.attempts < self.config.timing.standby_retries {
+                let retry = vec![
+                    Action::CecSend {
+                        to: pending.la,
+                        data: vec![STANDBY],
+                    },
+                    Action::CecSend {
+                        to: pending.la,
+                        data: vec![GIVE_DEVICE_POWER_STATUS],
+                    },
+                ];
+                let role = pending.role.clone();
+                let pending = &mut self.standby_verifications[index];
+                pending.attempts += 1;
+                pending.deadline =
+                    now + Duration::from_millis(self.config.timing.takeover_settle_ms);
+                actions.extend_from_slice(&retry);
+                self.record(Some(role), None, None, "standby_retry", retry);
+                index += 1;
+            } else {
+                let pending = self.standby_verifications.swap_remove(index);
+                self.record(
+                    Some(pending.role),
+                    None,
+                    None,
+                    "standby_unconfirmed",
+                    vec![],
+                );
+            }
+        }
     }
 
     fn expire_off_timer(&mut self, now: Instant) -> Vec<Action> {

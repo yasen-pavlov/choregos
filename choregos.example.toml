@@ -47,6 +47,7 @@ volume_from = ["streamer"]        # roles whose remote volume keys are forwarded
 [timing]
 off_delay_s = 3                   # last device off → TV/receiver off
 takeover_settle_ms = 2000         # receiver turn_on → select_source → preset
+standby_retries = 2              # re-send <Standby> to a taken-over device that has not reported standby after takeover_settle_ms
 presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10

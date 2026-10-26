@@ -2,6 +2,35 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — Standby verification after takeover
+
+- A live takeover on 2026-10-26 sent Standby during the incoming source's
+  announcement burst, but the displaced source stayed on; a later manual
+  Standby worked. The previous Node-RED automation had the same failure.
+  Bus arbitration/NACK or a device ignoring a mid-burst command can explain
+  the race, so sending once is not evidence that standby took effect.
+- Send Standby followed immediately by Give Device Power Status, including
+  all-off and manual standby through the shared stop path. Verify after
+  `takeover_settle_ms` and retry that pair at the same interval, bounded by
+  `timing.standby_retries` (default 2, range 0–10); record `standby_retry`,
+  then `standby_unconfirmed` after N retries without confirmation.
+- Confirmation requires observed Standby or Transition power from that LA.
+  Silence and Unknown power are not standby evidence: absent devices exhaust
+  the bounded retries rather than being assumed off.
+- During pending verification, `8F` replies (`90 xx`) update bus power only,
+  never role signals or buffered signals. An unchanged On reply must not
+  wake the displaced role, stop the new source, or be replayed after warming.
+  Real On events still cancel verification to respect a user wake.
+- Cancel blocked/remapped identities, clear pending checks on bridge-offline,
+  and retain only same-LA `cec_standby` roles on reload. Do not register
+  verification in shadow mode, since Standby is not executed there; entering
+  shadow also clears pending checks to avoid misleading retry decisions.
+- Residual risk: a retry deadline may land between a waking device's
+  non-on-event frames (`84`/`87`, depending on its configured on list) and its
+  on-event. This bounded verification does not distinguish that burst window.
+- Warn on the patched bridge's `HdmiSend.Ack=false` as well as the stock
+  `Sending failed` response, without correlating acknowledgements to requests.
+
 ## 2026-10-25 — Restart resilience and directed-broadcast WoL
 
 - Identification requires PA plus the union of OSD/vendor keys used by configured

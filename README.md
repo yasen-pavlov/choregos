@@ -41,7 +41,7 @@ hosts, entities, sources and matching rules with your own. Secrets are accepted
 | `receiver` | HA `entity`, `select_source` boolean |
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries with `from`, `to` (`HH:MM`), and HA `script`. Must cover exactly 24 hours; use `24:00` only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` list of role IDs. Volume keys are forwarded only while Sonos reports `playing`. |
-| `timing` | `off_delay_s`, `takeover_settle_ms`, `presence_poll_s`, `presence_misses`, `identify_retry_s`. Poll/retry intervals and misses must be positive. |
+| `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default `2`, range `0`–`10`), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Unconfirmed standby is re-sent after each settle interval, followed by a power-status query; `0` disables retries. Poll/retry intervals and presence misses must be positive. |
 | `fake_tv` | `replies=true` (default; false when bridge firmware answers directed TV requests), `power_status="always_on"`, `cec_version="1.4"`, `osd_name` (1–14 ASCII bytes). Broadcast Request Active Source remains service-owned. |
 | `device` | Array of roles: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` has `issuer`, `client_id`; `web.local_login` has `username` |
