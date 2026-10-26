@@ -40,6 +40,10 @@ pub struct BusEntry {
     last_identify: Option<Instant>,
     attempts: u8,
     identify_since: Instant,
+    restore_reconfirmation: bool,
+    vendor_reconfirmed: bool,
+    osd_reconfirmed: bool,
+    manual_pending: bool,
 }
 impl BusEntry {
     fn new(now: Instant) -> Self {
@@ -56,6 +60,10 @@ impl BusEntry {
             last_identify: None,
             attempts: 0,
             identify_since: now,
+            restore_reconfirmation: false,
+            vendor_reconfirmed: false,
+            osd_reconfirmed: false,
+            manual_pending: false,
         }
     }
 }
@@ -66,6 +74,7 @@ pub struct BusModel {
     pub bridge: u8,
     retry: Duration,
     required: IdentifyQueries,
+    identify_not_before: Option<Instant>,
 }
 impl BusModel {
     pub fn new(bridge: u8, identify_retry_s: u64, required: IdentifyQueries) -> Self {
@@ -75,6 +84,7 @@ impl BusModel {
             bridge,
             retry: Duration::from_secs(identify_retry_s),
             required,
+            identify_not_before: None,
         }
     }
     pub fn configure_identification(&mut self, seconds: u64, required: IdentifyQueries) {
@@ -104,17 +114,16 @@ impl BusModel {
             entry.device_type = identity.device_type;
             entry.verified = false;
             entry.confirmed_at = Some(identity.confirmed_at);
+            entry.restore_reconfirmation =
+                entry.physical.is_some() && entry.vendor.is_some() && entry.osd.is_some();
             entry.identified = Self::missing(self.required, &entry).is_empty();
             self.entries.insert(identity.la, entry);
         }
     }
 
     fn missing(required: IdentifyQueries, entry: &BusEntry) -> IdentifyQueries {
-        if !entry.verified {
-            return IdentifyQueries::ALL;
-        }
         IdentifyQueries {
-            physical: entry.physical.is_none(),
+            physical: !entry.verified || entry.physical.is_none(),
             vendor: required.vendor && entry.vendor.is_none(),
             osd: required.osd && entry.osd.is_none(),
         }
@@ -132,14 +141,18 @@ impl BusModel {
             entry.attempts = 0;
             entry.identify_since = now;
         }
+        self.defer_identification(now);
     }
 
-    pub fn manual_identify(&mut self, la: u8, now: Instant) {
+    fn defer_identification(&mut self, now: Instant) {
+        self.identify_not_before = Some(now + Duration::from_secs(1));
+    }
+
+    pub fn manual_identify(&mut self, la: u8, now: Instant) -> Vec<Action> {
         let entry = self.entries.entry(la).or_insert_with(|| BusEntry::new(now));
-        entry.last_identify = Some(now);
-        entry.attempts = 0;
+        entry.manual_pending = true;
+        self.identify(la, now).into_iter().collect()
     }
-
     pub fn replaces_identity(&self, frame: &Frame) -> bool {
         let Some(entry) = self.entries.get(&frame.from) else {
             return false;
@@ -165,46 +178,62 @@ impl BusModel {
     fn vendor(frame: &Frame) -> u32 {
         u32::from_be_bytes([0, frame.params[0], frame.params[1], frame.params[2]])
     }
-    fn identify(
-        la: u8,
-        entry: &mut BusEntry,
-        required: IdentifyQueries,
-        retry: Duration,
-        now: Instant,
-    ) -> Option<Action> {
-        let queries = Self::missing(required, entry);
-        entry.identified = queries.is_empty();
-        if !entry.identified
-            && entry
-                .last_identify
-                .is_none_or(|last| now.duration_since(last) >= Self::delay(retry, entry.attempts))
-        {
-            if entry.last_identify.is_some() {
-                entry.attempts = entry.attempts.saturating_add(1);
-            }
-            entry.last_identify = Some(now);
-            Some(Action::Identify { la, queries })
+    fn entry_deadline(retry: Duration, entry: &BusEntry) -> Instant {
+        if entry.manual_pending {
+            entry.identify_since
         } else {
-            None
+            entry.last_identify.map_or(entry.identify_since, |last| {
+                last + Self::delay(retry, entry.attempts)
+            })
         }
     }
 
+    fn identify(&mut self, la: u8, now: Instant) -> Option<Action> {
+        if self.identify_not_before.is_some_and(|next| now < next) {
+            return None;
+        }
+        let entry = self.entries.get_mut(&la)?;
+        let queries = if entry.manual_pending {
+            IdentifyQueries::ALL
+        } else {
+            Self::missing(self.required, entry)
+        };
+        if queries.is_empty() || now < Self::entry_deadline(self.retry, entry) {
+            return None;
+        }
+        if entry.manual_pending {
+            entry.manual_pending = false;
+        } else if entry.last_identify.is_some() {
+            entry.attempts = entry.attempts.saturating_add(1);
+        }
+        entry.last_identify = Some(now);
+        self.defer_identification(now);
+        Some(Action::Identify { la, queries })
+    }
+
     pub fn retry_identification(&mut self, now: Instant) -> Vec<Action> {
-        self.entries
-            .iter_mut()
-            .filter(|(la, _)| **la < 15 && **la != self.bridge)
-            .filter_map(|(&la, entry)| Self::identify(la, entry, self.required, self.retry, now))
+        let next = self
+            .entries
+            .iter()
+            .filter(|(la, entry)| {
+                **la < 15 && **la != self.bridge && (!entry.identified || entry.manual_pending)
+            })
+            .min_by_key(|(_, entry)| Self::entry_deadline(self.retry, entry))
+            .map(|(&la, _)| la);
+        next.and_then(|la| self.identify(la, now))
+            .into_iter()
             .collect()
     }
 
     pub fn next_identify_deadline(&self) -> Option<Instant> {
         self.entries
             .iter()
-            .filter(|(la, entry)| **la < 15 && **la != self.bridge && !entry.identified)
+            .filter(|(la, entry)| {
+                **la < 15 && **la != self.bridge && (!entry.identified || entry.manual_pending)
+            })
             .map(|(_, entry)| {
-                entry.last_identify.map_or(entry.identify_since, |last| {
-                    last + Self::delay(self.retry, entry.attempts)
-                })
+                let due = Self::entry_deadline(self.retry, entry);
+                self.identify_not_before.map_or(due, |gate| due.max(gate))
             })
             .min()
     }
@@ -237,7 +266,14 @@ impl BusModel {
             }
         }
         entry.last_seen = Some(now);
-        entry.attempts = 0;
+        let learned_key = match frame.opcode {
+            Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
+                entry.physical.is_none() || !entry.verified
+            }
+            Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => entry.vendor.is_none(),
+            Some(SET_OSD_NAME) if !frame.params.is_empty() => entry.osd.is_none(),
+            _ => false,
+        };
         match frame.opcode {
             Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
                 entry.physical = frame.physical();
@@ -246,10 +282,23 @@ impl BusModel {
                 entry.confirmed_at = Some(wall);
             }
             Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => {
+                if entry.restore_reconfirmation
+                    && entry.vendor == Some(Self::vendor(frame))
+                    && (frame.to == self.bridge || frame.to == 15)
+                {
+                    entry.vendor_reconfirmed = true;
+                }
                 entry.vendor = Some(Self::vendor(frame));
             }
             Some(SET_OSD_NAME) if !frame.params.is_empty() => {
-                entry.osd = Some(decode_osd(&frame.params));
+                let osd = decode_osd(&frame.params);
+                if entry.restore_reconfirmation
+                    && entry.osd.as_ref() == Some(&osd)
+                    && frame.to == self.bridge
+                {
+                    entry.osd_reconfirmed = true;
+                }
+                entry.osd = Some(osd);
             }
             Some(ACTIVE_SOURCE) if frame.params.len() == 2 && frame.to == 15 => {
                 if replaces {
@@ -285,11 +334,19 @@ impl BusModel {
             }
             _ => {}
         }
+        let reconfirmed = !entry.verified && entry.vendor_reconfirmed && entry.osd_reconfirmed;
+        if reconfirmed {
+            entry.verified = true;
+        }
+        if entry.verified {
+            entry.restore_reconfirmation = false;
+        }
+        if learned_key || reconfirmed {
+            entry.attempts = 0;
+        }
         entry.identified = Self::missing(self.required, entry).is_empty();
         if frame.from != self.bridge {
-            Self::identify(frame.from, entry, self.required, self.retry, now)
-                .into_iter()
-                .collect()
+            self.identify(frame.from, now).into_iter().collect()
         } else {
             vec![]
         }

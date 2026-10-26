@@ -494,11 +494,9 @@ impl Engine {
             }
             Command::Identify(la) => {
                 if la < 15 && la != self.bus.bridge {
-                    self.bus.manual_identify(la, now);
-                    actions.push(Action::Identify {
-                        la,
-                        queries: IdentifyQueries::ALL,
-                    });
+                    actions.extend(self.bus.manual_identify(la, now));
+                    // Accepted commands remain visible even when their send is queued.
+                    self.record(None, None, None, "command_identify", actions.clone());
                 }
             }
             Command::SendRaw { to, data } => {

@@ -217,6 +217,7 @@ prints the resolved config with secrets redacted.
 ### 5.1 Bus model
 `BusModel` keeps one entry per logical address 0–14:
 `{physical: Option<u16>, device_type: Option<u8>, vendor: Option<u32>, osd: Option<String>, power: Unknown|On|Standby|Transition, last_seen: Option<Instant>, verified: bool, confirmed_at: Option<DateTime<Utc>>, identified: bool}`
+with transient flags tracking vendor/OSD re-confirmation since restore,
 plus `active_source: Option<u16>` (physical address) and the bridge's own LA.
 Learning rules (all from received frames; sender = `From`):
 - `84 PP PP TT` Report Physical Address (bcast) → physical, device_type, last_seen, verified = true, confirmed_at = injected wall time.
@@ -227,15 +228,18 @@ Learning rules (all from received frames; sender = `From`):
 - `36` Standby from a device (to TV or bcast) → sender power = Standby. (From the TV/bridge to others it is a command, not a report.)
 - `90 SS` Report Power Status → sender power per SS (00 On, 01 Standby, 02 →On, 03 →Standby).
 - `04` Image View On / `0D` Text View On (to TV) → sender power = On.
-- An entry is `identified` only when verified, physical address is known and every `osd`/`vendor` key used by any configured device match rule is known. Recompute the required key set on config reload. Query only missing required keys (`83` PA, `8C` vendor, `46` OSD); unverified restored entries request all three keys. Manual identify requests all three and updates its last-query instant; the bridge and LA 15 are never queried.
-- Retry on ticks only while the bridge is online. The interval is `identify_retry_s * 2^attempts`, capped at one hour, starting at the base interval after the first query. Each unanswered retry increases attempts; any frame from that LA or bridge-online/resync resets attempts. Resync also clears each last-query instant, allowing replies to trigger missing-key identification immediately.
+- An entry is `identified` only when verified, physical address is known and every `osd`/`vendor` key used by any configured device match rule is known. Recompute the required key set on config reload. Query only missing required keys (`83` PA, `8C` vendor, `46` OSD). Unverified restored entries additionally need PA verification: when all keys are cached, request **only `83` on every automatic attempt**, including the first; never solicit `87`/`47` solely for re-confirmation. Missing vendor/OSD keys are still requested. Manual identify requests all three and updates its last-query instant when sent; the bridge and LA 15 are never queried.
+- Retry on ticks only while the bridge is online. The interval is `identify_retry_s * 2^attempts`, capped at one hour, starting at the base interval after the first query. Each unanswered retry increases attempts. Reset attempts only on a newly learned key, verification, identity replacement, or bridge-online/resync, not arbitrary traffic or unchanged identity replies. With a 10 s base, intervals are 10, 20, 40, …, 2560, 3600 s: the interval reaches about ten minutes after about ten minutes, and the one-hour cap after about 85 minutes of cumulative silence. Resync also clears each last-query instant.
+- Except for the existing one-off resync burst (§5.6), emit at most one `Action::Identify` (one LA) per handled event, with a shared one-second minimum between sends. Other due LAs (including queued manual identify requests) wait for that slot; `next_deadline` includes this deadline bump, preventing a zero-delay tick loop. Choose the earliest due entry, then LA order for ties. Resync reserves the next second too: coincident retries wait for a later tick.
+- A fully keyed restored identity may also verify opportunistically after both its stored vendor and OSD have been re-confirmed since restore, in either order: accept `87` to the bridge or broadcast (the normal vendor reply), and `47` directed to the bridge. A single unchanged reply does not reset attempts. This alternative never updates `confirmed_at`; only `84` does. It is unavailable after replacement or if the restored PA/vendor/OSD was missing.
 - A differing PA in `84` or broadcast `82` replaces the LA entry and clears its buffered signals. A differing known vendor/OSD clears the other non-PA keys and signals, retains PA only as unverified, and requires fresh `84` confirmation before role matching.
 - Entries age out of `power = On` only via explicit events or presence polling; never by time alone.
 
 ### 5.2 Identity → role
 A role matches a verified LA entry when every key in its `match` table matches
-(`osd` exact after trimming, `vendor` hex, `physical` dotted). Restored entries
-are ignored until a received `84` confirms the stored PA; power signals received
+(OSD exact after trimming, vendor hex, physical dotted). Restored entries
+are ignored until a received `84` confirms the stored PA, or both cached
+vendor and OSD are re-confirmed as specified in §5.1; power signals received
 before verification remain buffered. If two roles
 match one LA, or one role matches two LAs, the engine records a `Conflict`
 decision, exposes it in the UI/HA, and takes **no power actions** for the
@@ -275,8 +279,11 @@ empty; corrupt or unknown versions warn and start empty without failing startup.
 `Engine::new(config, now, restored)` receives the seed without I/O. Restored
 entries have Unknown power, no last-seen time, and verified = false; their
 restore instant anchors the first retry deadline. Duplicate restored physical
-addresses keep the earlier LA. Only a matching received `84` verifies cached
-keys and enables role matching; a differing PA replaces the cached identity.
+addresses keep the earlier LA. A matching received `84` verifies cached keys
+and enables role matching; a differing PA replaces the cached identity.
+Opportunistic matching vendor plus directed OSD traffic may also verify a
+fully keyed restored identity (§5.1), without refreshing its persisted
+`confirmed_at` or extending the 30-day lifetime.
 The devices page labels unverified entries `restored` rather than inventing a
 last-seen time. The runtime appends `service_started` after restored decisions.
 

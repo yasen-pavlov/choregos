@@ -2,6 +2,43 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — Bound restored-identity identification traffic
+
+- Standby devices may ignore `83` while answering `46`. Re-querying all keys
+  and resetting retries on every reply created a self-sustaining traffic loop
+  capable of crashing the bridge. Request only missing required keys; a fully
+  keyed unverified restore requests only `83`, including its first automatic
+  attempt. Do not add a first-attempt `8C`/`46` burst.
+- Permit opportunistic verification of a fully keyed restored identity once
+  both its cached vendor and OSD are re-confirmed, in either order. Vendor
+  `87` may target the bridge or broadcast (CEC's usual vendor response); OSD
+  `47` must target the bridge. This accepts the available standby/wake evidence
+  without soliciting more traffic. Differing values retain the replacement
+  path, clear re-confirmation evidence, and still require a fresh `84`.
+  Identities missing a cached PA/vendor/OSD cannot use this shortcut.
+- Reset attempts only for identification progress (new key, verification or
+  replacement) and resync/bridge-online, never arbitrary frames or repeated
+  unchanged keys. A single matching OSD/vendor reply is not progress.
+  Preserve the 10, 20, 40, … second sequence and one-hour cap: after about
+  ten minutes the retry interval is about ten minutes, not one hour; the cap
+  is reached after about 85 minutes of cumulative silence.
+- Rate-limit automatic and manual identification together in the pure bus
+  model using injected time: one LA per event and at least one second between
+  bursts. Keep deferred manual requests pending rather than dropping them.
+  Include the shared slot in identification deadlines, choosing earliest due
+  entries with LA tie-breaking, so due devices do not cause a busy tick loop
+  or starve behind more recently due entries.
+  Record acceptance of queued identify commands immediately (with no sent
+  actions yet), preserving the command log/persistence contract while they wait.
+- Retain the existing one-off resync burst, but reserve its following second
+  before allowing retries. This bounds sustained identification load without
+  changing startup interrogation or introducing executor-side timing/I/O.
+- Re-confirmation flags are transient. Do not change persisted state format,
+  `confirmed_at`, or its lifetime: only received `84` refreshes confirmation.
+  Same-model swaps with identical vendor/OSD remain indistinguishable by this
+  evidence; accept that tradeoff instead of keeping silent standby entries
+  permanently unverified.
+
 ## 2026-10-26 — Bridge send results and startup log noise
 
 - Devices that leave the CEC bus in standby legitimately NACK Standby and
