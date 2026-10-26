@@ -14,8 +14,8 @@ use crate::{
     web::{WebError, WebState, render},
 };
 
-/// Data bytes after the header block; a CEC frame carries at most 16 blocks.
-const MAX_RAW_DATA: usize = 15;
+/// Data bytes after the header block; the bridge firmware rejects frames of 15 data bytes or more.
+const MAX_RAW_DATA: usize = 14;
 
 #[derive(Template)]
 #[template(path = "partials/flash.html")]
@@ -147,7 +147,7 @@ pub(crate) async fn send_raw(
     run(&web, Command::SendRaw { to, data }, done).await
 }
 
-/// Accepts `8F`, `44 41`, `44:41`; requires 1–15 bytes.
+/// Accepts `8F`, `44 41`, `44:41`; requires 1–14 bytes.
 fn parse_hex(text: &str) -> Result<Vec<u8>, &'static str> {
     let digits: String = text
         .chars()
@@ -155,7 +155,7 @@ fn parse_hex(text: &str) -> Result<Vec<u8>, &'static str> {
         .collect();
     let data = hex::decode(&digits).map_err(|_| "Data must be hex bytes, e.g. 44 41.")?;
     if data.is_empty() || data.len() > MAX_RAW_DATA {
-        return Err("Data must be 1–15 bytes.");
+        return Err("Data must be 1–14 bytes.");
     }
     Ok(data)
 }
@@ -172,7 +172,7 @@ mod tests {
         assert!(parse_hex("").is_err());
         assert!(parse_hex("4").is_err());
         assert!(parse_hex("zz").is_err());
-        assert_eq!(parse_hex(&"00".repeat(15)).unwrap().len(), 15);
-        assert!(parse_hex(&"00".repeat(16)).is_err());
+        assert_eq!(parse_hex(&"00".repeat(14)).unwrap().len(), 14);
+        assert!(parse_hex(&"00".repeat(15)).is_err());
     }
 }

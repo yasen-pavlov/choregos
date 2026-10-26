@@ -2,6 +2,40 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — Bridge send results and startup log noise
+
+- Devices that leave the CEC bus in standby legitimately NACK Standby and
+  power-status queries, including startup resync. Blind bridge-NACK warnings
+  obscured the distinction between absent devices and devices still on the bus.
+  Only patched `HdmiSend.Ack` responses emit `SendResult { to, data, ack }`
+  engine events. Stock `Done` means queued, while `Sending failed` means the
+  bridge refused to transmit (busy or no LA claimed): neither reports the
+  target's ACK/NACK. Correlated replies log at debug, never warn for NACKs.
+- The bridge answers sends in publish order. Keep at most 64 outstanding
+  successfully queued sends, dropping the oldest on overflow; discard entries
+  older than five seconds before consuming a reply. Every `HdmiSend` reply,
+  including stock responses and firmware errors such as `Invalid JSON`,
+  `Buffer empty`, and `Buffer too large`, consumes an entry to preserve order.
+  Clear on bridge Offline/Online, MQTT disconnect/reconnect, and any config
+  reload (which replaces the transport). Results never gate safety.
+- Pending standby verification counts outgoing `36`/`8F` frames and their
+  correlated NACKs, and remembers any ACK. After the same bounded retries,
+  `sent > 0 && !acked && nacked >= sent` becomes `standby_target_absent`;
+  extra or late NACKs cannot override an observed ACK. Mixed ACKs or missing
+  results without a confirming power report remain `standby_unconfirmed`.
+  ACK-based absence classification requires patched firmware; stock firmware
+  can only produce `standby_unconfirmed`. Neither NACK nor silence confirms
+  standby or suppresses retries. Observed Standby/Transition and real role On
+  retain confirmation/cancellation semantics; reload clears pending checks.
+  Results outside pending verification (such as resync) are ignored.
+- Suppressed shadow-mode standby sends never enter the transport FIFO.
+- Do not publish retained states while the runtime's MQTT connection is down.
+  Clear the state cache on connect so the latest values publish then, avoiding
+  startup noise rather than lowering the severity of real dropped publishes.
+  Disconnected-drop logging remains warn; no process-wide connection flag.
+- Raw-send validation accepts at most 14 data bytes, matching firmware's
+  rejection of payload lengths of 15 or greater.
+
 ## 2026-10-26 — Standby verification after takeover
 
 - A live takeover on 2026-10-26 sent Standby during the incoming source's
@@ -21,15 +55,13 @@ Deviations from DESIGN.md agreed in review. Newest first.
   never role signals or buffered signals. An unchanged On reply must not
   wake the displaced role, stop the new source, or be replayed after warming.
   Real On events still cancel verification to respect a user wake.
-- Cancel blocked/remapped identities, clear pending checks on bridge-offline,
-  and retain only same-LA `cec_standby` roles on reload. Do not register
-  verification in shadow mode, since Standby is not executed there; entering
-  shadow also clears pending checks to avoid misleading retry decisions.
+- Cancel blocked/remapped identities and clear pending checks on bridge-offline
+  or config reload. Do not register verification in shadow mode, since Standby
+  is not executed there; entering shadow also clears pending checks to avoid
+  misleading retry decisions.
 - Residual risk: a retry deadline may land between a waking device's
   non-on-event frames (`84`/`87`, depending on its configured on list) and its
   on-event. This bounded verification does not distinguish that burst window.
-- Warn on the patched bridge's `HdmiSend.Ack=false` as well as the stock
-  `Sending failed` response, without correlating acknowledgements to requests.
 
 ## 2026-10-25 — Restart resilience and directed-broadcast WoL
 

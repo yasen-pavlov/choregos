@@ -538,7 +538,7 @@ impl Runtime {
                 .map(|role| role.power)
                 .collect::<Vec<_>>(),
         );
-        if entity_states != self.last_states {
+        if self.snapshot.connections.mqtt_connected && entity_states != self.last_states {
             self.adapters().executor.mqtt.states(&self.snapshot);
             self.last_states = entity_states;
         }
@@ -667,7 +667,7 @@ fn push_ring<T>(items: &mut VecDeque<T>, item: T, max: usize) {
 fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandError> {
     let error = match command {
         Command::Identify(la) if *la >= 15 => Some("identify address must be 0–14"),
-        Command::SendRaw { to, data } if *to > 15 || data.is_empty() || data.len() > 15 => {
+        Command::SendRaw { to, data } if *to > 15 || data.is_empty() || data.len() > 14 => {
             Some("invalid CEC destination or payload length")
         }
         Command::Identify(la) if *la == engine.bus.bridge => Some("cannot identify the bridge"),
@@ -932,12 +932,26 @@ mod tests {
                 to: 4,
                 data: vec![],
             },
+            Command::SendRaw {
+                to: 4,
+                data: vec![0; 15],
+            },
             Command::Takeover("missing".into()),
             Command::AllOff,
         ] {
             assert!(validate_command(&command, &engine).is_err());
         }
         assert!(validate_command(&Command::SetMode(Mode::Shadow), &engine).is_ok());
+        assert!(
+            validate_command(
+                &Command::SendRaw {
+                    to: 4,
+                    data: vec![0; 14],
+                },
+                &engine,
+            )
+            .is_ok()
+        );
     }
 }
 

@@ -19,7 +19,33 @@ struct DashboardTemplate {
     layout: Option<Layout>,
     snapshot: Snapshot,
     active_name: Option<String>,
-    entities: Vec<(&'static str, HaEntityView)>,
+    entities: Vec<HaRow>,
+}
+
+struct HaRow {
+    kind: &'static str,
+    entity: HaEntityView,
+    /// The TV drops off the network ~2 min after standby, so Home Assistant reports it
+    /// `unavailable`/`unknown` whenever the room is off: render that as a muted `off`, not
+    /// a fault. Every other entity keeps its raw state (and the error styling).
+    off_unreachable: bool,
+}
+
+impl HaRow {
+    fn new(kind: &'static str, entity: &HaEntityView) -> Self {
+        Self {
+            kind,
+            entity: entity.clone(),
+            off_unreachable: false,
+        }
+    }
+
+    fn tv(entity: &HaEntityView) -> Self {
+        Self {
+            off_unreachable: matches!(entity.state.as_str(), "unavailable" | "unknown"),
+            ..Self::new("tv", entity)
+        }
+    }
 }
 
 pub(crate) async fn page(State(web): State<WebState>, ctx: Ctx) -> Result<Html<String>, WebError> {
@@ -31,18 +57,19 @@ pub(crate) async fn page(State(web): State<WebState>, ctx: Ctx) -> Result<Html<S
             .find(|role| &role.role == active)
             .map_or_else(|| active.clone(), |role| role.name.clone())
     });
-    let mut entities = vec![
-        ("tv", snapshot.ha.tv.clone()),
-        ("receiver", snapshot.ha.receiver.clone()),
-        ("sonos", snapshot.ha.sonos.clone()),
-    ];
-    entities.extend(
-        snapshot
-            .ha
-            .media_players
+    let ha = &snapshot.ha;
+    let entities = [
+        HaRow::tv(&ha.tv),
+        HaRow::new("receiver", &ha.receiver),
+        HaRow::new("sonos", &ha.sonos),
+    ]
+    .into_iter()
+    .chain(
+        ha.media_players
             .iter()
-            .map(|entity| ("media", entity.clone())),
-    );
+            .map(|entity| HaRow::new("media", entity)),
+    )
+    .collect();
     render(&DashboardTemplate {
         layout: Some(Layout::new(ctx, "dashboard", &snapshot)),
         snapshot,

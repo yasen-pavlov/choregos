@@ -70,13 +70,13 @@
     <table class="grid">
       <thead><tr><th></th><th>entity</th><th>state</th><th>detail</th><th>changed</th></tr></thead>
       <tbody>
-        {% for (kind, entity) in entities %}
+        {% for row in entities %}
         <tr>
-          <td class="dim">{{ kind }}</td>
-          <td class="mono">{{ entity.entity }}</td>
-          <td><span class="pill state-{{ entity.state }}">{{ entity.state }}</span></td>
-          <td>{{ view::ha_detail(entity) }}</td>
-          <td class="dim">{{ view::ago(entity.last_changed) }}</td>
+          <td class="dim">{{ row.kind }}</td>
+          <td class="mono">{{ row.entity.entity }}</td>
+          <td>{% if row.off_unreachable %}<span class="pill state-off" title="Home Assistant: {{ row.entity.state }} (the TV leaves the network in standby)">off (unreachable)</span>{% else %}<span class="pill state-{{ row.entity.state }}">{{ row.entity.state }}</span>{% endif %}</td>
+          <td>{{ view::ha_detail(row.entity) }}</td>
+          <td class="dim">{{ view::ago(row.entity.last_changed) }}</td>
         </tr>
         {% endfor %}
       </tbody>

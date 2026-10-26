@@ -60,6 +60,17 @@ Power events: `image_view_on`, `text_view_on`, `active_source`, `power_on`,
 Takeover policies: `cec_standby`, `ha_media_stop` (requires `media_player`),
 `none`. Presence policies: `events` or `poll` (playback devices only).
 
+Active-mode standby verification retries remain bounded even if a device is
+silent or NACKs. With patched bridge firmware, exhaustion records
+`standby_target_absent` when all standby and power-status frames were NACKed and
+none ACKed (expected for devices that leave the bus in standby), otherwise
+`standby_unconfirmed`. Extra/late NACKs never override an observed ACK. Stock
+firmware reports only queue/transmit status, not target ACKs, so unconfirmed
+standby always records `standby_unconfirmed`. Only an observed
+Standby/Transition report confirms standby; a real role On event cancels
+verification. Config reload clears pending checks. Raw CEC sends accept 1–14
+data bytes, matching the bridge firmware limit.
+
 ```sh
 cargo run -- check-config --config choregos.toml
 cargo run -- run --config choregos.toml

@@ -715,6 +715,24 @@ async fn role_path_segments_cannot_escape_their_action() {
 }
 
 #[tokio::test]
+async fn unreachable_tv_reads_as_off_while_other_entities_keep_the_error_state() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.ha.tv.state = "unavailable".to_owned();
+    snapshot.ha.receiver.state = "unavailable".to_owned();
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/", Some(&cookie)).await).await;
+    let tv = between(&html, "media_player.test_tv", "</tr>");
+    let tv_pill = classes_around(tv, "off (unreachable)</span>");
+    assert!(tv_pill.contains(&"state-off"));
+    assert!(!tv_pill.contains(&"state-unavailable"));
+    let receiver = between(&html, "media_player.test_receiver", "</tr>");
+    assert!(!receiver.contains("off (unreachable)"));
+    assert!(classes_around(receiver, "unavailable</span>").contains(&"state-unavailable"));
+}
+
+#[tokio::test]
 async fn secure_cookie_follows_the_normalised_public_url_scheme() {
     for (public_url, secure) in [
         ("https://choregos.example.com/", true),
