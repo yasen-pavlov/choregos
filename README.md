@@ -52,8 +52,8 @@ testable model instead of a pile of automations.
 
 ```mermaid
 flowchart LR
-    bridge["Tasmota CEC bridge<br/>(claims the TV role)"] -- "tele/…/SENSOR<br/>stat/…/RESULT" --> mqtt[(MQTT)]
-    mqtt -- "cmnd/…/HdmiSend" --> bridge
+    bridge["Tasmota CEC bridge<br/>(claims the TV role)"] -- "frames, ACKs" --> mqtt[(MQTT)]
+    mqtt -- "sends" --> bridge
     mqtt <--> choregos["Choregos<br/>bus model · roles · decisions"]
     choregos <-- "websocket" --> ha["Home Assistant"]
     ha --> devices["Receiver · TV · Sonos · media players"]
