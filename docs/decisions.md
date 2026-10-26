@@ -2,6 +2,55 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — Leave Request Active Source replies to the active source
+
+- Never answer broadcast Request Active Source (`85`) from the fake TV, even
+  when the bus model knows an active source. Only the current active source
+  device may answer with Active Source (`82`) for its own physical address;
+  a TV claiming another device's address is not CEC-compliant.
+- A live activation flow showed a recording device broadcast `85`, followed by
+  a bridge reply `82 <stale PA>` and the recording device's `9D <PA>`. Later
+  controlled tests identified Power Off Function's broadcast Standby as the
+  cause of the receiver shutdown and recording-device dropout, rather than
+  this reply alone. Keep the reply removal independently for CEC compliance;
+  bridge firmware must likewise avoid replying on another source's behalf.
+- Keep directed `8F`/`9F`/`46`/`91` replies under `fake_tv.replies`. This
+  supersedes the earlier decision to retain a service-owned broadcast `85`
+  response. Startup/resync still sends `85` to solicit the real source's reply;
+  received `82` learning is unchanged.
+
+## 2026-10-26 — Pause before Standby for playback-resistant sources
+
+- Directed Standby (`36`) is ACKed but ignored by the streaming box while
+  playing; it works at the idle menu or after playback is paused. Repeated
+  back-to-back live tests with another source active showed that directed
+  deck-control Play: Still (`41 25`), Standby (`36`), then Give Device Power
+  Status (`8F`) stops it during playback without an activation side effect.
+  Expose this as `cec_pause_standby` without changing `cec_standby` for devices
+  that already honour Standby.
+- Reject the user-control Pause key (`44 46` followed by `45`): keys sent by
+  the TV make the box assert Active Source (`82`) before honouring Standby,
+  briefly stealing the input from the new source. Deck-control Play: Still
+  pauses without that side-effect frame.
+- Reject Power Off Function (`44 6C`): although it sleeps the box, when the box
+  is not the active source it broadcasts Standby to the bus. That shuts down
+  the receiver and makes the recording device announce Inactive Source
+  (`9D <PA>`), explaining the observed recording-device dropout. It is not a
+  safe takeover policy.
+- Play: Still followed by directed Standby instead produces Inactive Source
+  (`9D <PA>`) and Standby power reports (`90 01`), with no broadcast Standby
+  or stray Image View On. Do not suppress `04`/`0D` wakes during verification:
+  they keep normal bus learning and role-On cancellation, as does `82`.
+  Retain the existing `90 xx` role/buffered-signal suppression while learning
+  those replies for verification.
+- Remember the entire stop/query sequence for retries and ACK/NACK accounting:
+  two frames per round for `cec_standby`, three for `cec_pause_standby`.
+  An observed `9D` or `90 01` confirms standby even if the trailing `8F` NACKs
+  because the box is asleep. An ACKed `36` prevents absence classification;
+  without an observed power report the result remains unconfirmed.
+- Keep the independent Request Active Source (`85`) reply removal above:
+  only the actual active source should announce its own physical address.
+
 ## 2026-10-26 — Bound restored-identity identification traffic
 
 - Standby devices may ignore `83` while answering `46`. Re-querying all keys
@@ -260,8 +309,9 @@ Runtime review decisions:
   or HTTP wake otherwise; README and compose describe the alternatives.
 - m10: remove no-op PersistMode; Resync is payload-free with fixed query expansion;
   share Config using Arc; the retained bridge LWT initiates startup resync once.
-- `fake_tv.replies` defaults true. Firmware-owned directed replies can be disabled
-  without disabling the service's Active Source response to broadcast `85`.
+- `fake_tv.replies` defaults true. Firmware-owned directed replies can be
+  disabled. The former service-owned broadcast `85` response is superseded by
+  the 2026-10-26 Request Active Source decision above.
 - CLI operations move to tested runtime/cli.rs; main.rs remains parsing/dispatch
   and is explicitly excluded from Sonar coverage, not the runtime implementation.
 

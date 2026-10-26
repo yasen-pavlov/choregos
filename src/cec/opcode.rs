@@ -12,6 +12,7 @@ opcodes! {
     TEXT_VIEW_ON = 0x0D => "Text View On",
     SET_MENU_LANGUAGE = 0x32 => "Set Menu Language",
     STANDBY = 0x36 => "Standby",
+    PLAY = 0x41 => "Play",
     USER_CONTROL_PRESSED = 0x44 => "User Control Pressed",
     USER_CONTROL_RELEASED = 0x45 => "User Control Released",
     GIVE_OSD_NAME = 0x46 => "Give OSD Name",
@@ -37,3 +38,5 @@ opcodes! {
     REPORT_FEATURES = 0xA6 => "Report Features",
     REQUEST_CURRENT_LATENCY = 0xA7 => "Request Current Latency",
 }
+
+pub const PLAY_MODE_STILL: u8 = 0x25;

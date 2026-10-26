@@ -47,13 +47,13 @@ volume_from = ["streamer"]        # roles whose remote volume keys are forwarded
 [timing]
 off_delay_s = 3                   # last device off → TV/receiver off
 takeover_settle_ms = 2000         # receiver turn_on → select_source → preset
-standby_retries = 2              # re-send <Standby> to a taken-over device that has not reported standby after takeover_settle_ms
+standby_retries = 2              # re-send the CEC stop/query sequence if standby is unconfirmed after takeover_settle_ms
 presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
 
 [fake_tv]
-replies = true                  # false if bridge firmware owns directed TV replies; broadcast Active Source stays enabled
+replies = true                  # false if bridge firmware owns directed TV replies; never answers Request Active Source
 power_status = "always_on"        # reply <Report Power Status: On> to <Give Device Power Status>
 cec_version = "1.4"
 osd_name = "Choregos"
@@ -66,7 +66,7 @@ match = { vendor = "0010FA" }     # any listed key must match (osd > vendor > ph
 source = "Streamer"               # receiver source name for select_source
 on = ["image_view_on", "text_view_on", "active_source", "power_on"]
 off = ["standby", "inactive_source", "power_standby"]
-takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | none
+takeover = "cec_standby"          # cec_standby | cec_pause_standby | ha_media_stop | none; for sources that ignore <Standby> while playing: <Play>[Still] first
 presence = "events"               # events | poll  (poll: send <Give Device Power Status> every presence_poll_s while on)
 
 [[device]]

@@ -1,7 +1,7 @@
 use choregos::{
     action::{Action, IdentifyQueries},
     cec::Frame,
-    config::Config,
+    config::{Config, Takeover},
     engine::{Engine, Event},
     state::{BusPower, Command, Mode, RolePower},
 };
@@ -202,24 +202,33 @@ fn takeover_from_streamer() -> (Engine, Instant, Duration) {
 }
 
 fn takeover_from_streamer_in_mode(mode: Mode) -> (Engine, Instant, Duration) {
+    takeover_from_streamer_with_policy(mode, Takeover::CecStandby)
+}
+
+fn streamer_stop_actions(policy: Takeover) -> Vec<Action> {
+    let data = if policy == Takeover::CecPauseStandby {
+        vec![vec![0x41, 0x25], vec![0x36], vec![0x8f]]
+    } else {
+        vec![vec![0x36], vec![0x8f]]
+    };
+    data.into_iter()
+        .map(|data| Action::CecSend { to: 4, data })
+        .collect()
+}
+
+fn takeover_from_streamer_with_policy(mode: Mode, policy: Takeover) -> (Engine, Instant, Duration) {
     let (mut engine, now) = setup();
+    std::sync::Arc::make_mut(&mut engine.config).device[0].takeover = policy;
     engine.handle(Event::Command(Command::SetMode(mode)), now, wall());
     identify_atv(&mut engine, now);
     frame(&mut engine, now, 4, 0, "04");
     let takeover = now + Duration::from_secs(1);
     let actions = frame(&mut engine, takeover, 8, 15, "84230004");
-    assert!(actions.windows(2).any(|pair| {
-        pair == [
-            Action::CecSend {
-                to: 4,
-                data: vec![0x36],
-            },
-            Action::CecSend {
-                to: 4,
-                data: vec![0x8f],
-            },
-        ]
-    }));
+    let sent: Vec<_> = actions
+        .into_iter()
+        .filter(|action| matches!(action, Action::CecSend { .. }))
+        .collect();
+    assert_eq!(sent, streamer_stop_actions(policy));
     assert_eq!(engine.roles["streamer"].power, RolePower::Off);
     let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
     (engine, takeover, settle)
@@ -451,6 +460,199 @@ fn rewoken_role_cancels_takeover_standby_verification() {
         data: vec![0x36],
     }));
     assert_no_standby_decision(&engine, "streamer");
+}
+
+#[test]
+fn pause_standby_config_parses() {
+    let text = include_str!("../choregos.example.toml").replacen(
+        "takeover = \"cec_standby\"",
+        "takeover = \"cec_pause_standby\"",
+        1,
+    );
+    let config = Config::parse(&text).unwrap();
+    assert_eq!(config.device[0].takeover, Takeover::CecPauseStandby);
+}
+
+#[test]
+fn pause_standby_takeover_retries_the_entire_directed_sequence() {
+    let (mut engine, takeover, settle) =
+        takeover_from_streamer_with_policy(Mode::Active, Takeover::CecPauseStandby);
+    assert_eq!(engine.next_deadline(), Some(takeover + settle));
+    let actions = engine.handle(Event::Tick, takeover + settle, wall());
+    let sent: Vec<_> = actions
+        .into_iter()
+        .filter(|action| matches!(action, Action::CecSend { .. }))
+        .collect();
+    assert_eq!(sent, streamer_stop_actions(Takeover::CecPauseStandby));
+    let retry = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "standby_retry")
+        .unwrap();
+    assert_eq!(retry.role.as_deref(), Some("streamer"));
+    assert_eq!(retry.actions, sent);
+}
+
+#[test]
+fn pause_standby_observed_standby_confirms_despite_nacked_trailing_query() {
+    for report in ["9D2100", "9001"] {
+        let (mut engine, takeover, settle) =
+            takeover_from_streamer_with_policy(Mode::Active, Takeover::CecPauseStandby);
+        engine.handle(
+            Event::SendResult {
+                to: 4,
+                data: vec![0x36],
+                ack: true,
+            },
+            takeover + Duration::from_millis(10),
+            wall(),
+        );
+        frame(
+            &mut engine,
+            takeover + Duration::from_millis(20),
+            4,
+            0,
+            report,
+        );
+        engine.handle(
+            Event::SendResult {
+                to: 4,
+                data: vec![0x8f],
+                ack: false,
+            },
+            takeover + Duration::from_millis(30),
+            wall(),
+        );
+        assert_eq!(engine.bus.entries[&4].power, BusPower::Standby);
+        for interval in 1..=4 {
+            let actions = engine.handle(Event::Tick, takeover + settle * interval, wall());
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::CecSend { to: 4, .. }))
+            );
+            assert_no_standby_decision(&engine, "streamer");
+            assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+            assert_eq!(engine.roles["console_a"].power, RolePower::On);
+            assert_eq!(engine.active_role.as_deref(), Some("console_a"));
+        }
+    }
+}
+
+#[test]
+fn pause_standby_rewake_signals_cancel_verification() {
+    for (to, data) in [(0, "04"), (0, "0D"), (15, "822100")] {
+        let (mut engine, takeover, settle) =
+            takeover_from_streamer_with_policy(Mode::Active, Takeover::CecPauseStandby);
+        frame(
+            &mut engine,
+            takeover + Duration::from_millis(100),
+            4,
+            to,
+            data,
+        );
+        assert_eq!(engine.bus.entries[&4].power, BusPower::On);
+        assert_eq!(engine.roles["streamer"].power, RolePower::On);
+        assert_eq!(engine.active_role.as_deref(), Some("streamer"));
+        for interval in 1..=4 {
+            let actions = engine.handle(Event::Tick, takeover + settle * interval, wall());
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::CecSend { to: 4, .. }))
+            );
+            assert_no_standby_decision(&engine, "streamer");
+        }
+    }
+}
+
+#[test]
+fn pause_standby_nack_accounting_counts_all_three_frames_per_round() {
+    for missing in [None, Some(0x41), Some(0x36), Some(0x8f)] {
+        let (mut engine, takeover, settle) =
+            takeover_from_streamer_with_policy(Mode::Active, Takeover::CecPauseStandby);
+        for round in 0..=engine.config.timing.standby_retries {
+            let sent_at = takeover + settle * u32::from(round) + Duration::from_millis(1);
+            for action in streamer_stop_actions(Takeover::CecPauseStandby) {
+                let Action::CecSend { to, data } = action else {
+                    unreachable!()
+                };
+                if Some(data[0]) != missing {
+                    engine.handle(
+                        Event::SendResult {
+                            to,
+                            data,
+                            ack: false,
+                        },
+                        sent_at,
+                        wall(),
+                    );
+                    assert_no_standby_decision(&engine, "streamer");
+                }
+            }
+            engine.handle(
+                Event::Tick,
+                takeover + settle * (u32::from(round) + 1),
+                wall(),
+            );
+        }
+        let reason = if missing.is_none() {
+            "standby_target_absent"
+        } else {
+            "standby_unconfirmed"
+        };
+        assert!(engine.decisions.iter().any(|decision| {
+            decision.role.as_deref() == Some("streamer") && decision.reason == reason
+        }));
+    }
+}
+
+#[test]
+fn pause_standby_acked_standby_without_power_report_remains_unconfirmed() {
+    let (mut engine, takeover, settle) =
+        takeover_from_streamer_with_policy(Mode::Active, Takeover::CecPauseStandby);
+    for round in 0..=engine.config.timing.standby_retries {
+        let sent_at = takeover + settle * u32::from(round) + Duration::from_millis(1);
+        for action in streamer_stop_actions(Takeover::CecPauseStandby) {
+            let Action::CecSend { to, data } = action else {
+                unreachable!()
+            };
+            engine.handle(
+                Event::SendResult {
+                    to,
+                    ack: data == [0x36],
+                    data,
+                },
+                sent_at,
+                wall(),
+            );
+        }
+        // Even an extra late query NACK cannot override the Standby ACK.
+        engine.handle(
+            Event::SendResult {
+                to: 4,
+                data: vec![0x8f],
+                ack: false,
+            },
+            sent_at,
+            wall(),
+        );
+        engine.handle(
+            Event::Tick,
+            takeover + settle * (u32::from(round) + 1),
+            wall(),
+        );
+    }
+    assert_eq!(engine.bus.entries[&4].power, BusPower::On);
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
+    }));
+    assert!(
+        !engine
+            .decisions
+            .iter()
+            .any(|decision| { decision.reason == "standby_target_absent" })
+    );
 }
 
 #[test]
@@ -1089,13 +1291,26 @@ fn fake_tv_never_answers_unregistered_senders_and_can_delegate_directed_replies(
     for query in ["8F", "9F", "46", "91"] {
         assert!(frame(&mut engine, now, 4, 0, query).is_empty());
     }
+}
+
+#[test]
+fn fake_tv_never_answers_request_active_source_even_with_known_source() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
     frame(&mut engine, now, 4, 15, "822100");
-    assert!(
-        frame(&mut engine, now, 4, 15, "85").contains(&Action::CecSend {
-            to: 15,
-            data: vec![0x82, 0x21, 0]
-        })
-    );
+    assert_eq!(engine.bus.active_source, Some(0x2100));
+    for replies in [true, false] {
+        std::sync::Arc::make_mut(&mut engine.config).fake_tv.replies = replies;
+        let actions = frame(&mut engine, now, 1, 15, "85");
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::CecSend { .. }))
+        );
+        assert_eq!(engine.bus.active_source, Some(0x2100));
+        assert_eq!(engine.roles["streamer"].power, RolePower::On);
+        assert_eq!(engine.active_role.as_deref(), Some("streamer"));
+    }
 }
 
 #[test]

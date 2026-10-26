@@ -389,7 +389,7 @@ mod tests {
             bus.handle(
                 &f("04"),
                 now + Duration::from_secs(9),
-                chrono::DateTime::UNIX_EPOCH
+                chrono::DateTime::UNIX_EPOCH,
             )
             .is_empty()
         );
@@ -397,7 +397,7 @@ mod tests {
             bus.handle(
                 &f("04"),
                 now + Duration::from_secs(10),
-                chrono::DateTime::UNIX_EPOCH
+                chrono::DateTime::UNIX_EPOCH,
             )
             .len(),
             1

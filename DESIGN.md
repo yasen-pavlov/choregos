@@ -157,7 +157,7 @@ match = { vendor = "0010FA" }     # any listed key must match (osd > vendor > ph
 source = "Streamer"               # receiver source name for select_source
 on = ["image_view_on", "text_view_on", "active_source", "power_on"]
 off = ["standby", "inactive_source", "power_standby"]
-takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | none
+takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | cec_pause_standby | ha_media_stop | none
 presence = "events"               # events | poll  (poll: send <Give Device Power Status> every presence_poll_s while on)
 
 [[device]]
@@ -253,11 +253,14 @@ duplicates (same state) are ignored (replaces today's `rbe` nodes).
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
 1. `WakeTv` if `tv.entity` state is not `on` (HA state cache; if unknown, send anyway).
-2. For every other role currently On: `takeover` action — `cec_standby` → `CecSend{to: la, data: "36"}` followed by `CecSend{to: la, data: "8F"}`; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `none`.
+2. For every other role currently On: `takeover` action — `cec_standby` → directed `CecSend{to: la, data: "36"}` followed by `"8F"`; `cec_pause_standby` → directed `"41 25"` (Play: Still), `"36"` (Standby), then `"8F"` (Give Device Power Status), for sources that ignore Standby while playing: pause through deck control first; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `none`.
 3. If Sonos state is `playing`: `HaCall{media_player.media_stop, sonos.entity}`.
 4. `HaCall{media_player.turn_on, receiver}` if receiver not `on`; then after `takeover_settle_ms`: `HaCall{media_player.select_source, receiver, {source}}` if `select_source` and current receiver source ≠ `source`; then `HaCall{script.turn_on, preset_for(now)}` — the preset only runs when the receiver transitioned off→on in this takeover or the active role changed.
 Takeovers are idempotent: a repeated On for the same role with no state change does nothing.
-In active mode, CEC standby actions (including all-off and manual standby) are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA; `8F` replies during verification update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry Standby followed by Give Device Power Status up to `standby_retries` times; silence or NACK is not confirmation and does not shorten retries. Each pending verification counts outgoing `36`/`8F` frames to its LA (`sent`), correlated NACKs (`nacked`), and whether any ACK was observed (`acked`). On exhaustion, record `standby_target_absent` if `sent > 0 && !acked && nacked >= sent` (expected for devices that leave the bus in standby), otherwise `standby_unconfirmed` (ACKed frames or missing results without a confirming power report). Extra/late NACKs cannot override an observed ACK. ACK-based classification requires patched bridge firmware; stock firmware without ACK information can only produce `standby_unconfirmed`. Send results for other LAs or opcodes do not affect verification. A real role On event or blocked/remapped identity cancels verification; bridge-offline or a config reload clears pending verifications. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
+
+`cec_pause_standby` uses deck-control Play: Still rather than the user-control Pause key: keys sent by the TV can make the displaced source assert Active Source and briefly steal the input. Play: Still pauses without that activation side effect, allowing directed Standby to be honoured during playback.
+
+In active mode, both CEC stop policies (including all-off and manual standby) are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA. During pending verification, `90 xx` replies update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry the complete original stop/query sequence up to `standby_retries` times: `36`, `8F` for `cec_standby`, or `41 25`, `36`, `8F` for `cec_pause_standby`. Silence or NACK is not confirmation and does not shorten retries. Each pending verification remembers its sequence and counts every outgoing frame in it to its LA (`sent`: two or three per round), correlated NACKs (`nacked`), and whether any ACK was observed (`acked`). Observed Standby/Transition confirms the stop even when the trailing `8F` NACKs because the device is already asleep; an ACKed `36` also prevents absence classification if no power report arrives. On exhaustion without confirmation, record `standby_target_absent` if `sent > 0 && !acked && nacked >= sent` (expected for devices that leave the bus in standby), otherwise `standby_unconfirmed` (ACKed frames or missing results without a confirming power report). Extra/late NACKs cannot override an observed ACK. ACK-based classification requires patched bridge firmware; stock firmware without ACK information can only produce `standby_unconfirmed`. Send results for other LAs or frame data outside the remembered sequence do not affect verification. A real role On event (including configured `04`, `0D`, or `82`) or blocked/remapped identity cancels verification; bridge-offline or a config reload clears pending verifications. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
 
 ### 5.5 Release (role turns Off)
 Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_player.turn_off, tv}` and `HaCall{media_player.turn_off, receiver}`. If a role turned On meanwhile the timer is cancelled.
@@ -301,11 +304,10 @@ Replay never opens the state file.
 While the role is On: every `presence_poll_s` send `8F` to its LA. A `90 xx` reply (or any frame from that LA) resets the miss counter; `presence_misses` consecutive polls without any frame from the LA → role Off (with decision reason `presence_timeout`) and bus entry power Unknown, retaining its learned identity. Silence is not an observed standby report. Polling stops when Off.
 
 ### 5.8 Fake TV replies (frames addressed to the bridge LA)
-`fake_tv.replies` defaults to `true`. Set it to `false` when bridge firmware handles directed `8F`/`9F`/`46`/`91` requests itself; the service still handles broadcast `85` replies. Never reply to unregistered senders (LA 15).
+`fake_tv.replies` defaults to `true`. Set it to `false` when bridge firmware handles directed `8F`/`9F`/`46`/`91` requests itself. The service never answers `85` Request Active Source: only the current active source device may announce its own physical address, and a TV must not claim another device's address on its behalf. Such a reply can suppress the real source's announcement and provoke an Inactive Source release. Never reply to unregistered senders (LA 15).
 - `8F` → `90 00` (when `power_status = "always_on"`).
 - `9F` → `9E 05` (1.4).
 - `46` → `47 <osd_name>`.
-- `85` (bcast) → `82 <active_source>` if known.
 - `91` → `32 "eng"`.
 Everything else: no reply (Feature Abort is a firmware concern).
 

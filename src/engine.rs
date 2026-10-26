@@ -5,8 +5,8 @@ use crate::{
         frame::Frame,
         opcode::{
             ACTIVE_SOURCE, CEC_VERSION, DEVICE_VENDOR_ID, GET_CEC_VERSION, GET_MENU_LANGUAGE,
-            GIVE_DEVICE_POWER_STATUS, GIVE_OSD_NAME, IMAGE_VIEW_ON, INACTIVE_SOURCE,
-            REPORT_PHYSICAL_ADDRESS, REPORT_POWER_STATUS, REQUEST_ACTIVE_SOURCE, SET_MENU_LANGUAGE,
+            GIVE_DEVICE_POWER_STATUS, GIVE_OSD_NAME, IMAGE_VIEW_ON, INACTIVE_SOURCE, PLAY,
+            PLAY_MODE_STILL, REPORT_PHYSICAL_ADDRESS, REPORT_POWER_STATUS, SET_MENU_LANGUAGE,
             SET_OSD_NAME, STANDBY, TEXT_VIEW_ON, USER_CONTROL_PRESSED,
         },
     },
@@ -71,11 +71,24 @@ pub struct HaState {
 struct StandbyVerification {
     la: u8,
     role: String,
+    frames: &'static [&'static [u8]],
     deadline: Instant,
     attempts: u8,
     sent: u8,
     acked: bool,
     nacked: u8,
+}
+
+impl StandbyVerification {
+    fn actions(&self) -> Vec<Action> {
+        self.frames
+            .iter()
+            .map(|data| Action::CecSend {
+                to: self.la,
+                data: data.to_vec(),
+            })
+            .collect()
+    }
 }
 
 pub struct Engine {
@@ -174,36 +187,34 @@ impl Engine {
             Event::Command(command) => Some(Self::command_reason(command)),
             _ => None,
         };
-        let mut actions = match event {
-            Event::BridgeOnline => self.handle_bridge_online(now),
-            Event::BridgeOffline => self.handle_bridge_offline(),
-            Event::HaState {
-                entity,
-                state,
-                attrs,
-                changed,
-            } => self.handle_ha_state(entity, state, attrs, changed, wall),
-            Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
-            Event::Frame(frame) => self.handle_frame(frame, now, wall),
-            Event::SendResult { to, data, ack } => {
-                if matches!(data.first(), Some(&STANDBY | &GIVE_DEVICE_POWER_STATUS))
-                    && let Some(pending) = self
-                        .standby_verifications
-                        .iter_mut()
-                        .find(|pending| pending.la == to)
-                {
-                    if ack {
-                        pending.acked = true;
-                    } else {
-                        pending.nacked = pending.nacked.saturating_add(1);
+        let mut actions =
+            match event {
+                Event::BridgeOnline => self.handle_bridge_online(now),
+                Event::BridgeOffline => self.handle_bridge_offline(),
+                Event::HaState {
+                    entity,
+                    state,
+                    attrs,
+                    changed,
+                } => self.handle_ha_state(entity, state, attrs, changed, wall),
+                Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
+                Event::Frame(frame) => self.handle_frame(frame, now, wall),
+                Event::SendResult { to, data, ack } => {
+                    if let Some(pending) = self.standby_verifications.iter_mut().find(|pending| {
+                        pending.la == to && pending.frames.contains(&data.as_slice())
+                    }) {
+                        if ack {
+                            pending.acked = true;
+                        } else {
+                            pending.nacked = pending.nacked.saturating_add(1);
+                        }
                     }
+                    vec![]
                 }
-                vec![]
-            }
-            Event::Command(command) => self.handle_command(command, now),
-            Event::Tick if self.bridge_online => self.bus.retry_identification(now),
-            Event::Tick => vec![],
-        };
+                Event::Command(command) => self.handle_command(command, now),
+                Event::Tick if self.bridge_online => self.bus.retry_identification(now),
+                Event::Tick => vec![],
+            };
         if was_warming && !self.warming {
             self.finish_warming(now, &mut actions);
         }
@@ -216,11 +227,10 @@ impl Engine {
         actions.extend(self.timers(now, wall));
         for action in &actions {
             if let Action::CecSend { to, data } = action
-                && matches!(data.first(), Some(&STANDBY | &GIVE_DEVICE_POWER_STATUS))
                 && let Some(pending) = self
                     .standby_verifications
                     .iter_mut()
-                    .find(|pending| pending.la == *to)
+                    .find(|pending| pending.la == *to && pending.frames.contains(&data.as_slice()))
             {
                 pending.sent = pending.sent.saturating_add(1);
             }
@@ -716,34 +726,35 @@ impl Engine {
             return vec![];
         };
         match device.takeover {
-            Takeover::CecStandby => {
+            Takeover::CecStandby | Takeover::CecPauseStandby => {
                 let Some(&la) = self.identity.roles.get(role) else {
                     return vec![];
                 };
                 self.standby_verifications
                     .retain(|pending| pending.la != la);
+                let pending = StandbyVerification {
+                    la,
+                    role: role.into(),
+                    frames: if device.takeover == Takeover::CecPauseStandby {
+                        &[
+                            &[PLAY, PLAY_MODE_STILL],
+                            &[STANDBY],
+                            &[GIVE_DEVICE_POWER_STATUS],
+                        ]
+                    } else {
+                        &[&[STANDBY], &[GIVE_DEVICE_POWER_STATUS]]
+                    },
+                    deadline: now + Duration::from_millis(self.config.timing.takeover_settle_ms),
+                    attempts: 0,
+                    sent: 0,
+                    acked: false,
+                    nacked: 0,
+                };
+                let actions = pending.actions();
                 if self.config.mode == Mode::Active {
-                    self.standby_verifications.push(StandbyVerification {
-                        la,
-                        role: role.into(),
-                        deadline: now
-                            + Duration::from_millis(self.config.timing.takeover_settle_ms),
-                        attempts: 0,
-                        sent: 0,
-                        acked: false,
-                        nacked: 0,
-                    });
+                    self.standby_verifications.push(pending);
                 }
-                vec![
-                    Action::CecSend {
-                        to: la,
-                        data: vec![STANDBY],
-                    },
-                    Action::CecSend {
-                        to: la,
-                        data: vec![GIVE_DEVICE_POWER_STATUS],
-                    },
-                ]
+                actions
             }
             Takeover::HaMediaStop => device
                 .media_player
@@ -784,16 +795,7 @@ impl Engine {
             if cancelled || confirmed {
                 self.standby_verifications.swap_remove(index);
             } else if pending.attempts < self.config.timing.standby_retries {
-                let retry = vec![
-                    Action::CecSend {
-                        to: pending.la,
-                        data: vec![STANDBY],
-                    },
-                    Action::CecSend {
-                        to: pending.la,
-                        data: vec![GIVE_DEVICE_POWER_STATUS],
-                    },
-                ];
+                let retry = pending.actions();
                 let role = pending.role.clone();
                 let pending = &mut self.standby_verifications[index];
                 pending.attempts += 1;
@@ -957,15 +959,6 @@ impl Engine {
             return vec![Action::CecSend {
                 to: frame.from,
                 data,
-            }];
-        }
-        if frame.to == 15
-            && frame.opcode == Some(REQUEST_ACTIVE_SOURCE)
-            && let Some(pa) = self.bus.active_source
-        {
-            return vec![Action::CecSend {
-                to: 15,
-                data: vec![ACTIVE_SOURCE, (pa >> 8) as u8, pa as u8],
             }];
         }
         vec![]
