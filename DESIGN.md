@@ -229,9 +229,9 @@ Learning rules (all from received frames; sender = `From`):
 - `90 SS` Report Power Status → sender power per SS (00 On, 01 Standby, 02 →On, 03 →Standby).
 - `04` Image View On / `0D` Text View On (to TV) → sender power = On.
 - An entry is `identified` only when verified, physical address is known and every `osd`/`vendor` key used by any configured device match rule is known. Recompute the required key set on config reload. Query only missing required keys (`83` PA, `8C` vendor, `46` OSD). Unverified restored entries additionally need PA verification: when all keys are cached, request **only `83` on every automatic attempt**, including the first; never solicit `87`/`47` solely for re-confirmation. Missing vendor/OSD keys are still requested. Manual identify requests all three and updates its last-query instant when sent; the bridge and LA 15 are never queried.
-- Retry on ticks only while the bridge is online. The interval is `identify_retry_s * 2^attempts`, capped at one hour, starting at the base interval after the first query. Each unanswered retry increases attempts. Reset attempts only on a newly learned key, verification, identity replacement, or bridge-online/resync, not arbitrary traffic or unchanged identity replies. With a 10 s base, intervals are 10, 20, 40, …, 2560, 3600 s: the interval reaches about ten minutes after about ten minutes, and the one-hour cap after about 85 minutes of cumulative silence. Resync also clears each last-query instant.
+- Retry on ticks only while the bridge is online. The interval is `identify_retry_s * 2^attempts`, capped at one hour, starting at the base interval after the first query. Each unanswered retry increases attempts. Reset attempts only on a genuinely new key, restored-identity verification, or bridge-online/resync, not arbitrary traffic or unchanged identity replies. Replacements retain the LA's last-query instant and attempts; re-confirming a PA retained after a vendor/OSD replacement does not reset them. With a 10 s base, intervals are 10, 20, 40, …, 2560, 3600 s: the interval reaches about ten minutes after about ten minutes, and the one-hour cap after about 85 minutes of cumulative silence. Resync clears last-query instants for verified entries and records its immediate `83` query for unverified entries, whose next retry is after the base interval.
 - Except for the existing one-off resync burst (§5.6), emit at most one `Action::Identify` (one LA) per handled event, with a shared one-second minimum between sends. Other due LAs (including queued manual identify requests) wait for that slot; `next_deadline` includes this deadline bump, preventing a zero-delay tick loop. Choose the earliest due entry, then LA order for ties. Resync reserves the next second too: coincident retries wait for a later tick.
-- A fully keyed restored identity may also verify opportunistically after both its stored vendor and OSD have been re-confirmed since restore, in either order: accept `87` to the bridge or broadcast (the normal vendor reply), and `47` directed to the bridge. A single unchanged reply does not reset attempts. This alternative never updates `confirmed_at`; only `84` does. It is unavailable after replacement or if the restored PA/vendor/OSD was missing.
+- A fully keyed restored identity may also verify opportunistically after both its stored vendor and OSD have been re-confirmed since restore, in either order. Accept matching `87` and `47` from that LA regardless of destination: devices may address these replies to the receiver rather than the bridge. A single unchanged reply does not reset attempts. This alternative never updates `confirmed_at`; only `84` does. It is unavailable after replacement or if the restored PA/vendor/OSD was missing.
 - A differing PA in `84` or broadcast `82` replaces the LA entry and clears its buffered signals. A differing known vendor/OSD clears the other non-PA keys and signals, retains PA only as unverified, and requires fresh `84` confirmation before role matching.
 - Entries age out of `power = On` only via explicit events or presence polling; never by time alone.
 
@@ -264,7 +264,7 @@ Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_pl
 
 ### 5.6 Startup / resync
 On start and on bridge LWT `Online`: send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
-Resync additionally sends `83` immediately to each unverified restored LA.
+Resync additionally sends `83` immediately to each unverified restored LA. This counts as its first query; without identification progress, the next `83` waits `identify_retry_s`, not merely the one-second send slot.
 
 #### Persisted state
 
@@ -281,7 +281,7 @@ entries have Unknown power, no last-seen time, and verified = false; their
 restore instant anchors the first retry deadline. Duplicate restored physical
 addresses keep the earlier LA. A matching received `84` verifies cached keys
 and enables role matching; a differing PA replaces the cached identity.
-Opportunistic matching vendor plus directed OSD traffic may also verify a
+Opportunistic matching vendor plus OSD traffic may also verify a
 fully keyed restored identity (§5.1), without refreshing its persisted
 `confirmed_at` or extending the 30-day lifetime.
 The devices page labels unverified entries `restored` rather than inventing a

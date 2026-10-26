@@ -135,13 +135,19 @@ impl BusModel {
             .min(Duration::from_secs(3600))
     }
 
-    pub fn reset_identification(&mut self, now: Instant) {
-        for entry in self.entries.values_mut() {
-            entry.last_identify = None;
+    pub fn reset_identification(&mut self, now: Instant) -> Vec<u8> {
+        let mut unverified = Vec::new();
+        for (&la, entry) in &mut self.entries {
+            let query_physical = !entry.verified && la < 15 && la != self.bridge;
+            entry.last_identify = query_physical.then_some(now);
             entry.attempts = 0;
             entry.identify_since = now;
+            if query_physical {
+                unverified.push(la);
+            }
         }
         self.defer_identification(now);
+        unverified
     }
 
     fn defer_identification(&mut self, now: Instant) {
@@ -259,21 +265,32 @@ impl BusModel {
             }
             let physical = entry.physical;
             let key_changed = matches!(frame.opcode, Some(DEVICE_VENDOR_ID | SET_OSD_NAME));
+            let last_identify = entry.last_identify;
+            let attempts = entry.attempts;
             *entry = BusEntry::new(now);
+            entry.last_identify = last_identify;
+            entry.attempts = attempts;
             if key_changed {
                 entry.physical = physical;
                 entry.verified = false;
             }
         }
         entry.last_seen = Some(now);
-        let learned_key = match frame.opcode {
-            Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
-                entry.physical.is_none() || !entry.verified
-            }
-            Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => entry.vendor.is_none(),
-            Some(SET_OSD_NAME) if !frame.params.is_empty() => entry.osd.is_none(),
-            _ => false,
-        };
+        let learned_key = !replaces
+            && match frame.opcode {
+                Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
+                    entry.physical.is_none()
+                }
+                Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => entry.vendor.is_none(),
+                Some(SET_OSD_NAME) if !frame.params.is_empty() => entry.osd.is_none(),
+                _ => false,
+            };
+        // Restores retain confirmed_at; a PA retained after replacement does not.
+        let restored_pa_confirmed = !replaces
+            && !entry.verified
+            && entry.confirmed_at.is_some()
+            && frame.opcode == Some(REPORT_PHYSICAL_ADDRESS)
+            && frame.params.len() >= 3;
         match frame.opcode {
             Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
                 entry.physical = frame.physical();
@@ -282,20 +299,14 @@ impl BusModel {
                 entry.confirmed_at = Some(wall);
             }
             Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => {
-                if entry.restore_reconfirmation
-                    && entry.vendor == Some(Self::vendor(frame))
-                    && (frame.to == self.bridge || frame.to == 15)
-                {
+                if entry.restore_reconfirmation && entry.vendor == Some(Self::vendor(frame)) {
                     entry.vendor_reconfirmed = true;
                 }
                 entry.vendor = Some(Self::vendor(frame));
             }
             Some(SET_OSD_NAME) if !frame.params.is_empty() => {
                 let osd = decode_osd(&frame.params);
-                if entry.restore_reconfirmation
-                    && entry.osd.as_ref() == Some(&osd)
-                    && frame.to == self.bridge
-                {
+                if entry.restore_reconfirmation && entry.osd.as_ref() == Some(&osd) {
                     entry.osd_reconfirmed = true;
                 }
                 entry.osd = Some(osd);
@@ -341,7 +352,7 @@ impl BusModel {
         if entry.verified {
             entry.restore_reconfirmation = false;
         }
-        if learned_key || reconfirmed {
+        if learned_key || restored_pa_confirmed || reconfirmed {
             entry.attempts = 0;
         }
         entry.identified = Self::missing(self.required, entry).is_empty();

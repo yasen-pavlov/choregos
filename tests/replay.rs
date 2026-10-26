@@ -1522,11 +1522,7 @@ fn restored_osd_replies_do_not_restart_backoff_or_request_known_keys() {
             .contains(&pa_only)
     );
     assert!(engine.handle(Event::Tick, now, wall()).is_empty());
-    let mut due = now + Duration::from_secs(1);
-    assert_eq!(
-        engine.handle(Event::Tick, due, wall()).as_slice(),
-        std::slice::from_ref(&pa_only)
-    );
+    let mut due = now;
     for delay in [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600, 3600] {
         assert!(
             frame(
@@ -1554,11 +1550,12 @@ fn restored_osd_replies_do_not_restart_backoff_or_request_known_keys() {
 }
 
 #[test]
-fn matching_restored_vendor_and_directed_osd_verify_in_either_order_without_new_confirmation_time()
-{
+fn matching_restored_vendor_and_osd_verify_in_either_order_without_new_confirmation_time() {
     for replies in [
         [(15, "870010FA"), (0, "4753747265616D6572")],
         [(0, "4753747265616D6572"), (0, "870010FA")],
+        [(5, "870010FA"), (5, "4753747265616D6572")],
+        [(5, "4753747265616D6572"), (5, "870010FA")],
     ] {
         let now = Instant::now();
         let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
@@ -1592,21 +1589,6 @@ fn matching_restored_vendor_and_directed_osd_verify_in_either_order_without_new_
             );
         }
     }
-}
-
-#[test]
-fn restored_reconfirmation_ignores_identity_replies_addressed_elsewhere() {
-    let now = Instant::now();
-    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
-    engine.handle(Event::BridgeOnline, now, wall());
-    frame(&mut engine, now, 4, 5, "870010FA");
-    frame(&mut engine, now, 4, 5, "4753747265616D6572");
-    assert!(!engine.bus.entries[&4].verified);
-    frame(&mut engine, now, 4, 15, "870010FA");
-    assert!(!engine.bus.entries[&4].verified);
-    frame(&mut engine, now, 4, 0, "4753747265616D6572");
-    assert!(engine.bus.entries[&4].verified);
 }
 
 #[test]
@@ -1737,7 +1719,13 @@ fn four_restored_addresses_due_together_wait_for_separate_ticks_after_resync() {
     let mut engine = Engine::new(config, now, identities);
     engine.handle(Event::BridgeOnline, now, wall());
     assert!(engine.handle(Event::Tick, now, wall()).is_empty());
-    for (seconds, la) in [(1, 1), (2, 4), (3, 8), (4, 11)] {
+    assert!(
+        engine
+            .handle(Event::Tick, now + Duration::from_secs(1), wall())
+            .is_empty()
+    );
+    engine.handle(Event::Tick, now + Duration::from_secs(3), wall());
+    for (seconds, la) in [(10, 1), (11, 4), (12, 8), (13, 11)] {
         let due = now + Duration::from_secs(seconds);
         assert_eq!(engine.next_deadline(), Some(due));
         assert!(
@@ -1768,7 +1756,7 @@ fn incomplete_restore_queries_only_missing_required_keys_and_still_needs_physica
     let mut engine = Engine::new(config, now, vec![identity]);
     engine.handle(Event::BridgeOnline, now, wall());
     assert_eq!(
-        engine.handle(Event::Tick, now + Duration::from_secs(1), wall()),
+        engine.handle(Event::Tick, now + Duration::from_secs(10), wall()),
         [Action::Identify {
             la: 4,
             queries: IdentifyQueries {
@@ -1778,14 +1766,14 @@ fn incomplete_restore_queries_only_missing_required_keys_and_still_needs_physica
             },
         }]
     );
-    for seconds in [2, 3] {
+    for seconds in [11, 12] {
         let time = now + Duration::from_secs(seconds);
         frame(&mut engine, time, 4, 0, "4753747265616D6572");
         frame(&mut engine, time, 4, 15, "870010FA");
     }
     assert!(!engine.bus.entries[&4].verified);
     assert_eq!(
-        engine.handle(Event::Tick, now + Duration::from_secs(11), wall()),
+        engine.handle(Event::Tick, now + Duration::from_secs(20), wall()),
         [Action::Identify {
             la: 4,
             queries: IdentifyQueries {
@@ -1794,4 +1782,45 @@ fn incomplete_restore_queries_only_missing_required_keys_and_still_needs_physica
             },
         }]
     );
+}
+
+#[test]
+fn flapping_identity_keys_preserve_exponential_backoff_even_with_physical_reconfirmation() {
+    for (first, second) in [
+        ("474E616D652041", "474E616D652042"),
+        ("870010FA", "87080046"),
+        ("84210004", "84220004"),
+    ] {
+        for reconfirm_physical in [false, true] {
+            let (mut engine, now) = setup();
+            let now = now + Duration::from_secs(3);
+            frame(&mut engine, now, 4, 15, "84210004");
+            frame(&mut engine, now, 4, 0, first);
+            let mut query_times = Vec::new();
+            for seconds in 1..=150 {
+                let time = now + Duration::from_secs(seconds);
+                let data = if seconds % 2 == 0 { first } else { second };
+                let mut actions = frame(&mut engine, time, 4, 0, data);
+                if reconfirm_physical {
+                    let physical = engine.bus.entries[&4].physical.unwrap();
+                    actions.extend(frame(
+                        &mut engine,
+                        time,
+                        4,
+                        15,
+                        &format!("84{physical:04X}04"),
+                    ));
+                }
+                if !actions.is_empty() {
+                    assert!(matches!(
+                        actions.as_slice(),
+                        [Action::Identify { la: 4, .. }]
+                    ));
+                    query_times.push(seconds);
+                }
+            }
+            assert_eq!(query_times, [10, 30, 70, 150]);
+            assert_eq!(engine.next_deadline(), Some(now + Duration::from_secs(310)));
+        }
+    }
 }

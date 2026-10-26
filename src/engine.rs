@@ -565,22 +565,20 @@ impl Engine {
     fn resync(&mut self, now: Instant) -> Vec<Action> {
         self.warming = true;
         self.warm_until = now + Duration::from_secs(3);
-        self.bus.reset_identification(now);
+        let unverified = self.bus.reset_identification(now);
         for role in self.roles.values_mut() {
             role.awaiting = false;
             role.misses = 0;
         }
         let mut actions = vec![Action::Resync];
-        for (&la, entry) in &self.bus.entries {
-            if !entry.verified && la < 15 && la != self.bus.bridge {
-                actions.push(Action::Identify {
-                    la,
-                    queries: IdentifyQueries {
-                        physical: true,
-                        ..IdentifyQueries::default()
-                    },
-                });
-            }
+        for la in unverified {
+            actions.push(Action::Identify {
+                la,
+                queries: IdentifyQueries {
+                    physical: true,
+                    ..IdentifyQueries::default()
+                },
+            });
         }
         actions
     }

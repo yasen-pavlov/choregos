@@ -10,15 +10,18 @@ Deviations from DESIGN.md agreed in review. Newest first.
   keyed unverified restore requests only `83`, including its first automatic
   attempt. Do not add a first-attempt `8C`/`46` burst.
 - Permit opportunistic verification of a fully keyed restored identity once
-  both its cached vendor and OSD are re-confirmed, in either order. Vendor
-  `87` may target the bridge or broadcast (CEC's usual vendor response); OSD
-  `47` must target the bridge. This accepts the available standby/wake evidence
-  without soliciting more traffic. Differing values retain the replacement
+  both its cached vendor and OSD are re-confirmed, in either order. Accept
+  `87` and `47` from the restored LA regardless of destination: devices may
+  address these replies to the receiver rather than the bridge. This accepts
+  standby/wake evidence without soliciting traffic. Differing values retain the replacement
   path, clear re-confirmation evidence, and still require a fresh `84`.
   Identities missing a cached PA/vendor/OSD cannot use this shortcut.
-- Reset attempts only for identification progress (new key, verification or
-  replacement) and resync/bridge-online, never arbitrary frames or repeated
-  unchanged keys. A single matching OSD/vendor reply is not progress.
+- Reset attempts only for identification progress (a genuinely new key or
+  restored-identity verification) and resync/bridge-online, never arbitrary frames
+  or repeated unchanged keys. A single matching OSD/vendor reply is not progress.
+  Replacements retain the LA's last-query instant and attempts, including across
+  a fresh `84` re-confirming a PA retained after a vendor/OSD change; otherwise
+  alternating identity values could sustain one identification burst per second.
   Preserve the 10, 20, 40, … second sequence and one-hour cap: after about
   ten minutes the retry interval is about ten minutes, not one hour; the cap
   is reached after about 85 minutes of cumulative silence.
@@ -31,8 +34,10 @@ Deviations from DESIGN.md agreed in review. Newest first.
   Record acceptance of queued identify commands immediately (with no sent
   actions yet), preserving the command log/persistence contract while they wait.
 - Retain the existing one-off resync burst, but reserve its following second
-  before allowing retries. This bounds sustained identification load without
-  changing startup interrogation or introducing executor-side timing/I/O.
+  before allowing retries. Count each unverified entry's resync `83` as its first
+  query, so its next PA retry waits the full base interval rather than one second.
+  This bounds identification load without changing startup interrogation or
+  introducing executor-side timing/I/O.
 - Re-confirmation flags are transient. Do not change persisted state format,
   `confirmed_at`, or its lifetime: only received `84` refreshes confirmation.
   Same-model swaps with identical vendor/OSD remain indistinguishable by this
