@@ -219,7 +219,7 @@ pub enum PowerEvent {
 #[serde(rename_all = "snake_case")]
 pub enum Takeover {
     CecStandby,
-    CecPowerOffKey,
+    CecPauseStandby,
     HaMediaStop,
     None,
 }

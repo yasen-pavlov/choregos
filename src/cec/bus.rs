@@ -243,13 +243,7 @@ impl BusModel {
             })
             .min()
     }
-    pub fn handle(
-        &mut self,
-        frame: &Frame,
-        now: Instant,
-        wall: DateTime<Utc>,
-        verifying_standby: bool,
-    ) -> Vec<Action> {
+    pub fn handle(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
         if frame.from >= 15 {
             return vec![];
         }
@@ -346,7 +340,7 @@ impl BusModel {
                     _ => entry.power,
                 };
             }
-            Some(IMAGE_VIEW_ON | TEXT_VIEW_ON) if frame.to == self.bridge && !verifying_standby => {
+            Some(IMAGE_VIEW_ON | TEXT_VIEW_ON) if frame.to == self.bridge => {
                 entry.power = BusPower::On;
             }
             _ => {}
@@ -387,7 +381,7 @@ mod tests {
         );
         let f = |s| Frame::from_hex(4, 15, s).unwrap();
         assert_eq!(
-            bus.handle(&f("84210004"), now, chrono::DateTime::UNIX_EPOCH, false)
+            bus.handle(&f("84210004"), now, chrono::DateTime::UNIX_EPOCH)
                 .len(),
             1
         );
@@ -396,7 +390,6 @@ mod tests {
                 &f("04"),
                 now + Duration::from_secs(9),
                 chrono::DateTime::UNIX_EPOCH,
-                false,
             )
             .is_empty()
         );
@@ -405,7 +398,6 @@ mod tests {
                 &f("04"),
                 now + Duration::from_secs(10),
                 chrono::DateTime::UNIX_EPOCH,
-                false,
             )
             .len(),
             1
@@ -414,14 +406,12 @@ mod tests {
             &f("870010FA"),
             now + Duration::from_secs(11),
             chrono::DateTime::UNIX_EPOCH,
-            false,
         );
         assert!(bus.entries[&4].identified);
         bus.handle(
             &f("84230004"),
             now + Duration::from_secs(12),
             chrono::DateTime::UNIX_EPOCH,
-            false,
         );
         assert_eq!(bus.entries[&4].vendor, None);
         assert!(!bus.entries[&4].identified);

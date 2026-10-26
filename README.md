@@ -42,7 +42,7 @@ hosts, entities, sources and matching rules with your own. Secrets are accepted
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries with `from`, `to` (`HH:MM`), and HA `script`. Must cover exactly 24 hours; use `24:00` only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` list of role IDs. Volume keys are forwarded only while Sonos reports `playing`. |
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default `2`, range `0`–`10`), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Unconfirmed standby is re-sent after each settle interval, followed by a power-status query; `0` disables retries. Poll/retry intervals and presence misses must be positive. |
-| `fake_tv` | `replies=true` (default; false when bridge firmware answers directed TV requests), `power_status="always_on"`, `cec_version="1.4"`, `osd_name` (1–14 ASCII bytes). Broadcast Request Active Source remains service-owned. |
+| `fake_tv` | `replies=true` (default; false when bridge firmware answers directed TV requests), `power_status="always_on"`, `cec_version="1.4"`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source (`85`): only the active source device may announce its own physical address. |
 | `device` | Array of roles: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` has `issuer`, `client_id`; `web.local_login` has `username` |
 
@@ -58,9 +58,11 @@ Role IDs must match `[a-z0-9_]+` and may not be `bridge`, `mode`, `conflicts`,
 Power events: `image_view_on`, `text_view_on`, `active_source`, `power_on`,
 `standby`, `inactive_source`, `power_standby`, `report_physical_address`.
 Takeover policies: `cec_standby` sends directed Standby (`36`) then a power-status
-query (`8F`); `cec_power_off_key` sends directed Power Off Function (`44 6C`),
-User Control Released (`45`), then `8F` for devices that ignore Standby during
-playback; `ha_media_stop` requires `media_player`; `none` sends no stop action.
+query (`8F`); `cec_pause_standby` sends directed Play: Still (`41 25`), Standby
+(`36`), then `8F` for sources that ignore Standby while playing: pause through
+deck control first. Unlike the user-control Pause key, Play: Still avoids making
+the displaced source activate itself and steal the input.
+`ha_media_stop` requires `media_player`; `none` sends no stop action.
 Presence policies: `events` or `poll` (playback devices only).
 
 Active-mode verification for both CEC stop policies retries the complete original
@@ -71,12 +73,12 @@ none ACKed (expected for devices that leave the bus in standby), otherwise
 `standby_unconfirmed`. Extra/late NACKs never override an observed ACK. Stock
 firmware reports only queue/transmit status, not target ACKs, so unconfirmed
 standby always records `standby_unconfirmed`. Only an observed
-Standby/Transition report confirms standby. During pending verification, `90 xx`
-updates bus power but cannot wake the role; `04` Image View On and `0D` Text View
-On are neither role signals nor buffered signals and do not change bus power,
-preventing stray sleep-burst frames from retaking the room. `82` Active Source
-still learns normally and cancels verification when configured as an On event.
-Outside verification, view-on frames retain their normal wake behavior.
+Standby/Transition report confirms standby, even if the trailing `8F` NACKs
+because the device has already gone to sleep. An ACKed Standby prevents
+absence classification; without a power report it remains unconfirmed.
+During pending verification, `90 xx` updates bus power but cannot wake the role.
+Configured On events, including Image View On (`04`), Text View On (`0D`), and
+Active Source (`82`), retain normal learning and cancel verification.
 Config reload clears pending checks. Raw CEC sends accept 1–14
 data bytes, matching the bridge firmware limit.
 

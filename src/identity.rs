@@ -79,13 +79,11 @@ mod tests {
                 &Frame::from_hex(la, 0, "474170706C65205456").unwrap(),
                 Instant::now(),
                 chrono::DateTime::UNIX_EPOCH,
-                false,
             );
             bus.handle(
                 &Frame::from_hex(la, 15, "870010FA").unwrap(),
                 Instant::now(),
                 chrono::DateTime::UNIX_EPOCH,
-                false,
             );
         }
         assert!(resolve(&config.device, &bus).blocked.contains("streamer"));

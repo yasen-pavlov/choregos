@@ -5,10 +5,9 @@ use crate::{
         frame::Frame,
         opcode::{
             ACTIVE_SOURCE, CEC_VERSION, DEVICE_VENDOR_ID, GET_CEC_VERSION, GET_MENU_LANGUAGE,
-            GIVE_DEVICE_POWER_STATUS, GIVE_OSD_NAME, IMAGE_VIEW_ON, INACTIVE_SOURCE,
-            POWER_OFF_FUNCTION, REPORT_PHYSICAL_ADDRESS, REPORT_POWER_STATUS,
-            REQUEST_ACTIVE_SOURCE, SET_MENU_LANGUAGE, SET_OSD_NAME, STANDBY, TEXT_VIEW_ON,
-            USER_CONTROL_PRESSED, USER_CONTROL_RELEASED,
+            GIVE_DEVICE_POWER_STATUS, GIVE_OSD_NAME, IMAGE_VIEW_ON, INACTIVE_SOURCE, PLAY,
+            PLAY_MODE_STILL, REPORT_PHYSICAL_ADDRESS, REPORT_POWER_STATUS, SET_MENU_LANGUAGE,
+            SET_OSD_NAME, STANDBY, TEXT_VIEW_ON, USER_CONTROL_PRESSED,
         },
     },
     config::{Config, PowerEvent, Presence, Takeover},
@@ -324,8 +323,7 @@ impl Engine {
         if self.bus.replaces_identity(frame) {
             self.signals.remove(&frame.from);
         }
-        let verifying_standby = self.is_verifying_standby(frame.from);
-        let actions = self.bus.handle(frame, now, wall, verifying_standby);
+        let actions = self.bus.handle(frame, now, wall);
         self.signals
             .retain(|la, _| self.bus.entries.contains_key(la));
         if self.warming
@@ -345,12 +343,6 @@ impl Engine {
         }
         self.refresh_identity();
         actions
-    }
-
-    fn is_verifying_standby(&self, la: u8) -> bool {
-        self.standby_verifications
-            .iter()
-            .any(|pending| pending.la == la)
     }
 
     fn refresh_identity(&mut self) {
@@ -386,12 +378,13 @@ impl Engine {
         now: Instant,
         actions: &mut Vec<Action>,
     ) {
-        // Stop-burst view-on frames are not user wakes; power replies only verify.
-        // Neither is buffered, since warming can replay buffered signals.
-        if matches!(
-            frame.opcode,
-            Some(REPORT_POWER_STATUS | IMAGE_VIEW_ON | TEXT_VIEW_ON)
-        ) && self.is_verifying_standby(frame.from)
+        // Power-status replies verify an outgoing stop; they are not user wakes.
+        // Do not buffer them either, since warming can replay buffered signals.
+        if frame.opcode == Some(REPORT_POWER_STATUS)
+            && self
+                .standby_verifications
+                .iter()
+                .any(|pending| pending.la == frame.from)
         {
             return;
         }
@@ -733,7 +726,7 @@ impl Engine {
             return vec![];
         };
         match device.takeover {
-            Takeover::CecStandby | Takeover::CecPowerOffKey => {
+            Takeover::CecStandby | Takeover::CecPauseStandby => {
                 let Some(&la) = self.identity.roles.get(role) else {
                     return vec![];
                 };
@@ -742,10 +735,10 @@ impl Engine {
                 let pending = StandbyVerification {
                     la,
                     role: role.into(),
-                    frames: if device.takeover == Takeover::CecPowerOffKey {
+                    frames: if device.takeover == Takeover::CecPauseStandby {
                         &[
-                            &[USER_CONTROL_PRESSED, POWER_OFF_FUNCTION],
-                            &[USER_CONTROL_RELEASED],
+                            &[PLAY, PLAY_MODE_STILL],
+                            &[STANDBY],
                             &[GIVE_DEVICE_POWER_STATUS],
                         ]
                     } else {
@@ -966,15 +959,6 @@ impl Engine {
             return vec![Action::CecSend {
                 to: frame.from,
                 data,
-            }];
-        }
-        if frame.to == 15
-            && frame.opcode == Some(REQUEST_ACTIVE_SOURCE)
-            && let Some(pa) = self.bus.active_source
-        {
-            return vec![Action::CecSend {
-                to: 15,
-                data: vec![ACTIVE_SOURCE, (pa >> 8) as u8, pa as u8],
             }];
         }
         vec![]
