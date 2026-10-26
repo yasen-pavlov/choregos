@@ -57,8 +57,10 @@ Role IDs must match `[a-z0-9_]+` and may not be `bridge`, `mode`, `conflicts`,
 
 Power events: `image_view_on`, `text_view_on`, `active_source`, `power_on`,
 `standby`, `inactive_source`, `power_standby`, `report_physical_address`.
-Takeover policies: `cec_standby`, `ha_media_stop` (requires `media_player`),
-`none`. Presence policies: `events` or `poll` (playback devices only).
+Takeover policies: `cec_standby`, `ha_media_stop`, `ha_turn_off` (both HA policies
+require `media_player`), `none`. Use `ha_turn_off` for boxes that ignore CEC
+Standby while playing; it calls `media_player.turn_off` without CEC standby
+verification. Presence policies: `events` or `poll` (playback devices only).
 
 Active-mode standby verification retries remain bounded even if a device is
 silent or NACKs. With patched bridge firmware, exhaustion records

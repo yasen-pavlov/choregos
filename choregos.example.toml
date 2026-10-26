@@ -66,7 +66,8 @@ match = { vendor = "0010FA" }     # any listed key must match (osd > vendor > ph
 source = "Streamer"               # receiver source name for select_source
 on = ["image_view_on", "text_view_on", "active_source", "power_on"]
 off = ["standby", "inactive_source", "power_standby"]
-takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | none
+takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | ha_turn_off | none
+# ha_turn_off (requires media_player) is reliable for boxes that ignore <Standby> while playing.
 presence = "events"               # events | poll  (poll: send <Give Device Power Status> every presence_poll_s while on)
 
 [[device]]

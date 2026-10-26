@@ -231,6 +231,80 @@ fn assert_no_standby_decision(engine: &Engine, role: &str) {
     }));
 }
 
+fn ha_turn_off_streamer() -> (Engine, Instant) {
+    let text = include_str!("../choregos.example.toml").replacen(
+        "takeover = \"cec_standby\"",
+        "takeover = \"ha_turn_off\"\nmedia_player = \"media_player.streamer\"",
+        1,
+    );
+    let mut config = Config::parse(&text).unwrap();
+    config.mode = Mode::Active;
+    let now = Instant::now();
+    let mut engine = Engine::new(config, now, vec![]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 4, 0, "04");
+    (engine, now)
+}
+
+#[test]
+fn ha_turn_off_takeover_calls_ha_without_cec_or_standby_verification() {
+    let (mut engine, now) = ha_turn_off_streamer();
+    let takeover = now + Duration::from_secs(1);
+    frame(&mut engine, takeover, 1, 15, "84220001");
+    frame(&mut engine, takeover, 1, 0, "474B6F6469");
+    let actions = frame(&mut engine, takeover, 1, 15, "822200");
+    let turn_off = Action::ha("media_player", "turn_off", "media_player.streamer");
+    assert_eq!(
+        actions.iter().filter(|action| **action == turn_off).count(),
+        1
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::CecSend { .. }))
+    );
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    for interval in 1..=u32::from(engine.config.timing.standby_retries) + 1 {
+        let actions = engine.handle(Event::Tick, takeover + settle * interval, wall());
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::CecSend { .. }))
+        );
+        assert_no_standby_decision(&engine, "streamer");
+    }
+}
+
+#[test]
+fn ha_turn_off_all_off_calls_ha_without_cec_or_standby_verification() {
+    let (mut engine, now) = ha_turn_off_streamer();
+    let stopped = now + Duration::from_secs(1);
+    let actions = engine.handle(Event::Command(Command::AllOff), stopped, wall());
+    let turn_off = Action::ha("media_player", "turn_off", "media_player.streamer");
+    assert_eq!(
+        actions.iter().filter(|action| **action == turn_off).count(),
+        1
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::CecSend { .. }))
+    );
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    for interval in 1..=u32::from(engine.config.timing.standby_retries) + 1 {
+        let actions = engine.handle(Event::Tick, stopped + settle * interval, wall());
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::CecSend { .. }))
+        );
+        assert_no_standby_decision(&engine, "streamer");
+    }
+}
+
 #[test]
 fn takeover_retries_unconfirmed_standby_in_order_then_expires() {
     let (mut engine, takeover, settle) = takeover_from_streamer();

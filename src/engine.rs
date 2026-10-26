@@ -750,6 +750,11 @@ impl Engine {
                 .as_ref()
                 .map(|entity| vec![Action::ha("media_player", "media_stop", entity)])
                 .unwrap_or_default(),
+            Takeover::HaTurnOff => device
+                .media_player
+                .as_ref()
+                .map(|entity| vec![Action::ha("media_player", "turn_off", entity)])
+                .unwrap_or_default(),
             Takeover::None => vec![],
         }
     }

@@ -2,6 +2,18 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-26 — ha_turn_off takeover
+
+- The streaming box ACKs directed Standby but ignores it during playback,
+  continuing to report On until CEC standby verification is exhausted.
+  Its HA integration's power-off is deterministic regardless of playback.
+- Add `ha_turn_off`, requiring the role's `media_player`, to call
+  `media_player.turn_off` through the shared takeover/all-off stop path.
+  This is not a CEC action, so do not register CEC standby verification or retries.
+- Keep `cec_standby` for consoles that honour it; leave the example streamer's
+  policy unchanged and document `ha_turn_off` for boxes that ignore Standby
+  while playing.
+
 ## 2026-10-26 — Bound restored-identity identification traffic
 
 - Standby devices may ignore `83` while answering `46`. Re-querying all keys

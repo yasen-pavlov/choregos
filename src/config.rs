@@ -220,6 +220,7 @@ pub enum PowerEvent {
 pub enum Takeover {
     CecStandby,
     HaMediaStop,
+    HaTurnOff,
     None,
 }
 
@@ -428,6 +429,9 @@ impl DeviceConfig {
         if self.takeover == Takeover::HaMediaStop && self.media_player.is_none() {
             return invalid("ha_media_stop takeover requires media_player");
         }
+        if self.takeover == Takeover::HaTurnOff && self.media_player.is_none() {
+            return invalid("ha_turn_off takeover requires media_player");
+        }
         Ok(())
     }
 }
@@ -509,6 +513,20 @@ mod tests {
             config.timing.standby_retries = retries;
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn ha_turn_off_requires_media_player() {
+        let text = include_str!("../choregos.example.toml").replacen(
+            "takeover = \"cec_standby\"",
+            "takeover = \"ha_turn_off\"",
+            1,
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::Validation(message))
+                if message == "ha_turn_off takeover requires media_player"
+        ));
     }
 
     #[test]

@@ -157,7 +157,8 @@ match = { vendor = "0010FA" }     # any listed key must match (osd > vendor > ph
 source = "Streamer"               # receiver source name for select_source
 on = ["image_view_on", "text_view_on", "active_source", "power_on"]
 off = ["standby", "inactive_source", "power_standby"]
-takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | none
+takeover = "cec_standby"          # what to do to this device when another one takes over: cec_standby | ha_media_stop | ha_turn_off | none
+# ha_turn_off (requires media_player) is reliable for boxes that ignore <Standby> while playing.
 presence = "events"               # events | poll  (poll: send <Give Device Power Status> every presence_poll_s while on)
 
 [[device]]
@@ -253,7 +254,7 @@ duplicates (same state) are ignored (replaces today's `rbe` nodes).
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
 1. `WakeTv` if `tv.entity` state is not `on` (HA state cache; if unknown, send anyway).
-2. For every other role currently On: `takeover` action — `cec_standby` → `CecSend{to: la, data: "36"}` followed by `CecSend{to: la, data: "8F"}`; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `none`.
+2. For every other role currently On: `takeover` action — `cec_standby` → `CecSend{to: la, data: "36"}` followed by `CecSend{to: la, data: "8F"}`; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `ha_turn_off` → `HaCall{media_player.turn_off, entity}` (requires `media_player`, no CEC standby verification); `none`.
 3. If Sonos state is `playing`: `HaCall{media_player.media_stop, sonos.entity}`.
 4. `HaCall{media_player.turn_on, receiver}` if receiver not `on`; then after `takeover_settle_ms`: `HaCall{media_player.select_source, receiver, {source}}` if `select_source` and current receiver source ≠ `source`; then `HaCall{script.turn_on, preset_for(now)}` — the preset only runs when the receiver transitioned off→on in this takeover or the active role changed.
 Takeovers are idempotent: a repeated On for the same role with no state change does nothing.
