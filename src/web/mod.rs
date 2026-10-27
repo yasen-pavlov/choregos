@@ -81,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .route("/actions/mode", post(routes::actions::mode))
         .route("/actions/all-off", post(routes::actions::all_off))
         .route("/actions/identify/{la}", post(routes::actions::identify))
+        .route("/actions/forget/{la}", post(routes::actions::forget))
         .route("/actions/takeover/{role}", post(routes::actions::takeover))
         .route("/actions/standby/{role}", post(routes::actions::standby))
         .route("/actions/send-raw", post(routes::actions::send_raw))

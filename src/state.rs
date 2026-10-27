@@ -54,6 +54,7 @@ impl AppState {
             mode: config.mode,
             warming: true,
             bridge_online: false,
+            bridge_logical_address: config.bridge.logical_address,
             roles: config
                 .device
                 .iter()
@@ -216,6 +217,7 @@ pub struct Snapshot {
     pub mode: Mode,
     pub warming: bool,
     pub bridge_online: bool,
+    pub bridge_logical_address: u8,
     pub roles: Vec<RoleView>,
     pub bus: Vec<BusEntryView>,
     pub ha: HaView,
@@ -238,6 +240,7 @@ pub enum Command {
     AllOff,
     SetMode(Mode),
     Identify(u8),
+    Forget(u8),
     SendRaw { to: u8, data: Vec<u8> },
     Takeover(String),
     Standby(String),

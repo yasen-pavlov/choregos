@@ -1,4 +1,4 @@
-//! `/devices`: the learned bus table, role → source mapping, identify and raw send.
+//! `/devices`: the learned bus table, role → source mapping, identify, forget and raw send.
 
 use askama::Template;
 use axum::{extract::State, response::Html};

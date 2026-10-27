@@ -1588,6 +1588,196 @@ fn restored_identity(la: u8, physical: u16) -> choregos::cec::bus::LearnedIdenti
 }
 
 #[test]
+fn forgetting_a_restored_entry_removes_its_identification_retries_in_both_modes() {
+    for mode in [Mode::Shadow, Mode::Active] {
+        let now = Instant::now();
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        config.mode = mode;
+        let mut engine = Engine::new(config, now, vec![restored_identity(3, 0x2500)]);
+        engine.handle(Event::BridgeOnline, now, wall());
+        // Leave a full manual identify queued behind the resync send slot.
+        assert!(
+            engine
+                .handle(Event::Command(Command::Identify(3)), now, wall())
+                .is_empty()
+        );
+        assert!(!engine.bus.entries[&3].identified);
+        let actions = engine.handle(Event::Command(Command::Forget(3)), now, wall());
+        assert!(actions.is_empty());
+        assert!(!engine.bus.entries.contains_key(&3));
+        assert_eq!(engine.decisions.len(), 1);
+        let decision = &engine.decisions[0];
+        assert_eq!(decision.reason, "command_forget");
+        assert_eq!(
+            (decision.role.as_ref(), decision.from, decision.to),
+            (None, None, None)
+        );
+        assert!(decision.actions.is_empty());
+        for seconds in [1, 10, 30, 3600] {
+            assert!(
+                engine
+                    .handle(Event::Tick, now + Duration::from_secs(seconds), wall())
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn forgetting_an_on_role_unbinds_it_and_uses_identity_lost_release_semantics() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 8, 15, "84230004");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    assert_eq!(engine.active_role.as_deref(), Some("console_a"));
+    let forgotten = now + Duration::from_secs(1);
+    let actions = engine.handle(Event::Command(Command::Forget(8)), forgotten, wall());
+    assert!(actions.is_empty());
+    assert!(!engine.bus.entries.contains_key(&8));
+    assert!(!engine.identity.roles.contains_key("console_a"));
+    assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+    assert_eq!(
+        engine.roles["console_a"].last_event.as_deref(),
+        Some("identity_lost")
+    );
+    assert_eq!(engine.active_role, None);
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .map(|decision| (
+                decision.role.as_deref(),
+                decision.from,
+                decision.to,
+                decision.reason.as_str(),
+                decision.actions.as_slice(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some("console_a"),
+                Some(RolePower::On),
+                Some(RolePower::Off),
+                "identity_lost",
+                &[][..]
+            ),
+            (None, None, None, "command_forget", &[][..]),
+        ]
+    );
+    let released = engine.handle(
+        Event::Tick,
+        forgotten + Duration::from_secs(engine.config.timing.off_delay_s),
+        wall(),
+    );
+    assert!(released.contains(&Action::TvOff));
+    assert!(released.iter().any(|action| service(action, "turn_off")));
+}
+
+#[test]
+fn forgetting_a_conflicting_address_replays_the_new_bindings_latest_buffered_signal() {
+    for (latest, expected) in [("04", RolePower::On), ("36", RolePower::Off)] {
+        let (mut engine, now) = setup();
+        identify_atv(&mut engine, now);
+        frame(&mut engine, now, 11, 15, "84250004");
+        frame(&mut engine, now, 11, 15, "870010FA");
+        assert!(engine.identity.blocked.contains("streamer"));
+        assert!(!engine.identity.roles.contains_key("streamer"));
+        assert!(frame(&mut engine, now, 11, 0, "04").is_empty());
+        assert!(frame(&mut engine, now, 11, 0, latest).is_empty());
+        assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+
+        let actions = engine.handle(Event::Command(Command::Forget(4)), now, wall());
+        assert!(!engine.identity.blocked.contains("streamer"));
+        assert_eq!(engine.identity.roles["streamer"], 11);
+        assert_eq!(engine.roles["streamer"].power, expected);
+        assert_eq!(actions.contains(&Action::WakeTv), expected == RolePower::On);
+        if expected == RolePower::On {
+            assert_eq!(
+                engine.roles["streamer"].last_event.as_deref(),
+                Some("ImageViewOn")
+            );
+        }
+        assert!(
+            engine
+                .decisions
+                .iter()
+                .any(|decision| decision.reason == "conflict_resolved")
+        );
+        let forgotten = engine.decisions.last().unwrap();
+        assert_eq!(forgotten.reason, "command_forget");
+        assert!(forgotten.actions.is_empty());
+    }
+}
+
+#[test]
+fn a_forgotten_address_is_learned_afresh_without_cached_keys_backoff_or_wake_signals() {
+    let now = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    // Buffer a wake under the unverified identity and build up retry backoff.
+    frame(&mut engine, now, 4, 0, "04");
+    for seconds in [10, 30] {
+        engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
+    }
+    let forgotten = now + Duration::from_secs(31);
+    assert!(
+        engine
+            .handle(Event::Command(Command::Forget(4)), forgotten, wall())
+            .is_empty()
+    );
+    // An ordinary poll is enough to rediscover the LA: no wake special case.
+    assert_eq!(
+        frame(&mut engine, forgotten, 4, 0, ""),
+        [Action::Identify {
+            la: 4,
+            queries: IdentifyQueries::ALL
+        }]
+    );
+    let entry = &engine.bus.entries[&4];
+    assert_eq!(
+        (entry.physical, entry.vendor, entry.osd.as_ref()),
+        (None, None, None)
+    );
+    assert_eq!(entry.confirmed_at, None);
+    assert_eq!(entry.power, BusPower::Unknown);
+    assert_eq!(entry.last_seen, Some(forgotten));
+    identify_atv(&mut engine, forgotten);
+    assert_eq!(engine.identity.roles["streamer"], 4);
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    assert_eq!(engine.bus.entries[&4].power, BusPower::Unknown);
+    assert!(frame(&mut engine, forgotten, 4, 0, "04").contains(&Action::WakeTv));
+}
+
+#[test]
+fn forgetting_an_address_cancels_its_pending_standby_verification() {
+    let (mut engine, takeover, settle) = takeover_from_streamer();
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    assert!(
+        engine
+            .handle(Event::Command(Command::Forget(4)), takeover, wall())
+            .is_empty()
+    );
+    // Rebinding the same role at the same LA must not revive the old verification.
+    identify_atv(&mut engine, takeover);
+    assert_eq!(engine.identity.roles["streamer"], 4);
+    for interval in 1..=4 {
+        let actions = engine.handle(Event::Tick, takeover + settle * interval, wall());
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::CecSend { to: 4, .. }))
+        );
+        assert!(
+            !engine
+                .decisions
+                .iter()
+                .any(|decision| decision.reason.starts_with("standby_"))
+        );
+    }
+}
+
+#[test]
 fn restored_identity_buffers_power_until_confirming_physical_report() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();

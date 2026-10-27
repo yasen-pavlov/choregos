@@ -70,23 +70,28 @@ fn known_role(web: &WebState, role: &str) -> bool {
         .any(|view| view.role == role)
 }
 
-pub(crate) async fn mode(
-    State(web): State<WebState>,
-    Form(form): Form<ModeForm>,
-) -> Result<Response, WebError> {
-    let mut response = run(
-        &web,
-        Command::SetMode(form.mode),
-        format!("Mode set to {}.", form.mode),
-    )
-    .await?;
+/// Reloads the page after a successful command whose effect is shown outside the flash.
+fn refresh_on_success(mut response: Response) -> Response {
     if response.status().is_success() {
-        // The mode badge lives in the page chrome; reload it.
         response
             .headers_mut()
             .insert("hx-refresh", HeaderValue::from_static("true"));
     }
-    Ok(response)
+    response
+}
+
+pub(crate) async fn mode(
+    State(web): State<WebState>,
+    Form(form): Form<ModeForm>,
+) -> Result<Response, WebError> {
+    // The mode badge lives in the page chrome.
+    run(
+        &web,
+        Command::SetMode(form.mode),
+        format!("Mode set to {}.", form.mode),
+    )
+    .await
+    .map(refresh_on_success)
 }
 
 pub(crate) async fn all_off(State(web): State<WebState>) -> Result<Response, WebError> {
@@ -106,6 +111,19 @@ pub(crate) async fn identify(
             )
             .await
         }
+        _ => rejected("Logical address must be 0–14."),
+    }
+}
+
+pub(crate) async fn forget(
+    State(web): State<WebState>,
+    Path(la): Path<String>,
+) -> Result<Response, WebError> {
+    match la.parse::<u8>() {
+        // The forgotten row and any role bound through it live in the page, not the flash.
+        Ok(la) if la <= 14 => run(&web, Command::Forget(la), format!("Forgot LA {la}."))
+            .await
+            .map(refresh_on_success),
         _ => rejected("Logical address must be 0–14."),
     }
 }

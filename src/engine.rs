@@ -456,27 +456,16 @@ impl Engine {
         frame: &Frame,
         signal: Option<PowerEvent>,
     ) -> Option<(PowerEvent, RolePower)> {
+        if previous_la != Some(la) {
+            return self.buffered_power_event(role, la);
+        }
         let device = self
             .config
             .device
             .iter()
             .find(|d| d.role == role)
             .expect("configured role");
-        let signal = if previous_la != Some(la) {
-            self.signals
-                .get(&la)
-                .and_then(|signals| {
-                    signals
-                        .iter()
-                        .rev()
-                        .find(|signal| device.on.contains(signal) || device.off.contains(signal))
-                })
-                .copied()
-        } else if la == frame.from {
-            signal
-        } else {
-            None
-        }?;
+        let signal = (la == frame.from).then_some(signal).flatten()?;
         let target = if device.on.contains(&signal) {
             RolePower::On
         } else if device.off.contains(&signal) {
@@ -485,6 +474,28 @@ impl Engine {
             return None;
         };
         Some((signal, target))
+    }
+
+    fn buffered_power_event(&self, role: &str, la: u8) -> Option<(PowerEvent, RolePower)> {
+        let device = self
+            .config
+            .device
+            .iter()
+            .find(|device| device.role == role)?;
+        let signal = self
+            .signals
+            .get(&la)?
+            .iter()
+            .rev()
+            .find(|signal| device.on.contains(signal) || device.off.contains(signal))?;
+        Some((
+            *signal,
+            if device.on.contains(signal) {
+                RolePower::On
+            } else {
+                RolePower::Off
+            },
+        ))
     }
 
     fn forward_volume(&mut self, frame: &Frame, actions: &mut Vec<Action>) {
@@ -538,6 +549,41 @@ impl Engine {
                     self.record(None, None, None, "command_identify", actions.clone());
                 }
             }
+            Command::Forget(la) => {
+                if la < 15 && la != self.bus.bridge && self.bus.entries.remove(&la).is_some() {
+                    self.standby_verifications
+                        .retain(|pending| pending.la != la);
+                    self.signals.remove(&la);
+                    let previous_roles = self.identity.roles.clone();
+                    self.refresh_identity();
+                    for role in previous_roles.keys() {
+                        if !self.identity.roles.contains_key(role)
+                            && !self.identity.blocked.contains(role)
+                        {
+                            actions.extend(self.transition(
+                                role,
+                                RolePower::Off,
+                                "identity_lost",
+                                now,
+                            ));
+                        }
+                    }
+                    let newly_bound: Vec<_> = self
+                        .identity
+                        .roles
+                        .iter()
+                        .filter(|(role, la)| previous_roles.get(*role) != Some(*la))
+                        .filter_map(|(role, &la)| {
+                            self.buffered_power_event(role, la)
+                                .map(|(signal, power)| (role.clone(), signal, power))
+                        })
+                        .collect();
+                    for (role, signal, power) in newly_bound {
+                        actions.extend(self.transition(&role, power, &format!("{signal:?}"), now));
+                    }
+                    self.record(None, None, None, "command_forget", vec![]);
+                }
+            }
             Command::SendRaw { to, data } => {
                 if to <= 15 && !data.is_empty() && data.len() <= 14 {
                     actions.push(Action::CecSend { to, data });
@@ -570,6 +616,7 @@ impl Engine {
             Command::AllOff => "command_all_off",
             Command::SetMode(_) => "command_set_mode",
             Command::Identify(_) => "command_identify",
+            Command::Forget(_) => "command_forget",
             Command::SendRaw { .. } => "command_send_raw",
             Command::Takeover(_) => "command_takeover",
             Command::Standby(_) => "command_standby",
@@ -577,26 +624,15 @@ impl Engine {
     }
 
     fn finish_warming(&mut self, now: Instant, actions: &mut Vec<Action>) {
-        let pending: Vec<_> =
-            self.identity
-                .roles
-                .iter()
-                .filter_map(|(role, la)| {
-                    let device = self.config.device.iter().find(|d| &d.role == role)?;
-                    let signal =
-                        self.signals.get(la)?.iter().rev().find(|signal| {
-                            device.on.contains(signal) || device.off.contains(signal)
-                        })?;
-                    Some((
-                        role.clone(),
-                        if device.on.contains(signal) {
-                            RolePower::On
-                        } else {
-                            RolePower::Off
-                        },
-                    ))
-                })
-                .collect();
+        let pending: Vec<_> = self
+            .identity
+            .roles
+            .iter()
+            .filter_map(|(role, &la)| {
+                self.buffered_power_event(role, la)
+                    .map(|(_, power)| (role.clone(), power))
+            })
+            .collect();
         for (role, power) in pending {
             actions.extend(self.transition(&role, power, "resync_complete", now));
         }

@@ -14,7 +14,10 @@ use tower::ServiceExt;
 use super::router;
 use crate::{
     config::Config,
-    state::{AppState, DecisionView, FrameDirection, FrameView, RolePower, UiEvent},
+    state::{
+        AppState, BusEntryView, BusPower, Command, CommandError, DecisionView, FrameDirection,
+        FrameView, RolePower, UiEvent,
+    },
 };
 
 const PASSWORD: &str = "test-only-password";
@@ -406,11 +409,103 @@ async fn action_inputs_are_validated_before_reaching_the_runtime() {
         .post_form("/actions/identify/15", &cookie, Some(&csrf), "")
         .await;
     assert_eq!(bad_la.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_forget = h
+        .post_form("/actions/forget/15", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(bad_forget.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let bad_raw = h
         .post_form("/actions/send-raw", &cookie, Some(&csrf), "to=4&data=xyz")
         .await;
     assert_eq!(bad_raw.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body(bad_raw).await.contains("hex bytes"));
+}
+
+/// Answers exactly one runtime command with `result` and hands the command back to the test.
+fn answer_one_command(
+    state: &AppState,
+    result: Result<(), CommandError>,
+) -> tokio::sync::oneshot::Receiver<Command> {
+    let (sender, mut inputs) = tokio::sync::mpsc::channel(1);
+    state.attach(sender);
+    let (forward, received) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Some(crate::runtime::Input::Request(crate::runtime::Request::Command(
+            command,
+            Some(reply),
+        ))) = inputs.recv().await
+        {
+            let _ = reply.send(result);
+            let _ = forward.send(command);
+        }
+    });
+    received
+}
+
+#[tokio::test]
+async fn forget_forwards_the_logical_address_and_reloads_only_on_success() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let received = answer_one_command(&h.state, Ok(()));
+    let response = h
+        .post_form("/actions/forget/3", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["hx-refresh"], "true");
+    assert!(body(response).await.contains("Forgot LA 3."));
+    let command = received.await.expect("runtime received the command");
+    assert!(matches!(command, Command::Forget(3)), "{command:?}");
+
+    // A second click on the now stale row: the runtime rejects it and the flash stays.
+    let _received = answer_one_command(
+        &h.state,
+        Err(CommandError::Invalid("unknown logical address".to_owned())),
+    );
+    let stale = h
+        .post_form("/actions/forget/3", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(stale.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!stale.headers().contains_key("hx-refresh"));
+    assert!(body(stale).await.contains("unknown logical address"));
+
+    let out_of_range = h
+        .post_form("/actions/forget/15", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(out_of_range.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!out_of_range.headers().contains_key("hx-refresh"));
+}
+
+fn bus_entry(la: u8) -> BusEntryView {
+    BusEntryView {
+        logical_address: la,
+        physical_address: Some("2.5.0.0".to_owned()),
+        device_type: Some(3),
+        vendor: Some("000000".to_owned()),
+        osd: None,
+        power: BusPower::Unknown,
+        last_seen: None,
+        identified: false,
+        verified: false,
+        matched_role: None,
+    }
+}
+
+#[tokio::test]
+async fn devices_rows_offer_forget_except_for_the_bridge() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    let bridge = snapshot.bridge_logical_address;
+    snapshot.bus = vec![bus_entry(bridge), bus_entry(3)];
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/devices", Some(&cookie)).await).await;
+    let row = between(&html, "<td class=\"mono\">3</td>", "</tr>");
+    assert!(row.contains(r#"hx-post="/actions/forget/3""#));
+    assert!(row.contains("hx-confirm=\"Forget LA 3? It will be re-learned if it talks again.\""));
+    assert!(row.contains(r#"hx-post="/actions/identify/3""#));
+    // Both buttons share the last cell: the row keeps the header's nine columns.
+    assert_eq!(row.matches("<td").count(), 8, "plus the LA cell = 9");
+    assert!(!html.contains(&format!("/actions/forget/{bridge}\"")));
+    assert!(html.contains(&format!("/actions/identify/{bridge}\"")));
 }
 
 #[tokio::test]
