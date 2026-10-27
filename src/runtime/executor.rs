@@ -1,9 +1,9 @@
-use super::{ha::Ha, mqtt::Mqtt, wol};
+use super::{ha::Ha, mqtt::Mqtt, webos, wol};
 #[cfg(test)]
 use crate::action::IdentifyQueries;
 use crate::{
     action::Action,
-    config::{Config, WakeConfig},
+    config::{Config, TvOffConfig, WakeConfig},
     state::Mode,
 };
 use std::sync::{
@@ -38,7 +38,10 @@ impl Executor {
         config: &Config,
         known_las: &[u8],
     ) -> Option<Vec<crate::cec::Frame>> {
-        if matches!(action, Action::WakeTv | Action::HaCall { .. }) {
+        if matches!(
+            action,
+            Action::WakeTv | Action::TvOff | Action::HaCall { .. }
+        ) {
             return None;
         }
         if !self.permits(action, config) {
@@ -85,7 +88,9 @@ impl Executor {
                 }
             }
             Action::CecSend { to, data } => send(*to, data),
-            Action::WakeTv | Action::HaCall { .. } => unreachable!("ordered action checked above"),
+            Action::WakeTv | Action::TvOff | Action::HaCall { .. } => {
+                unreachable!("ordered action checked above")
+            }
         }
         Some(frames)
     }
@@ -106,6 +111,26 @@ impl Executor {
                 entity,
                 data,
             } => self.ha.call(domain, service, entity, data.clone()).await?,
+            Action::TvOff => match &config.tv.off {
+                TvOffConfig::Ha => {
+                    self.ha
+                        .call(
+                            "media_player",
+                            "turn_off",
+                            &config.tv.entity,
+                            serde_json::json!({}),
+                        )
+                        .await?;
+                }
+                TvOffConfig::Webos { host, port, .. } => {
+                    let key = config
+                        .secrets
+                        .tv_webos_key
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing webOS power-off credential"))?;
+                    retry_webos_off(|| webos::turn_off(host, *port, key)).await?;
+                }
+            },
             Action::WakeTv => match &config.tv.wake {
                 WakeConfig::Wol {
                     mac,
@@ -135,6 +160,27 @@ impl Executor {
         Ok(())
     }
 }
+
+async fn retry_webos_off<F, Fut>(mut operation: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    for attempt in 1..=3 {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(attempt, error = %error, "webOS power-off attempt failed");
+                if error.is::<webos::PairingRequired>() || attempt == 3 {
+                    tracing::error!(attempt, error = %error, "webOS power-off failed");
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    unreachable!("last attempt returns its result")
+}
 pub fn suppressed(mode: Mode, action: &Action) -> bool {
     mode == Mode::Shadow && !action.allowed_in_shadow()
 }
@@ -142,10 +188,42 @@ pub fn suppressed(mode: Mode, action: &Action) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn pairing_required_is_attempted_once_without_retry_delay() {
+        let mut attempts = 0;
+        let error = retry_webos_off(|| {
+            attempts += 1;
+            std::future::ready(Err(webos::PairingRequired.into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is::<webos::PairingRequired>());
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_retry_three_times_one_second_apart() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = retry_webos_off(|| {
+            attempts += 1;
+            std::future::ready(Err(anyhow::anyhow!("test-only connection failure")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(error.to_string(), "test-only connection failure");
+    }
+
     #[test]
     fn shadow_gate_covers_every_effect() {
         let effects = [
             Action::WakeTv,
+            Action::TvOff,
             Action::ha("media_player", "turn_off", "media_player.example"),
             Action::CecSend {
                 to: 4,
@@ -182,6 +260,7 @@ mod behavior_tests {
         ] {
             let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
             config.mode = produced_mode;
+            config.tv.off = TvOffConfig::Ha;
             let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             config.tv.wake = WakeConfig::Wol {
                 mac: "02:11:22:33:44:55".into(),
@@ -224,10 +303,21 @@ mod behavior_tests {
                 .await
                 .unwrap();
             executor.execute(&Action::WakeTv, &config).await.unwrap();
+            assert!(executor.fast_lane(&Action::TvOff, &config, &[]).is_none());
+            executor.execute(&Action::TvOff, &config).await.unwrap();
             eventloop.clean();
             assert_eq!(eventloop.pending.len(), 9 + usize::from(executes));
             if executes {
                 assert_eq!(calls.recv().await.unwrap()["service"], "turn_on");
+                assert_eq!(
+                    calls.recv().await.unwrap(),
+                    serde_json::json!({
+                        "domain": "media_player",
+                        "service": "turn_off",
+                        "entity": config.tv.entity,
+                        "data": {}
+                    })
+                );
                 let mut packet = [0; 102];
                 tokio::time::timeout(std::time::Duration::from_secs(1), udp.recv(&mut packet))
                     .await

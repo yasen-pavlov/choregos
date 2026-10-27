@@ -4,7 +4,7 @@ Choregos (χορηγός, the patron who ran the chorus at the Dionysia) is the
 conductor of a living-room home theater: it watches the HDMI-CEC bus through a
 Tasmota CEC bridge, keeps a model of who is on the bus and who is the active
 source, and drives the non-CEC parts of the room (TV, receiver, Sonos, Kodi)
-through Home Assistant so that every device can be used with its own remote.
+through Home Assistant, with native TV wake/power-off, so that every device can be used with its own remote.
 
 This document is the contract between the implementation slices. It is
 authoritative until superseded by code review decisions recorded in
@@ -15,7 +15,7 @@ authoritative until superseded by code review decisions recorded in
 ```
 TV ──────────── HDMI ──── AV receiver (CEC audio system, LA 5, PA 2.0.0.0)
   CEC pin disconnected        │ in1 streaming box   (playback)
-  WoL + vendor API via HA     │ in2 Kodi box        (recording device)
+  Native WoL + webOS SSAP     │ in2 Kodi box        (recording device)
                               │ in3 console A       (playback; leaves the bus entirely in standby)
                               │ in4 console B       (playback)
                               │ in5 the bridge      (Tasmota HDMI-CEC device, claims the TV role, LA 0)
@@ -48,13 +48,13 @@ primary replay fixture.
 
 ## 2. Non-goals
 
-- No receiver/TV/Sonos/Kodi protocol implementations: Home Assistant already
-  has working integrations; choregos calls HA services.
+- No general receiver/TV/Sonos/Kodi protocol implementations: Home Assistant
+  handles these, except the TV's narrow native wake and webOS power-off paths.
 - No persistence of live power or active-source state: the bus is
   re-interrogated on start (§5.6); learned identities and decisions are retained.
 - No CEC frame decoding beyond what the engine needs (a name table for the UI
   is fine; no full CEC stack).
-- No plugin system. The TV wake path is a two-variant enum, not a plugin.
+- No plugin system. The TV wake and off paths are small enums, not plugins.
 
 ## 3. Crate layout (single binary crate `choregos`)
 
@@ -72,6 +72,7 @@ src/runtime/mod.rs     event loop: channels → engine → executor          [co
 src/runtime/mqtt.rs    rumqttc client; bridge topics; HA discovery; state topics [core]
 src/runtime/ha.rs      HA websocket client: auth, call_service, state subscriptions, reconnect [core]
 src/runtime/wol.rs     magic packet to directed broadcast                [core]
+src/runtime/webos.rs   native TLS SSAP TV power-off                       [core]
 src/runtime/executor.rs Action → side effect (respects mode)             [core]
 src/state.rs           AppState shared with the web layer (RwLock snapshot + broadcast channel of UI events) [core]
 src/web/mod.rs         axum router, OIDC + local login, session cookie   [ui]
@@ -111,6 +112,8 @@ url = "http://homeassistant.lan:8123"
 entity = "media_player.tv"
 wake = { kind = "wol", mac = "AA:BB:CC:DD:EE:FF", broadcast = "192.168.10.255", port = 9 }
 # or: wake = { kind = "http", url = "http://wol-service.lan:8090/api/wake/<device-id>", header = "Authorization", token_env = "CHOREGOS_WAKE_TOKEN" }
+off = { kind = "webos", host = "192.168.10.20", key_env = "CHOREGOS_TV_KEY" }
+# or: off = { kind = "ha" }  # default; uses HA media_player.turn_off
 
 [receiver]
 entity = "media_player.receiver"
@@ -263,7 +266,12 @@ Takeovers are idempotent: a repeated On for the same role with no state change d
 In active mode, both CEC stop policies (including all-off and manual standby) are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA. During pending verification, `90 xx` replies update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry the complete original stop/query sequence up to `standby_retries` times: `36`, `8F` for `cec_standby`, or `41 25`, `36`, `8F` for `cec_pause_standby`. Silence or NACK is not confirmation and does not shorten retries. Each pending verification remembers its sequence and counts every outgoing frame in it to its LA (`sent`: two or three per round), correlated NACKs (`nacked`), and whether any ACK was observed (`acked`). Observed Standby/Transition confirms the stop even when the trailing `8F` NACKs because the device is already asleep; an ACKed `36` also prevents absence classification if no power report arrives. On exhaustion without confirmation, record `standby_target_absent` if `sent > 0 && !acked && nacked >= sent` (expected for devices that leave the bus in standby), otherwise `standby_unconfirmed` (ACKed frames or missing results without a confirming power report). Extra/late NACKs cannot override an observed ACK. ACK-based classification requires patched bridge firmware; stock firmware without ACK information can only produce `standby_unconfirmed`. Send results for other LAs or frame data outside the remembered sequence do not affect verification. A real role On event (including configured `04`, `0D`, or `82`) or blocked/remapped identity cancels verification; bridge-offline or a config reload clears pending verifications. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
 
 ### 5.5 Release (role turns Off)
-Start/restart `off_delay_s` timer. On expiry, if no role is On: `HaCall{media_player.turn_off, tv}` and `HaCall{media_player.turn_off, receiver}`. If a role turned On meanwhile the timer is cancelled.
+Start/restart `off_delay_s` timer. On expiry, if no role is On: `TvOff` and `HaCall{media_player.turn_off, receiver}`. `TvOff` uses HA by default, or native webOS SSAP over TLS (default port 3001) with an environment-only pairing key. Native off has one five-second connect/register/request/close deadline per attempt, three attempts one second apart, and no HA fallback. If a role turned On meanwhile the timer is cancelled.
+Before each native power-off attempt, query `getPowerState`; `Power Off`, `Suspend`
+and `Active Standby` succeed without `turnOff`, which can wake a standby TV.
+An unsupported-service/error response permits `turnOff` on older webOS.
+Pairing-required responses are permanent errors and are never retried.
+After an acknowledged power-off, websocket close is best-effort.
 
 ### 5.6 Startup / resync
 On start and on bridge LWT `Online`: send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).

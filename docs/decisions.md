@@ -2,6 +2,35 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-27 — Native webOS power-off
+
+- After native Wake-on-LAN, the HA webOS integration needed about 30 seconds
+  to reconnect. A release 23 seconds after wake called `media_player.turn_off`
+  while the TV entity was still unavailable: the receiver turned off, but the
+  TV stayed on. A direct paired SSAP connection completed in about 0.23 seconds.
+- Add a transport-independent `TvOff` action. Existing configurations retain
+  HA power-off; `tv.off.kind = "webos"` connects directly over `wss` (default
+  port 3001) and registers with an environment-only key. Before each power-off
+  attempt, query `ssap://com.webos.service.tvpower/power/getPowerState`; `Power Off`,
+  `Suspend` or `Active Standby` succeeds without sending `ssap://system/turnOff`,
+  which can wake a TV in Active Standby. Unsupported-service/error responses
+  fall through to turnOff for older webOS. Unknown keys require pairing and
+  are never retried, avoiding repeated pairing prompts. There is no HA fallback.
+- LG exposes a self-signed certificate without a public trust chain, so the
+  TV-only rustls verifier accepts its certificate. TLS handshake signatures
+  remain verified, but server identity is not authenticated: use a trusted LAN.
+  Explicitly select the ring crypto provider already used by the dependency graph.
+- Bound each entire exchange to five seconds. The ordered executor attempts
+  native off three times, waiting one second between attempts for the TV's
+  network stack after wake. Warn on each failure and error after the last;
+  diagnostics never echo credentials, server replies, or connection addresses.
+- After a successful turnOff acknowledgement, websocket close is best-effort:
+  a TCP reset while the TV powers down must not trigger another power command.
+- Treat `tv.off` as a restart-only credential destination, like `tv.wake`, so
+  the live config editor cannot redirect resolved environment secrets.
+- Copy aiowebostv's public registration payload unchanged; upstream now keeps
+  it in `aiowebostv/handshake.py`, imported by `webos_client.py`.
+
 ## 2026-10-27 — Logical address moves keep the role
 
 - During receiver HDMI re-enumeration, a console moved from LA 8 to LA 11

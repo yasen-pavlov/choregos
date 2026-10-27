@@ -46,6 +46,7 @@ pub struct Secrets {
     pub oidc_client_secret: Secret,
     pub local_password: Secret,
     pub tv_http_token: Option<Secret>,
+    pub tv_webos_key: Option<Secret>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,6 +95,8 @@ pub struct HomeAssistantConfig {
 pub struct TvConfig {
     pub entity: String,
     pub wake: WakeConfig,
+    #[serde(default)]
+    pub off: TvOffConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -109,6 +112,55 @@ pub enum WakeConfig {
         header: String,
         token_env: String,
     },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(from = "StrictTvOffConfig")]
+pub enum TvOffConfig {
+    #[default]
+    Ha,
+    Webos {
+        host: String,
+        #[serde(default = "default_webos_port")]
+        port: u16,
+        key_env: String,
+    },
+}
+
+// Serde ignores unknown fields for internally tagged unit variants, even with
+// deny_unknown_fields. A struct-shaped HA wire variant keeps both kinds strict.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StrictTvOffConfig {
+    Ha {},
+    Webos {
+        host: String,
+        #[serde(default = "default_webos_port")]
+        port: u16,
+        key_env: String,
+    },
+}
+
+impl From<StrictTvOffConfig> for TvOffConfig {
+    fn from(value: StrictTvOffConfig) -> Self {
+        match value {
+            StrictTvOffConfig::Ha {} => Self::Ha,
+            StrictTvOffConfig::Webos {
+                host,
+                port,
+                key_env,
+            } => Self::Webos {
+                host,
+                port,
+                key_env,
+            },
+        }
+    }
+}
+
+fn default_webos_port() -> u16 {
+    3001
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -288,6 +340,10 @@ impl Config {
                 WakeConfig::Http { token_env, .. } => Some(required(token_env)?),
                 WakeConfig::Wol { .. } => None,
             },
+            tv_webos_key: match &self.tv.off {
+                TvOffConfig::Webos { key_env, .. } => Some(required(key_env)?),
+                TvOffConfig::Ha => None,
+            },
         };
         if secrets.session_secret.expose().len() < 32 {
             return invalid("CHOREGOS_SESSION_SECRET must contain at least 32 bytes");
@@ -311,6 +367,9 @@ impl Config {
         if let WakeConfig::Http { .. } = self.tv.wake {
             text.push_str("# TV HTTP token = [REDACTED]\n");
         }
+        if let TvOffConfig::Webos { .. } = self.tv.off {
+            text.push_str("# TV webOS key = [REDACTED]\n");
+        }
         Ok(text)
     }
 
@@ -323,6 +382,25 @@ impl Config {
         }
         if let WakeConfig::Wol { mac, .. } = &self.tv.wake {
             parse_mac(mac)?;
+        }
+        if let TvOffConfig::Webos { host, port, .. } = &self.tv.off {
+            let ipv6 = host.parse::<std::net::Ipv6Addr>().is_ok()
+                || host
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok());
+            if host.is_empty()
+                || host.contains('/')
+                || host.chars().any(char::is_whitespace)
+                || (!ipv6 && host.contains([':', '[', ']']))
+            {
+                return invalid(
+                    "TV webOS host must be a hostname or IP address without a path or port",
+                );
+            }
+            if *port == 0 {
+                return invalid("TV webOS port must be nonzero");
+            }
         }
         self.validate_presets()
     }
@@ -497,6 +575,85 @@ mod tests {
 
     fn example() -> Config {
         Config::parse(include_str!("../choregos.example.toml")).expect("valid example")
+    }
+
+    #[test]
+    fn tv_off_defaults_to_ha_for_existing_configs() {
+        let text = include_str!("../choregos.example.toml")
+            .lines()
+            .filter(|line| !line.starts_with("off = {"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut config = Config::parse(&text).unwrap();
+        assert!(matches!(config.tv.off, TvOffConfig::Ha));
+        config.resolve_secrets(|_| Some("x".repeat(32))).unwrap();
+        assert!(config.secrets.tv_webos_key.is_none());
+    }
+
+    #[test]
+    fn webos_requires_its_own_secret_and_redacts_it() {
+        let mut config = example();
+        config.tv.off = TvOffConfig::Webos {
+            host: "192.168.10.20".into(),
+            port: 3001,
+            key_env: "CHOREGOS_TV_KEY".into(),
+        };
+        for missing in [None, Some(String::new())] {
+            let error = config
+                .resolve_secrets(|name| {
+                    if name == "CHOREGOS_TV_KEY" {
+                        missing.clone()
+                    } else {
+                        Some("x".repeat(32))
+                    }
+                })
+                .unwrap_err();
+            assert!(matches!(error, ConfigError::MissingSecret(name) if name == "CHOREGOS_TV_KEY"));
+        }
+        let sentinel = "test-only-webos-credential-not-a-real-key";
+        config.resolve_secrets(|_| Some(sentinel.into())).unwrap();
+        assert_eq!(
+            config.secrets.tv_webos_key.as_ref().unwrap().expose(),
+            sentinel
+        );
+        let text = config.redacted_text().unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("# TV webOS key"))
+            .unwrap();
+        assert_eq!(line, "# TV webOS key = [REDACTED]");
+        assert!(!text.contains(sentinel));
+        assert!(!format!("{config:?}").contains(sentinel));
+        println!("{line}");
+    }
+
+    #[test]
+    fn webos_defaults_tls_port_and_rejects_empty_host_or_unknown_fields() {
+        let mut config = example();
+        config.tv.off = TvOffConfig::Ha;
+        let text = toml::to_string(&config).unwrap().replace(
+            "kind = \"ha\"",
+            "kind = \"webos\"\nhost = \"tv.example.com\"\nkey_env = \"CHOREGOS_TV_KEY\"",
+        );
+        assert!(matches!(
+            Config::parse(&text).unwrap().tv.off,
+            TvOffConfig::Webos { port: 3001, .. }
+        ));
+        assert!(Config::parse(&text.replace("tv.example.com", "  ")).is_err());
+        assert!(Config::parse(&text.replace("tv.example.com", "tv.example.com/path")).is_err());
+        assert!(Config::parse(&text.replace("tv.example.com", "tv.example.com:3001")).is_err());
+        assert!(Config::parse(&text.replace("tv.example.com", "bad host")).is_err());
+        assert!(
+            Config::parse(&text.replace("kind = \"webos\"", "kind = \"webos\"\nport = 0")).is_err()
+        );
+        for host in ["2001:db8::1", "[2001:db8::1]"] {
+            assert!(Config::parse(&text.replace("tv.example.com", host)).is_ok());
+        }
+        assert!(
+            Config::parse(&text.replace("kind = \"webos\"", "kind = \"webos\"\nunknown = true"))
+                .is_err()
+        );
+        assert!(Config::parse(&text.replace("kind = \"webos\"", "kind = \"ha\"")).is_err());
     }
 
     #[test]

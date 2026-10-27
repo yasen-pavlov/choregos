@@ -40,8 +40,8 @@ testable model instead of a pile of automations.
 - **Forwards volume.** Remote volume keys reach Sonos while it is playing.
 - **Integrates with Home Assistant.** MQTT discovery publishes per-role power
   sensors, active source, conflicts, bridge availability, a mode select and an
-  all-off button; the receiver, TV, Sonos and media players are driven through
-  HA's own integrations.
+  all-off button; receiver, Sonos and media players use HA's integrations.
+  TV power-off can use native webOS SSAP to avoid HA reconnect delays after wake.
 - **Shows its work.** A web UI with dashboard, live bus stream, devices,
   decision log, config editor and manual actions, behind OIDC or a break-glass
   login.
@@ -57,7 +57,7 @@ flowchart LR
     mqtt <--> choregos["Choregos<br/>bus model · roles · decisions"]
     choregos <-- "websocket" --> ha["Home Assistant"]
     ha --> devices["Receiver · TV · Sonos · media players"]
-    choregos -- "WoL / HTTP" --> tv["TV"]
+    choregos -- "WoL / HTTP · webOS SSAP" --> tv["TV"]
     choregos --- web["Web UI"]
 ```
 
@@ -65,7 +65,7 @@ Every received frame updates a bus model and resolves configured roles. The
 engine is a pure state machine: no network I/O, no clock reads. Injected time
 drives startup warming, takeover settling, identification retries and
 presence/off timers, which makes every behaviour replayable from a capture and
-testable without hardware. MQTT, the HA websocket and TV wake are thin adapters
+testable without hardware. MQTT, the HA websocket and TV power are thin adapters
 that execute the engine's actions.
 
 [DESIGN.md](DESIGN.md) is the behavioural contract; [docs/decisions.md](docs/decisions.md)
@@ -118,6 +118,17 @@ broadcast (e.g. `192.168.1.255`) that your router forwards to the TV's network.
 Otherwise use `network_mode: host`, or the `http` wake variant with a LAN wake
 service.
 
+Native webOS off uses only TLS (`wss`, port 3001 by default) and an existing
+pairing key from `tv.off.key_env`; it does not initiate pairing. LG's self-signed
+certificate is accepted only for this connection, so use a trusted LAN.
+Each connect/register/power-state-check/turnOff/close exchange has a five-second
+timeout, with up to three attempts one second apart and no fallback to HA.
+Already-off, suspended or Active Standby TVs are left untouched; sending
+`turnOff` can wake a standby TV. Older webOS versions without the power-state
+service still receive `turnOff`. Pairing-required errors are never retried.
+For containers, also pass the configured key environment variable (for example
+`-e CHOREGOS_TV_KEY`). Omit `tv.off` or select `kind = "ha"` for HA power-off.
+
 Start in `shadow` mode (the default in the example), watch the **Decisions**
 page through a few evenings, then switch to `active` from the UI or over MQTT.
 
@@ -135,6 +146,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `CHOREGOS_OIDC_CLIENT_SECRET` | OIDC client secret for the web UI |
 | `CHOREGOS_LOCAL_PASSWORD` | Break-glass login password; hashed by the web layer |
 | *(named by `tv.wake.token_env`)* | Complete header value for HTTP wake |
+| `CHOREGOS_TV_KEY` *(or `tv.off.key_env`)* | Existing LG webOS pairing key when `tv.off.kind = "webos"` |
 
 | Section | Settings |
 | --- | --- |
@@ -142,7 +154,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `mqtt` | `host`, `port`, `username`, `client_id` |
 | `bridge` | Tasmota `topic` and the `logical_address` the bridge claims (0–14) |
 | `home_assistant` | HTTP(S) base `url`; the websocket is `/api/websocket` |
-| `tv` | HA `entity`; `wake` is `{kind="wol", mac, broadcast, port}` or `{kind="http", url, header, token_env}` (POST, header value from the environment) |
+| `tv` | HA `entity`; `wake` is `{kind="wol", mac, broadcast, port}` or `{kind="http", url, header, token_env}` (POST, header value from the environment); `off` defaults to `{kind="ha"}` or uses `{kind="webos", host, port=3001, key_env}` |
 | `receiver` | HA `entity`, `select_source` boolean |
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries (`from`, `to` as `HH:MM`, HA `script`). Slots must cover exactly 24 hours; `24:00` is valid only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` role IDs whose volume keys are forwarded while Sonos is `playing` |
@@ -151,7 +163,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
 
-`web`, `mqtt`, `home_assistant` and `tv.wake` changes require a restart and are
+`web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` changes require a restart and are
 rejected by the in-app editor, so an authenticated user cannot redirect
 credentials elsewhere. Everything else is editable live: the editor shows the
 file verbatim with comments, validates, then replaces it atomically and reloads.
@@ -209,7 +221,7 @@ One instance per broker namespace.
 
 In `shadow` the complete engine runs and publishes its learned states and
 decisions, but the executor allows only read-only traffic on the bus:
-identification, startup/resync interrogation and presence polls. TV wake, HA
+identification, startup/resync interrogation and presence polls. TV wake/off, HA
 service calls, raw CEC, fake-TV replies and volume forwarding are logged as
 `would:` with their payload instead of being sent. Mode and config persistence
 and HA discovery keep working, so the dashboard and HA entities are fully live

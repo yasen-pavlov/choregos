@@ -857,7 +857,7 @@ impl Engine {
             return vec![];
         }
         let actions = vec![
-            Action::ha("media_player", "turn_off", &self.config.tv.entity),
+            Action::TvOff,
             Action::ha("media_player", "turn_off", &self.config.receiver.entity),
         ];
         for entity in [&self.config.tv.entity, &self.config.receiver.entity] {

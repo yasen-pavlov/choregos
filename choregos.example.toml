@@ -19,6 +19,8 @@ url = "http://homeassistant.lan:8123"
 entity = "media_player.tv"
 wake = { kind = "wol", mac = "AA:BB:CC:DD:EE:FF", broadcast = "192.168.10.255", port = 9 }
 # or: wake = { kind = "http", url = "http://wol-service.lan:8090/api/wake/<device-id>", header = "Authorization", token_env = "CHOREGOS_WAKE_TOKEN" }
+off = { kind = "webos", host = "192.168.10.20", key_env = "CHOREGOS_TV_KEY" }
+# or: off = { kind = "ha" }  # default; uses HA media_player.turn_off
 
 [receiver]
 entity = "media_player.receiver"

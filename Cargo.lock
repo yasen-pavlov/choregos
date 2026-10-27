@@ -462,6 +462,7 @@ dependencies = [
  "rand 0.10.3",
  "rumqttc",
  "rumqttd",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
