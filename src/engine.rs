@@ -311,7 +311,15 @@ impl Engine {
     }
 
     fn handle_frame(&mut self, frame: Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
-        let previous_roles = self.identity.roles.clone();
+        let mut previous_roles = self.identity.roles.clone();
+        if let Some(previous_la) = self.prepare_address_change(&frame) {
+            // A continuous role binding must not replay its historical wake signals.
+            for la in previous_roles.values_mut() {
+                if *la == previous_la {
+                    *la = frame.from;
+                }
+            }
+        }
         let mut actions = self.learn_frame(&frame, now, wall);
         self.reconcile_frame_roles(&previous_roles, &frame, now, &mut actions);
         actions.extend(self.fake_tv(&frame));
@@ -320,9 +328,6 @@ impl Engine {
     }
 
     fn learn_frame(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
-        if self.bus.replaces_identity(frame) {
-            self.signals.remove(&frame.from);
-        }
         let actions = self.bus.handle(frame, now, wall);
         self.signals
             .retain(|la, _| self.bus.entries.contains_key(la));
@@ -343,6 +348,30 @@ impl Engine {
         }
         self.refresh_identity();
         actions
+    }
+
+    fn prepare_address_change(&mut self, frame: &Frame) -> Option<u8> {
+        let moved_from = self.bus.address_move_from(frame);
+        if self.bus.replaces_identity(frame) || moved_from.is_some() {
+            self.signals.remove(&frame.from);
+        }
+        if let Some(previous_la) = moved_from {
+            self.standby_verifications
+                .retain(|pending| pending.la != frame.from);
+            if let Some(signals) = self.signals.remove(&previous_la) {
+                self.signals.insert(frame.from, signals);
+            }
+            for pending in &mut self.standby_verifications {
+                if pending.la == previous_la {
+                    pending.la = frame.from;
+                    // Results for sends to the old LA cannot classify the new target.
+                    pending.sent = 0;
+                    pending.acked = false;
+                    pending.nacked = 0;
+                }
+            }
+        }
+        moved_from
     }
 
     fn refresh_identity(&mut self) {

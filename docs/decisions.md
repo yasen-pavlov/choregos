@@ -2,6 +2,53 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-27 — Logical address moves keep the role
+
+- During receiver HDMI re-enumeration, a console moved from LA 8 to LA 11
+  while keeping its PA. The destination held a different restored identity.
+  Dropping LA 8 and clearing LA 11's keys temporarily unmapped the running
+  role. The roughly two-second vendor/OSD gap looked like power-off, starting
+  the room-off timer before a later Active Source woke the room again.
+- A valid `84` (at least three operands) or broadcast `82` (exactly two
+  operands) reporting another LA's PA moves that physical device: remove the
+  old LA, perform any destination replacement, then inherit physical address,
+  vendor, OSD, device type, power and confirmation state.
+  Apply the current report afterward, updating last-seen time and recomputing
+  identification. Identity follows PA plus keys, not the logical address.
+  Vendor/OSD reports alone never imply a move; a subsequent changed key still
+  invalidates the inherited identity and requires fresh PA confirmation.
+- If the destination is not being replaced and already has vendor/OSD keys
+  that differ from the old entry, do not inherit: evict the old LA but retain
+  the destination's own keys. Evidence already supplied by the new LA takes
+  precedence over the assumption that the device moved.
+- Inherited keys are provisional until the new LA supplies its own replies.
+  Queue a full `83`/`8C`/`46` identify via the existing manual-pending path,
+  subject to the shared one-second send slot, including in shadow mode.
+  This lets a different device on the same HDMI port or behind a non-CEC
+  switch correct a provisional role through normal key replacement.
+- For `82`-first moves, inherit `verified` and `confirmed_at` from the old
+  entry: the same PA identifies the same HDMI port, so a previously verified
+  role stays continuously mapped even before `84` arrives. `82` does not
+  create or refresh a confirmation; a moved unverified restored entry keeps
+  its cached keys but remains unverified until `84`. Only `84` refreshes
+  `confirmed_at`. Do not transfer restore-reconfirmation flags.
+- Identification retry timing and attempts stay destination-LA-local, with
+  the existing replacement resets; a move queues full identification there.
+  Transfer the old LA's buffered power signals after discarding the destination
+  occupant's signals. Treat already-mapped roles as continuously bound, so a
+  move alone
+  cannot replay an old wake signal and undo a manual standby; unmatched roles
+  still consume their migrated buffered wake when identification completes.
+- Retarget pending standby verification to the new LA, retaining sequence,
+  attempts and deadline but resetting send/ACK/NACK accounting because old
+  results refer to the old target. Discard the destination occupant's pending
+  verification only on a move, not on a plain vendor/OSD replacement; ordinary
+  remapping is handled by verification at its deadline. Presence
+  timers/misses/awaiting flags are role-keyed; the move
+  frame clears awaiting/misses through normal presence reconciliation and the
+  next poll uses the new mapping. Takeover settle and active-role state are
+  also role-keyed and remain intact.
+
 ## 2026-10-26 — Wake frames re-arm identification
 
 - A device waking shortly after service restart can remain restored/unidentified
