@@ -237,6 +237,7 @@ Learning rules (all from received frames; sender = `From`):
 - A fully keyed restored identity may also verify opportunistically after both its stored vendor and OSD have been re-confirmed since restore, in either order. Accept matching `87` and `47` from that LA regardless of destination: devices may address these replies to the receiver rather than the bridge. A single unchanged reply does not reset attempts. This alternative never updates `confirmed_at`; only `84` does. It is unavailable after replacement or if the restored PA/vendor/OSD was missing.
 - A differing PA in `84` or broadcast `82` replaces the LA entry and clears its buffered signals. A PA already held by another LA is an address move: the new LA inherits that entry's keys, power and verification, and the old LA is dropped. If the destination is not being replaced and already has conflicting vendor/OSD keys, only evict the old LA; retain the destination's own identity instead of inheriting. Inherited keys are provisional: queue a full identify (`83`/`8C`/`46`) at the new LA through the shared one-second slot, including in shadow mode. An `82`-first move preserves existing verification and `confirmed_at` without refreshing either; an unverified restored device stays unverified until `84` confirms it. A differing known vendor/OSD clears the other non-PA keys and signals, retains PA only as unverified, and requires fresh `84` confirmation before role matching. Only a move discards destination-occupant standby verification; ordinary key replacement leaves verification cancellation to its deadline.
 - Entries age out of `power = On` only via explicit events or presence polling; never by time alone.
+- Operator `Forget(la)` removes a non-bridge LA entry, its identification retry/manual-query state, buffered power signals and pending standby verification; the removal itself sends no CEC frames. Reject the command while the bridge is warming so deferred role transitions cannot leave an On role unbound. Re-resolve roles; a role losing its binding follows the existing `identity_lost` Off transition and release timer. A newly bound role consumes its latest relevant buffered on/off signal through the normal role transition. Record `command_forget` with no actions. The next persisted state excludes the entry. This local model edit is allowed in shadow mode and does not blacklist the LA: subsequent traffic learns it afresh.
 
 ### 5.2 Identity → role
 A role matches a verified LA entry when every key in its `match` table matches
@@ -329,7 +330,7 @@ Everything else: no reply (Feature Abort is a firmware concern).
 Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT). Entities: `binary_sensor.choregos_<role>` (power, per role), `sensor.choregos_active_source` (role name or `none`), `select.choregos_mode` (shadow/active), `button.choregos_all_off`, `binary_sensor.choregos_bridge` (bridge LWT), `sensor.choregos_conflicts` (count). Commands arrive on `choregos/cmd/<entity>`. State topics `choregos/state/<name>` retained.
 
 ### 5.12 Events into the engine
-`Frame`, `SendResult{to, data, ack}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | ForceIdentify(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`Frame`, `SendResult{to, data, ack}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
 `SendResult` correlates patched `{"Ack":true|false}` bridge results with
 successfully queued `HdmiSend` publishes. Stock `"Done"` / `"Sending failed"`
 and other non-ACK responses consume the FIFO entry without emitting an event:
@@ -346,7 +347,7 @@ command does not establish when the device actually changed state.
 Pages (all behind auth): 
 - `/` Dashboard: mode switch (confirm when going active), bridge status, role cards (name, power, LA/PA, vendor/OSD, last event, "takeover" and "standby" buttons), TV/receiver/Sonos/Kodi HA states, active source, conflicts banner, "all off".
 - `/bus` Live bus: SSE stream of frames (decoded: from/to names, opcode name, operands) interleaved with decisions; filters by LA/opcode; last 2000 kept in memory (ring buffer in `AppState`).
-- `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "send identify" per LA.
+- `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "identify" and confirmed "forget" controls per non-bridge LA.
 - `/decisions` Decision log with reasons and resulting actions (and `would:` entries in shadow mode).
 - `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
@@ -375,9 +376,9 @@ impl AppState {
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }
-pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView>, pub decisions: VecDeque<DecisionView>, pub connections: Health }
+pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView>, pub decisions: VecDeque<DecisionView>, pub connections: Health }
 pub enum UiEvent { Frame(FrameView), Decision(DecisionView) }   // snapshots are pulled via snapshot(), never broadcast
-pub enum Command { AllOff, SetMode(Mode), Identify(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
+pub enum Command { AllOff, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
 
 // src/web/mod.rs  (ui owns; core mounts)
 pub fn router(state: AppState) -> axum::Router;

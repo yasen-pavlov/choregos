@@ -16,7 +16,10 @@
         <td><span class="pill power-{{ view::bus_power(entry.power) }}">{{ view::bus_power(entry.power) }}</span></td>
         <td class="dim">{% if !entry.verified %}restored{% else %}{{ view::ago(entry.last_seen) }}{% endif %}</td>
         <td>{% if let Some(role) = entry.matched_role %}<span class="mono">{{ role }}</span>{% else if entry.identified %}<span class="dim">unmatched</span>{% else %}<span class="warn">unidentified</span>{% endif %}</td>
-        <td><button class="small" hx-post="/actions/identify/{{ entry.logical_address }}" hx-target="#flash">identify</button></td>
+        <td><div class="group">
+          <button class="small" hx-post="/actions/identify/{{ entry.logical_address }}" hx-target="#flash">identify</button>
+          {% if entry.logical_address != snapshot.bridge_logical_address %}<button class="small" hx-post="/actions/forget/{{ entry.logical_address }}" hx-target="#flash" hx-confirm="Forget LA {{ entry.logical_address }}? It will be re-learned if it talks again.">forget</button>{% endif %}
+        </div></td>
       </tr>
       {% else %}
       <tr><td colspan="9" class="empty">No devices seen on the bus yet.</td></tr>

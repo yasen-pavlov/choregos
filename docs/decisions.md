@@ -2,6 +2,29 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-27 — Forget a bus entry from the UI
+
+- A disconnected adapter's learned identity remained restored and unidentified
+  across service restarts, and automatic identification kept querying its stale
+  logical address. Provide an operator-controlled forget action on every
+  non-bridge bus row instead of requiring an offline state-file edit.
+- `Forget(la)` is a local model edit, including in shadow mode: remove the bus
+  entry together with its identification backoff/queued manual query, buffered
+  power signals and pending standby verification. Record `command_forget` with
+  no actions; send no CEC frames. The next state save omits the identity.
+- Recompute identity matching immediately. A role that loses its binding uses
+  the existing `identity_lost` transition: an On role becomes Off, clears its
+  active-role/presence state and starts the normal room-release timer.
+  If forgetting resolves a conflict and binds a role to another LA, replay that
+  LA's latest relevant buffered signal through the normal role transition.
+- Do not blacklist the address: logical addresses can be reused, and later
+  traffic must create a fresh entry and trigger ordinary identification.
+- Reject addresses outside 0–14, the configured bridge address and unknown
+  entries. Also reject forget while the bridge is warming: role transitions
+  are deferred then, so removal could otherwise leave an On role unbound.
+  Publish the configured bridge address in snapshots so the UI hides forget
+  on the bridge even when it uses a nonzero logical address.
+
 ## 2026-10-27 — Native webOS power-off
 
 - After native Wake-on-LAN, the HA webOS integration needed about 30 seconds

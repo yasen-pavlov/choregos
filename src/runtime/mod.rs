@@ -668,6 +668,11 @@ fn push_ring<T>(items: &mut VecDeque<T>, item: T, max: usize) {
 fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandError> {
     let error = match command {
         Command::Identify(la) if *la >= 15 => Some("identify address must be 0–14"),
+        Command::Forget(la) if *la >= 15 => Some("forget address must be 0–14"),
+        Command::Forget(la) if *la == engine.bus.bridge => Some("cannot forget the bridge"),
+        Command::Forget(la) if !engine.bus.entries.contains_key(la) => {
+            Some("unknown logical address")
+        }
         Command::SendRaw { to, data } if *to > 15 || data.is_empty() || data.len() > 14 => {
             Some("invalid CEC destination or payload length")
         }
@@ -680,7 +685,9 @@ fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandErr
         {
             Some("role has an identity conflict")
         }
-        Command::Takeover(_) | Command::Standby(_) | Command::AllOff if engine.warming => {
+        Command::Takeover(_) | Command::Standby(_) | Command::AllOff | Command::Forget(_)
+            if engine.warming =>
+        {
             Some("bridge is warming")
         }
         _ => None,
@@ -778,6 +785,7 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     snapshot.mode = engine.mode();
     snapshot.warming = engine.warming;
     snapshot.bridge_online = engine.bridge_online;
+    snapshot.bridge_logical_address = engine.bus.bridge;
     snapshot.active_role = engine.active_role.clone();
     snapshot.conflicts = engine.identity.conflicts.clone();
     snapshot.connections.bridge_online = engine.bridge_online;
@@ -957,6 +965,98 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn forget_rejects_invalid_bridge_and_unknown_addresses_but_allows_restored_entries() {
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let now = Instant::now();
+        let mut engine = Engine::new(config, now, vec![]);
+        for (la, message) in [
+            (15, "forget address must be 0–14"),
+            (u8::MAX, "forget address must be 0–14"),
+            (engine.bus.bridge, "cannot forget the bridge"),
+            (3, "unknown logical address"),
+        ] {
+            let error = validate_command(&Command::Forget(la), &engine).unwrap_err();
+            assert_eq!(error.to_string(), format!("invalid command: {message}"));
+        }
+        engine.bus.restore(
+            vec![LearnedIdentity {
+                la: 3,
+                physical: Some(0x2500),
+                vendor: Some(0x123456),
+                osd: Some("Disconnected adapter".into()),
+                device_type: Some(3),
+                confirmed_at: Utc::now(),
+            }],
+            now,
+        );
+        assert!(engine.warming);
+        assert_eq!(engine.mode(), Mode::Shadow);
+        assert_eq!(
+            validate_command(&Command::Forget(3), &engine)
+                .unwrap_err()
+                .to_string(),
+            "invalid command: bridge is warming"
+        );
+        engine.handle(Event::Tick, now + Duration::from_secs(3), Utc::now());
+        assert!(!engine.warming);
+        assert!(validate_command(&Command::Forget(3), &engine).is_ok());
+    }
+
+    #[test]
+    fn forgetting_an_identity_invalidates_and_removes_it_from_the_next_saved_state() {
+        let now = Instant::now();
+        let wall: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let identities = [(3, 0x2500), (4, 0x2100)]
+            .into_iter()
+            .map(|(la, physical)| LearnedIdentity {
+                la,
+                physical: Some(physical),
+                vendor: Some(0x123456),
+                osd: Some("CEC adapter".into()),
+                device_type: Some(3),
+                confirmed_at: wall,
+            })
+            .collect();
+        let mut engine = Engine::new(config, now, identities);
+        let decisions = VecDeque::new();
+        let saved = PersistedState::capture(&engine, &decisions);
+        assert_eq!(saved.identities.len(), 2);
+        assert!(PersistedState::identities_match(&saved.identities, &engine));
+
+        engine.handle(Event::Command(Command::Forget(3)), now, wall);
+        assert!(!PersistedState::identities_match(
+            &saved.identities,
+            &engine
+        ));
+        let next = PersistedState::capture(&engine, &decisions);
+        assert!(PersistedState::identities_match(&next.identities, &engine));
+        assert_eq!(
+            next.identities
+                .iter()
+                .map(|identity| identity.la)
+                .collect::<Vec<_>>(),
+            [4]
+        );
+    }
+
+    #[test]
+    fn snapshots_expose_the_configured_bridge_address_and_refresh_it_after_reload() {
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.bridge.logical_address = 14;
+        let state = AppState::new(config.clone(), String::new());
+        let mut snapshot = state.snapshot();
+        assert_eq!(snapshot.bridge_logical_address, 14);
+
+        let now = Instant::now();
+        let mut engine = Engine::new(config.clone(), now, vec![]);
+        config.bridge.logical_address = 0;
+        engine.handle(Event::ConfigReloaded(Arc::new(config)), now, Utc::now());
+        update_snapshot(&mut snapshot, &engine, now, Utc::now());
+        assert_eq!(snapshot.bridge_logical_address, 0);
     }
 }
 
