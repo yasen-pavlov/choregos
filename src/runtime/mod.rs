@@ -2,6 +2,7 @@ pub mod cli;
 pub mod executor;
 pub mod ha;
 pub mod mqtt;
+pub mod webos;
 pub mod wol;
 
 use crate::{
@@ -704,6 +705,10 @@ fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError>
             "tv.wake",
             toml::to_string(&config.tv.wake)? != toml::to_string(&current.tv.wake)?,
         ),
+        (
+            "tv.off",
+            toml::to_string(&config.tv.off)? != toml::to_string(&current.tv.off)?,
+        ),
     ] {
         if changed {
             return Err(ConfigError::Validation(format!(
@@ -969,7 +974,7 @@ mod review_tests {
         let current = config();
         persist(&current, &path).await.unwrap();
         let original = tokio::fs::read_to_string(&path).await.unwrap();
-        for kind in 0..5 {
+        for kind in 0..6 {
             let mut changed = current.clone();
             match kind {
                 0 => changed.web.public_url = "https://other.example.com".into(),
@@ -980,6 +985,13 @@ mod review_tests {
                         url: "https://wake.other.example.com".into(),
                         header: "Authorization".into(),
                         token_env: "CHOREGOS_LOCAL_PASSWORD".into(),
+                    }
+                }
+                4 => {
+                    changed.tv.off = crate::config::TvOffConfig::Webos {
+                        host: "tv.other.example.com".into(),
+                        port: 3001,
+                        key_env: "CHOREGOS_LOCAL_PASSWORD".into(),
                     }
                 }
                 _ => changed.mqtt.username = "other".into(),

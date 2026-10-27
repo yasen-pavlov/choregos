@@ -37,6 +37,7 @@ pub enum Action {
         data: Vec<u8>,
     },
     WakeTv,
+    TvOff,
     HaCall {
         domain: String,
         service: String,
@@ -69,4 +70,17 @@ pub struct Decision {
     pub to: Option<RolePower>,
     pub reason: String,
     pub actions: Vec<Action>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tv_off_has_a_redacted_transport_independent_action() {
+        let serialized = serde_json::to_string(&Action::TvOff).unwrap();
+        assert_eq!(serialized, r#"{"kind":"tv_off"}"#);
+        assert!(!Action::TvOff.allowed_in_shadow());
+        println!("{serialized}");
+    }
 }

@@ -153,12 +153,16 @@ fn capture_replays_power_release_and_both_volume_branches() {
         let off = effects
             .iter()
             .enumerate()
-            .find(|(index, action)| *index > preset && service(action, "turn_off"))
+            .find(|(index, action)| *index > preset && **action == Action::TvOff)
             .map(|(index, _)| index)
             .unwrap();
-        assert!(effects[..wake].iter().any(|a| service(a, "turn_off")));
+        assert!(effects[..wake].contains(&Action::TvOff));
         assert!(wake < receiver_on && receiver_on < select && select < preset && preset < off);
-        assert_eq!(effects.iter().filter(|a| service(a, "turn_off")).count(), 4); // Kodi release, then streamer release.
+        assert_eq!(effects.iter().filter(|a| **a == Action::TvOff).count(), 2);
+        assert_eq!(effects.iter().filter(|a| service(a, "turn_off")).count(), 2); // Each release powers off the TV natively and the receiver through HA.
+        assert!(effects.iter().filter(|a| service(a, "turn_off")).all(
+            |a| matches!(a, Action::HaCall { entity, .. } if entity == &engine.config.receiver.entity)
+        ));
         let volume_count = effects
             .iter()
             .filter(|a| service(a, "volume_up") || service(a, "volume_down"))
@@ -904,7 +908,7 @@ fn off_timer_is_cancelled_by_wake() {
         !engine
             .handle(Event::Tick, now + Duration::from_secs(5), wall())
             .iter()
-            .any(|a| service(a, "turn_off"))
+            .any(|a| *a == Action::TvOff || service(a, "turn_off"))
     );
 }
 
@@ -1150,10 +1154,13 @@ fn switching_to_shadow_keeps_pending_timer_but_suppresses_its_effects() {
     );
     let actions = engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
     assert_eq!(actions.len(), 2);
-    assert!(
-        actions
-            .iter()
-            .all(|a| service(a, "turn_off") && suppressed(engine.mode(), a))
+    assert!(actions.iter().all(|a| suppressed(engine.mode(), a)));
+    assert_eq!(
+        actions,
+        [
+            Action::TvOff,
+            Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
+        ]
     );
 }
 
@@ -1168,7 +1175,21 @@ fn taken_over_sources_cannot_hold_the_room_on_without_standby_reports() {
     assert!(engine.decisions.iter().any(|d| d.reason == "taken_over"));
     frame(&mut engine, now + Duration::from_secs(1), 4, 0, "36");
     let actions = engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
-    assert_eq!(actions.iter().filter(|a| service(a, "turn_off")).count(), 2);
+    assert_eq!(
+        actions,
+        [
+            Action::Identify {
+                la: 1,
+                queries: IdentifyQueries {
+                    physical: true,
+                    vendor: true,
+                    osd: false
+                },
+            },
+            Action::TvOff,
+            Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
+        ]
+    );
 }
 
 #[test]
@@ -1212,11 +1233,12 @@ fn a_physical_device_reclaiming_another_la_evicts_the_old_identity() {
     assert_eq!(engine.identity.roles["streamer"], 8);
     frame(&mut engine, now + Duration::from_secs(2), 8, 0, "04");
     frame(&mut engine, now + Duration::from_secs(3), 8, 0, "36");
-    assert!(
-        engine
-            .handle(Event::Tick, now + Duration::from_secs(6), wall())
-            .iter()
-            .any(|a| service(a, "turn_off"))
+    assert_eq!(
+        engine.handle(Event::Tick, now + Duration::from_secs(6), wall()),
+        [
+            Action::TvOff,
+            Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
+        ]
     );
 }
 
@@ -1234,12 +1256,19 @@ fn unrelated_conflicts_do_not_cancel_takeover_settle_or_release() {
     assert!(settled.iter().any(|a| service(a, "select_source")));
     frame(&mut engine, now + Duration::from_secs(3), 4, 0, "36");
     assert_eq!(
-        engine
-            .handle(Event::Tick, now + Duration::from_secs(6), wall())
-            .iter()
-            .filter(|a| service(a, "turn_off"))
-            .count(),
-        2
+        engine.handle(Event::Tick, now + Duration::from_secs(6), wall()),
+        [
+            Action::Identify {
+                la: 11,
+                queries: IdentifyQueries {
+                    physical: false,
+                    vendor: false,
+                    osd: true
+                },
+            },
+            Action::TvOff,
+            Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
+        ]
     );
 }
 
@@ -1259,7 +1288,13 @@ fn retained_online_defers_but_preserves_both_pending_timer_classes() {
     frame(&mut engine, now + Duration::from_secs(5), 4, 0, "36");
     engine.handle(Event::BridgeOnline, now + Duration::from_secs(6), wall());
     let off = engine.handle(Event::Tick, now + Duration::from_secs(9), wall());
-    assert_eq!(off.iter().filter(|a| service(a, "turn_off")).count(), 2);
+    assert_eq!(
+        off,
+        [
+            Action::TvOff,
+            Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
+        ]
+    );
 }
 
 #[test]
@@ -2352,10 +2387,11 @@ fn logical_address_move_keeps_role_on_without_off_timer() {
         wall(),
     );
     assert_eq!(
-        off.iter()
-            .filter(|action| service(action, "turn_off"))
-            .count(),
-        2
+        off,
+        [
+            Action::TvOff,
+            Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
+        ]
     );
 }
 
@@ -2739,7 +2775,11 @@ fn console_address_hop_during_receiver_power_up_keeps_room_on() {
     );
     let after_delay = moved_at + Duration::from_secs(engine.config.timing.off_delay_s + 1);
     let actions = engine.handle(Event::Tick, after_delay, wall());
-    assert!(actions.iter().all(|action| !service(action, "turn_off")));
+    assert!(
+        actions
+            .iter()
+            .all(|action| *action != Action::TvOff && !service(action, "turn_off"))
+    );
     assert_console_move_retained(&engine);
     reasons.extend(
         engine
