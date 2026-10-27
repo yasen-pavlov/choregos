@@ -2279,3 +2279,537 @@ fn active_source_flapping_rearms_at_most_once_per_base_interval() {
         "identification queries exceeded the base-interval bound: {query_times:?}",
     );
 }
+
+fn console_before_address_move() -> (Engine, Instant) {
+    let (mut engine, now) = setup();
+    let console = std::sync::Arc::make_mut(&mut engine.config)
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_b")
+        .unwrap();
+    console.matches.osd = Some("Console B".into());
+    let mut restored = restored_identity(11, 0x2300);
+    restored.vendor = Some(0x0009bf);
+    restored.osd = Some("Console A".into());
+    engine.bus.restore(vec![restored], now);
+    // A signal buffered for the previous destination occupant must not follow it.
+    frame(&mut engine, now, 11, 0, "36");
+    frame(&mut engine, now, 8, 15, "84240004");
+    frame(&mut engine, now, 8, 15, "87080046");
+    frame(&mut engine, now, 8, 0, "47436F6E736F6C652042");
+    frame(&mut engine, now, 8, 0, "0D");
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    engine.handle(Event::Tick, now + Duration::from_secs(2), wall());
+    (engine, now + Duration::from_secs(3))
+}
+
+fn assert_console_move_retained(engine: &Engine) {
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert_eq!(engine.identity.roles["console_b"], 11);
+    assert!(!engine.bus.entries.contains_key(&8));
+    assert!(engine.bus.entries[&11].verified);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .all(|decision| { decision.reason != "identity_lost" && decision.to.is_none() }),
+        "{:?}",
+        engine.decisions
+    );
+}
+
+#[test]
+fn logical_address_move_keeps_role_on_without_off_timer() {
+    let (mut engine, now) = console_before_address_move();
+    assert_eq!(
+        frame(&mut engine, now, 11, 15, "84240004"),
+        vec![Action::Identify {
+            la: 11,
+            queries: IdentifyQueries::ALL
+        }]
+    );
+    assert_console_move_retained(&engine);
+    let entry = &engine.bus.entries[&11];
+    assert_eq!(entry.vendor, Some(0x080046));
+    assert_eq!(entry.osd.as_deref(), Some("Console B"));
+    assert_eq!(entry.device_type, Some(4));
+    assert_eq!(entry.power, BusPower::On);
+    assert_eq!(entry.last_seen, Some(now));
+    assert_eq!(entry.confirmed_at, Some(wall()));
+    assert!(entry.identified);
+    for data in ["87080046", "47436F6E736F6C652042"] {
+        assert!(frame(&mut engine, now + Duration::from_secs(1), 11, 0, data).is_empty());
+        assert_console_move_retained(&engine);
+    }
+    let after_delay = now + Duration::from_secs(engine.config.timing.off_delay_s + 1);
+    assert!(engine.handle(Event::Tick, after_delay, wall()).is_empty());
+    assert_console_move_retained(&engine);
+    frame(&mut engine, after_delay, 11, 0, "36");
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    let off = engine.handle(
+        Event::Tick,
+        after_delay + Duration::from_secs(engine.config.timing.off_delay_s),
+        wall(),
+    );
+    assert_eq!(
+        off.iter()
+            .filter(|action| service(action, "turn_off"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn logical_address_move_via_active_source_keeps_role() {
+    let (mut engine, now) = console_before_address_move();
+    // Active Source inherits existing verification without inventing a confirmation.
+    let confirmed = engine.bus.entries[&8].confirmed_at;
+    assert_eq!(
+        frame(&mut engine, now, 11, 15, "822400"),
+        vec![Action::Identify {
+            la: 11,
+            queries: IdentifyQueries::ALL
+        }]
+    );
+    assert_console_move_retained(&engine);
+    assert_eq!(engine.bus.entries[&11].confirmed_at, confirmed);
+    assert_eq!(engine.bus.active_source, Some(0x2400));
+    engine.handle(Event::Tick, now + Duration::from_millis(500), wall());
+    assert_console_move_retained(&engine);
+    frame(
+        &mut engine,
+        now + Duration::from_secs(1),
+        11,
+        15,
+        "84240004",
+    );
+    assert_console_move_retained(&engine);
+    let after_delay = now + Duration::from_secs(engine.config.timing.off_delay_s + 1);
+    assert!(engine.handle(Event::Tick, after_delay, wall()).is_empty());
+    assert_console_move_retained(&engine);
+}
+
+#[test]
+fn same_physical_address_from_a_different_device_still_replaces() {
+    for changed_key in ["870009BF", "47436F6E736F6C652041"] {
+        let (mut engine, now) = console_before_address_move();
+        frame(&mut engine, now, 11, 15, "84240004");
+        frame(
+            &mut engine,
+            now + Duration::from_secs(1),
+            11,
+            0,
+            changed_key,
+        );
+        let entry = &engine.bus.entries[&11];
+        assert_eq!(entry.physical, Some(0x2400));
+        assert!(!entry.verified);
+        assert_eq!(entry.power, BusPower::Unknown);
+        assert_eq!(entry.confirmed_at, None);
+        assert!(entry.vendor.is_none() || entry.osd.is_none());
+        assert!(!engine.identity.roles.contains_key("console_b"));
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert!(
+            engine
+                .decisions
+                .iter()
+                .any(|decision| decision.reason == "identity_lost")
+        );
+    }
+}
+
+#[test]
+fn logical_address_move_preserves_unmatched_buffered_wake() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 8, 15, "84220001");
+    frame(&mut engine, now, 8, 0, "04");
+    assert!(!engine.identity.roles.contains_key("kodi"));
+    frame(
+        &mut engine,
+        now + Duration::from_secs(1),
+        11,
+        15,
+        "84220001",
+    );
+    assert_eq!(engine.bus.entries[&11].power, BusPower::On);
+    frame(
+        &mut engine,
+        now + Duration::from_secs(2),
+        11,
+        0,
+        "474B6F6469",
+    );
+    assert_eq!(engine.identity.roles["kodi"], 11);
+    assert_eq!(engine.roles["kodi"].power, RolePower::On);
+}
+
+#[test]
+fn logical_address_move_from_restored_identity_waits_for_physical_verification() {
+    for move_frame in ["84210004", "822100"] {
+        let (mut engine, now) = setup();
+        engine.bus.restore(vec![restored_identity(8, 0x2100)], now);
+        frame(&mut engine, now, 8, 0, "04");
+        frame(
+            &mut engine,
+            now + Duration::from_secs(1),
+            11,
+            15,
+            move_frame,
+        );
+        assert!(!engine.bus.entries.contains_key(&8));
+        assert_eq!(engine.bus.entries[&11].vendor, Some(0x0010fa));
+        assert_eq!(engine.bus.entries[&11].osd.as_deref(), Some("Streamer"));
+        if move_frame == "822100" {
+            assert!(!engine.bus.entries[&11].verified);
+            assert!(!engine.identity.roles.contains_key("streamer"));
+            assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+            frame(
+                &mut engine,
+                now + Duration::from_secs(2),
+                11,
+                15,
+                "84210004",
+            );
+        }
+        assert!(engine.bus.entries[&11].verified);
+        assert_eq!(engine.identity.roles["streamer"], 11);
+        assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    }
+}
+
+#[test]
+fn logical_address_move_retargets_pending_standby_without_replaying_wake() {
+    let (mut engine, now) = console_before_address_move();
+    engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
+    engine.handle(
+        Event::Command(Command::Standby("console_b".into())),
+        now,
+        wall(),
+    );
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    frame(
+        &mut engine,
+        now + Duration::from_secs(1),
+        11,
+        15,
+        "84240004",
+    );
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .all(|decision| decision.to.is_none())
+    );
+    // Late replies to the old address must not count against the new target.
+    engine.handle(
+        Event::SendResult {
+            to: 8,
+            data: vec![0x36],
+            ack: false,
+        },
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    let retry_at = now + Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    let retry = engine.handle(Event::Tick, retry_at, wall());
+    assert_eq!(
+        retry,
+        vec![
+            Action::CecSend {
+                to: 11,
+                data: vec![0x36]
+            },
+            Action::CecSend {
+                to: 11,
+                data: vec![0x8f]
+            },
+        ]
+    );
+    frame(&mut engine, retry_at, 11, 0, "9000");
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    frame(&mut engine, retry_at, 11, 0, "9001");
+    let after = retry_at + Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    let actions = engine.handle(Event::Tick, after, wall());
+    assert!(
+        actions
+            .iter()
+            .all(|action| !matches!(action, Action::CecSend { .. }))
+    );
+    assert_no_standby_decision(&engine, "console_b");
+}
+
+#[test]
+fn logical_address_move_keeps_presence_polling_on_the_new_address() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 8, 15, "84230004");
+    let interval = Duration::from_secs(engine.config.timing.presence_poll_s);
+    engine.handle(Event::Tick, now + interval, wall());
+    // The move is also a presence reply, clearing the old outstanding probe.
+    frame(
+        &mut engine,
+        now + interval + Duration::from_secs(1),
+        11,
+        15,
+        "84230004",
+    );
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    let actions = engine.handle(Event::Tick, now + interval * 2, wall());
+    assert!(actions.contains(&Action::PresencePoll { la: 11 }));
+    assert!(!actions.contains(&Action::PresencePoll { la: 8 }));
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+}
+
+#[test]
+fn moved_identity_is_corrected_when_the_new_address_reports_a_different_vendor() {
+    let (mut engine, now) = console_before_address_move();
+    // The new LA has not supplied any keys yet: keep the room on provisionally.
+    let actions = frame(&mut engine, now, 4, 15, "84240004");
+    assert_eq!(engine.identity.roles["console_b"], 4);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert_eq!(
+        actions,
+        vec![Action::Identify {
+            la: 4,
+            queries: IdentifyQueries::ALL
+        }]
+    );
+    assert!(engine.decisions.is_empty());
+    let actions = frame(&mut engine, now + Duration::from_secs(1), 4, 15, "870010FA");
+    assert!(actions.is_empty());
+    assert!(!engine.identity.roles.contains_key("console_b"));
+    assert!(!engine.identity.roles.contains_key("streamer"));
+    assert!(!engine.bus.entries[&4].verified);
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .map(|decision| (
+                decision.role.as_deref(),
+                decision.from,
+                decision.to,
+                decision.reason.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            Some("console_b"),
+            Some(RolePower::On),
+            Some(RolePower::Off),
+            "identity_lost"
+        )]
+    );
+    frame(&mut engine, now + Duration::from_secs(2), 4, 15, "84240004");
+    assert_eq!(engine.identity.roles["streamer"], 4);
+    assert!(!engine.identity.roles.contains_key("console_b"));
+    assert!(engine.decisions.is_empty());
+}
+
+#[test]
+fn destination_identity_keys_prevent_inheritance_without_physical_replacement() {
+    for key in ["870010FA", "4753747265616D6572"] {
+        let (mut engine, now) = console_before_address_move();
+        frame(&mut engine, now, 4, 15, key);
+        frame(&mut engine, now + Duration::from_secs(1), 4, 15, "84240004");
+        assert!(!engine.bus.entries.contains_key(&8));
+        assert!(!engine.identity.roles.contains_key("console_b"));
+        let entry = &engine.bus.entries[&4];
+        assert!(entry.verified);
+        assert_eq!(entry.power, BusPower::Unknown);
+        if key == "870010FA" {
+            assert_eq!(entry.vendor, Some(0x0010fa));
+            assert_eq!(entry.osd, None);
+            assert_eq!(engine.identity.roles["streamer"], 4);
+        } else {
+            assert_eq!(entry.osd.as_deref(), Some("Streamer"));
+            assert_eq!(entry.vendor, None);
+        }
+        assert_eq!(
+            engine
+                .decisions
+                .iter()
+                .map(|decision| decision.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["identity_lost"]
+        );
+    }
+}
+
+#[test]
+fn retarget_after_last_standby_retry_clears_old_address_send_accounting() {
+    for acked in [false, true] {
+        let (mut engine, now) = console_before_address_move();
+        engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
+        let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+        let retries = engine.config.timing.standby_retries;
+        engine.handle(
+            Event::Command(Command::Standby("console_b".into())),
+            now,
+            wall(),
+        );
+        for round in 0..=retries {
+            let sent_at = now + settle * u32::from(round);
+            if round > 0 {
+                engine.handle(Event::Tick, sent_at, wall());
+            }
+            for opcode in [0x36, 0x8f] {
+                engine.handle(
+                    Event::SendResult {
+                        to: 8,
+                        data: vec![opcode],
+                        ack: acked,
+                    },
+                    sent_at,
+                    wall(),
+                );
+            }
+        }
+        let last_retry = now + settle * u32::from(retries);
+        frame(
+            &mut engine,
+            last_retry + Duration::from_millis(1),
+            11,
+            15,
+            "84240004",
+        );
+        engine.handle(Event::Tick, last_retry + settle, wall());
+        assert_eq!(
+            engine
+                .decisions
+                .iter()
+                .filter(|decision| decision.role.as_deref() == Some("console_b"))
+                .map(|decision| decision.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["standby_unconfirmed"]
+        );
+    }
+}
+
+#[test]
+fn console_address_hop_during_receiver_power_up_keeps_room_on() {
+    let now = Instant::now();
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    config
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_b")
+        .unwrap()
+        .matches
+        .osd = Some("Console B".into());
+    let mut restored = restored_identity(11, 0x2300);
+    restored.vendor = Some(0x0009bf);
+    restored.osd = Some("Console A".into());
+    let mut engine = Engine::new(config, now, vec![restored]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    let mut reasons = Vec::new();
+    for data in ["84240004", "87080046", "47436F6E736F6C652042"] {
+        frame(&mut engine, now, 8, 15, data);
+        reasons.extend(
+            engine
+                .decisions
+                .iter()
+                .map(|decision| decision.reason.clone()),
+        );
+    }
+    let actions = frame(&mut engine, now, 8, 0, "0D");
+    assert!(actions.contains(&Action::WakeTv));
+    assert!(actions.iter().any(|action| service(action, "turn_on")));
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    reasons.extend(
+        engine
+            .decisions
+            .iter()
+            .map(|decision| decision.reason.clone()),
+    );
+    let settled_at = now + Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    engine.handle(Event::Tick, settled_at, wall());
+    reasons.extend(
+        engine
+            .decisions
+            .iter()
+            .map(|decision| decision.reason.clone()),
+    );
+    let moved_at = settled_at + Duration::from_secs(1);
+    frame(&mut engine, moved_at, 11, 15, "84240004");
+    assert_console_move_retained(&engine);
+    reasons.extend(
+        engine
+            .decisions
+            .iter()
+            .map(|decision| decision.reason.clone()),
+    );
+    let after_delay = moved_at + Duration::from_secs(engine.config.timing.off_delay_s + 1);
+    let actions = engine.handle(Event::Tick, after_delay, wall());
+    assert!(actions.iter().all(|action| !service(action, "turn_off")));
+    assert_console_move_retained(&engine);
+    reasons.extend(
+        engine
+            .decisions
+            .iter()
+            .map(|decision| decision.reason.clone()),
+    );
+    for data in ["87080046", "47436F6E736F6C652042", "822400"] {
+        frame(&mut engine, after_delay, 11, 15, data);
+        assert_console_move_retained(&engine);
+        reasons.extend(
+            engine
+                .decisions
+                .iter()
+                .map(|decision| decision.reason.clone()),
+        );
+    }
+    assert_eq!(reasons, vec!["TextViewOn", "takeover_settled"]);
+}
+
+#[test]
+fn retargeted_standby_does_not_keep_old_address_acknowledgements() {
+    let (mut engine, now) = console_before_address_move();
+    engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
+    engine.handle(
+        Event::Command(Command::Standby("console_b".into())),
+        now,
+        wall(),
+    );
+    engine.handle(
+        Event::SendResult {
+            to: 8,
+            data: vec![0x36],
+            ack: true,
+        },
+        now,
+        wall(),
+    );
+    frame(
+        &mut engine,
+        now + Duration::from_secs(1),
+        11,
+        15,
+        "84240004",
+    );
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    let retries = engine.config.timing.standby_retries;
+    for round in 1..=retries {
+        let sent_at = now + settle * u32::from(round);
+        engine.handle(Event::Tick, sent_at, wall());
+        for opcode in [0x36, 0x8f] {
+            engine.handle(
+                Event::SendResult {
+                    to: 11,
+                    data: vec![opcode],
+                    ack: false,
+                },
+                sent_at,
+                wall(),
+            );
+        }
+    }
+    engine.handle(Event::Tick, now + settle * (u32::from(retries) + 1), wall());
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .filter(|decision| decision.role.as_deref() == Some("console_b"))
+            .map(|decision| decision.reason.as_str())
+            .collect::<Vec<_>>(),
+        vec!["standby_target_absent"]
+    );
+}

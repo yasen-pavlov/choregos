@@ -66,6 +66,21 @@ impl BusEntry {
             manual_pending: false,
         }
     }
+
+    fn inherit_device(&mut self, moved: Self) {
+        self.physical = moved.physical;
+        self.vendor = moved.vendor;
+        self.osd = moved.osd;
+        self.device_type = moved.device_type;
+        self.power = moved.power;
+        self.verified = moved.verified;
+        self.confirmed_at = moved.confirmed_at;
+        // Scheduling stays LA-local, but inherited keys need fresh replies here.
+        self.manual_pending = true;
+        self.restore_reconfirmation = false;
+        self.vendor_reconfirmed = false;
+        self.osd_reconfirmed = false;
+    }
 }
 
 pub struct BusModel {
@@ -243,14 +258,39 @@ impl BusModel {
             })
             .min()
     }
-    fn evict_physical_duplicates(&mut self, frame: &Frame) {
-        if (frame.opcode == Some(REPORT_PHYSICAL_ADDRESS) && frame.params.len() >= 3)
-            || (frame.opcode == Some(ACTIVE_SOURCE) && frame.params.len() == 2 && frame.to == 15)
+    fn physical_duplicate_from(&self, frame: &Frame) -> Option<u8> {
+        if frame.from < 15
+            && ((frame.opcode == Some(REPORT_PHYSICAL_ADDRESS) && frame.params.len() >= 3)
+                || (frame.opcode == Some(ACTIVE_SOURCE)
+                    && frame.params.len() == 2
+                    && frame.to == 15))
         {
-            let physical = frame.physical();
-            self.entries
-                .retain(|&la, entry| la == frame.from || entry.physical != physical);
+            self.entries.iter().find_map(|(&la, entry)| {
+                (la != frame.from && entry.physical == frame.physical()).then_some(la)
+            })
+        } else {
+            None
         }
+    }
+
+    fn accepts_address_move(&self, frame: &Frame, previous_la: u8) -> bool {
+        self.replaces_identity(frame)
+            || self.entries.get(&frame.from).is_none_or(|destination| {
+                let moved = &self.entries[&previous_la];
+                (destination.vendor.is_none() || destination.vendor == moved.vendor)
+                    && (destination.osd.is_none() || destination.osd == moved.osd)
+            })
+    }
+
+    pub(crate) fn address_move_from(&self, frame: &Frame) -> Option<u8> {
+        self.physical_duplicate_from(frame)
+            .filter(|&la| self.accepts_address_move(frame, la))
+    }
+
+    fn evict_physical_duplicates(&mut self, frame: &Frame) -> Option<BusEntry> {
+        let previous_la = self.physical_duplicate_from(frame)?;
+        let inherit = self.accepts_address_move(frame, previous_la);
+        self.entries.remove(&previous_la).filter(|_| inherit)
     }
 
     fn replace_entry(
@@ -361,13 +401,16 @@ impl BusModel {
         }
         let replaces = self.replaces_identity(frame);
         let wake = self.is_wake_frame(frame);
-        self.evict_physical_duplicates(frame);
+        let moved = self.evict_physical_duplicates(frame);
         let entry = self
             .entries
             .entry(frame.from)
             .or_insert_with(|| BusEntry::new(now));
         if replaces {
             Self::replace_entry(entry, frame, now, &mut self.active_source);
+        }
+        if let Some(moved) = moved {
+            entry.inherit_device(moved);
         }
         entry.last_seen = Some(now);
         let learned_key = !replaces && Self::learned_key(entry, frame);
