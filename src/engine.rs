@@ -312,7 +312,10 @@ impl Engine {
 
     fn handle_frame(&mut self, frame: Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
         let mut previous_roles = self.identity.roles.clone();
-        if let Some(previous_la) = self.prepare_address_change(&frame) {
+        let keep_running = previous_roles
+            .iter()
+            .any(|(role, &la)| la == frame.from && self.roles[role].power == RolePower::On);
+        if let Some(previous_la) = self.prepare_address_change(&frame, keep_running) {
             // A continuous role binding must not replay its historical wake signals.
             for la in previous_roles.values_mut() {
                 if *la == previous_la {
@@ -320,15 +323,21 @@ impl Engine {
                 }
             }
         }
-        let mut actions = self.learn_frame(&frame, now, wall);
+        let mut actions = self.learn_frame(&frame, now, wall, keep_running);
         self.reconcile_frame_roles(&previous_roles, &frame, now, &mut actions);
         actions.extend(self.fake_tv(&frame));
         self.forward_volume(&frame, &mut actions);
         actions
     }
 
-    fn learn_frame(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
-        let actions = self.bus.handle(frame, now, wall);
+    fn learn_frame(
+        &mut self,
+        frame: &Frame,
+        now: Instant,
+        wall: DateTime<Utc>,
+        keep_running: bool,
+    ) -> Vec<Action> {
+        let actions = self.bus.handle(frame, now, wall, keep_running);
         self.signals
             .retain(|la, _| self.bus.entries.contains_key(la));
         if self.warming
@@ -350,9 +359,9 @@ impl Engine {
         actions
     }
 
-    fn prepare_address_change(&mut self, frame: &Frame) -> Option<u8> {
+    fn prepare_address_change(&mut self, frame: &Frame, keep_running: bool) -> Option<u8> {
         let moved_from = self.bus.address_move_from(frame);
-        if self.bus.replaces_identity(frame) || moved_from.is_some() {
+        if self.bus.replaces_identity(frame, keep_running) || moved_from.is_some() {
             self.signals.remove(&frame.from);
         }
         if let Some(previous_la) = moved_from {
