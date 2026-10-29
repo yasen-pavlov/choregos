@@ -2,6 +2,38 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-29 — Physical address changes keep the role
+
+- During receiver power-up, a running console at LA 8 announced PA 2.3.0.0,
+  temporarily changed to 1.0.0.0, then returned to 2.3.0.0. Replacing its
+  entry on each change erased vendor/OSD and briefly lost its role binding.
+  The second identity gap exceeded the release delay, switching off the room
+  while the console was still running; later identity traffic woke it again.
+- Treat a differing PA in `84` (at least three operands) or broadcast `82`
+  (exactly two operands) as a same-device PA change only for a verified,
+  non-bridge entry below LA 15 with both vendor and OSD known, bound to a role
+  that is currently On. Keep its keys, power, buffered signals and pending
+  standby verification. Update PA and last-seen time; take device type from
+  `84`, and remap active_source when it held the old PA. `84` refreshes
+  verification and confirmation time as usual; `82` does not. Unknown keys,
+  bridge traffic and unverified restored entries retain replacement behavior:
+  stale cache keys are not evidence of bus identity.
+- Continuity is needed only for a running device. An Off role at a reused LA
+  provides no same-device evidence. Keep its replace → buffer → rebind path,
+  so a new device's PA announcement cannot wake the previous occupant's role
+  before its differing vendor/OSD replies identify the actual new device.
+- Retained keys are provisional, not an assertion that a logical address can
+  never be reused. Queue all identity queries through the existing manual
+  pending path and shared one-second slot, including in shadow mode. A
+  differing vendor or OSD reply still invokes ordinary replacement, clearing
+  the other keys and requiring fresh PA verification before role matching.
+  This is the same safety argument as provisional keys during an LA move.
+- Detect another LA already holding the announced PA first; existing
+  address-move inheritance and verification retargeting take precedence.
+  Vendor/OSD-matched roles remain bound through a same-device PA change.
+  A physical-matched role may legitimately unbind and start release because
+  its configured identity key is the PA itself; it can rebind when PA returns.
+
 ## 2026-10-27 — Forget a bus entry from the UI
 
 - A disconnected adapter's learned identity remained restored and unidentified

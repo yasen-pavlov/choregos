@@ -83,6 +83,13 @@ impl BusEntry {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityChange {
+    None,
+    Physical,
+    Replace,
+}
+
 pub struct BusModel {
     pub entries: BTreeMap<u8, BusEntry>,
     pub active_source: Option<u16>,
@@ -174,17 +181,45 @@ impl BusModel {
         entry.manual_pending = true;
         self.identify(la, now).into_iter().collect()
     }
-    pub fn replaces_identity(&self, frame: &Frame) -> bool {
-        let Some(entry) = self.entries.get(&frame.from) else {
-            return false;
-        };
+    pub fn replaces_identity(&self, frame: &Frame, keep_running: bool) -> bool {
+        self.identity_change(frame, keep_running) == IdentityChange::Replace
+    }
+
+    fn reports_physical(frame: &Frame) -> bool {
         match frame.opcode {
-            Some(REPORT_PHYSICAL_ADDRESS) if frame.params.len() >= 3 => {
-                entry.physical.is_some() && entry.physical != frame.physical()
-            }
-            Some(ACTIVE_SOURCE) if frame.params.len() == 2 && frame.to == 15 => {
-                entry.physical.is_some() && entry.physical != frame.physical()
-            }
+            Some(REPORT_PHYSICAL_ADDRESS) => frame.params.len() >= 3,
+            Some(ACTIVE_SOURCE) => frame.params.len() == 2 && frame.to == 15,
+            _ => false,
+        }
+    }
+
+    fn physical_changed(&self, frame: &Frame) -> bool {
+        Self::reports_physical(frame)
+            && self
+                .entries
+                .get(&frame.from)
+                .is_some_and(|entry| entry.physical.is_some() && entry.physical != frame.physical())
+    }
+
+    fn identity_change(&self, frame: &Frame, keep_running: bool) -> IdentityChange {
+        let Some(entry) = self.entries.get(&frame.from) else {
+            return IdentityChange::None;
+        };
+        // Address moves take precedence over continuity at the destination LA.
+        if self.physical_changed(frame) {
+            return if keep_running
+                && frame.from != self.bridge
+                && entry.verified
+                && entry.vendor.is_some()
+                && entry.osd.is_some()
+                && self.physical_duplicate_from(frame).is_none()
+            {
+                IdentityChange::Physical
+            } else {
+                IdentityChange::Replace
+            };
+        }
+        let replaces = match frame.opcode {
             Some(DEVICE_VENDOR_ID) if frame.params.len() == 3 => entry
                 .vendor
                 .is_some_and(|vendor| vendor != Self::vendor(frame)),
@@ -193,6 +228,11 @@ impl BusModel {
                 .as_ref()
                 .is_some_and(|osd| *osd != decode_osd(&frame.params)),
             _ => false,
+        };
+        if replaces {
+            IdentityChange::Replace
+        } else {
+            IdentityChange::None
         }
     }
 
@@ -259,12 +299,7 @@ impl BusModel {
             .min()
     }
     fn physical_duplicate_from(&self, frame: &Frame) -> Option<u8> {
-        if frame.from < 15
-            && ((frame.opcode == Some(REPORT_PHYSICAL_ADDRESS) && frame.params.len() >= 3)
-                || (frame.opcode == Some(ACTIVE_SOURCE)
-                    && frame.params.len() == 2
-                    && frame.to == 15))
-        {
+        if frame.from < 15 && Self::reports_physical(frame) {
             self.entries.iter().find_map(|(&la, entry)| {
                 (la != frame.from && entry.physical == frame.physical()).then_some(la)
             })
@@ -274,7 +309,7 @@ impl BusModel {
     }
 
     fn accepts_address_move(&self, frame: &Frame, previous_la: u8) -> bool {
-        self.replaces_identity(frame)
+        self.replaces_identity(frame, false)
             || self.entries.get(&frame.from).is_none_or(|destination| {
                 let moved = &self.entries[&previous_la];
                 (destination.vendor.is_none() || destination.vendor == moved.vendor)
@@ -328,7 +363,7 @@ impl BusModel {
         entry: &mut BusEntry,
         frame: &Frame,
         wall: DateTime<Utc>,
-        replaces: bool,
+        change: IdentityChange,
         bridge: u8,
         active_source: &mut Option<u16>,
     ) {
@@ -353,7 +388,7 @@ impl BusModel {
                 entry.osd = Some(osd);
             }
             Some(ACTIVE_SOURCE) if frame.params.len() == 2 && frame.to == 15 => {
-                if replaces {
+                if change != IdentityChange::None {
                     entry.physical = frame.physical();
                 }
                 *active_source = frame.physical();
@@ -395,11 +430,18 @@ impl BusModel {
         }
     }
 
-    pub fn handle(&mut self, frame: &Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
+    pub fn handle(
+        &mut self,
+        frame: &Frame,
+        now: Instant,
+        wall: DateTime<Utc>,
+        keep_running: bool,
+    ) -> Vec<Action> {
         if frame.from >= 15 {
             return vec![];
         }
-        let replaces = self.replaces_identity(frame);
+        let change = self.identity_change(frame, keep_running);
+        let replaces = change == IdentityChange::Replace;
         let wake = self.is_wake_frame(frame);
         let moved = self.evict_physical_duplicates(frame);
         let entry = self
@@ -408,6 +450,12 @@ impl BusModel {
             .or_insert_with(|| BusEntry::new(now));
         if replaces {
             Self::replace_entry(entry, frame, now, &mut self.active_source);
+        }
+        if change == IdentityChange::Physical {
+            if self.active_source == entry.physical {
+                self.active_source = frame.physical();
+            }
+            entry.manual_pending = true;
         }
         if let Some(moved) = moved {
             entry.inherit_device(moved);
@@ -424,7 +472,7 @@ impl BusModel {
             entry,
             frame,
             wall,
-            replaces,
+            change,
             self.bridge,
             &mut self.active_source,
         );
@@ -473,7 +521,7 @@ mod tests {
         );
         let f = |s| Frame::from_hex(4, 15, s).unwrap();
         assert_eq!(
-            bus.handle(&f("84210004"), now, chrono::DateTime::UNIX_EPOCH)
+            bus.handle(&f("84210004"), now, chrono::DateTime::UNIX_EPOCH, false)
                 .len(),
             1
         );
@@ -482,6 +530,7 @@ mod tests {
                 &f("04"),
                 now + Duration::from_secs(9),
                 chrono::DateTime::UNIX_EPOCH,
+                false,
             )
             .is_empty()
         );
@@ -490,6 +539,7 @@ mod tests {
                 &f("04"),
                 now + Duration::from_secs(10),
                 chrono::DateTime::UNIX_EPOCH,
+                false,
             )
             .len(),
             1
@@ -498,12 +548,14 @@ mod tests {
             &f("870010FA"),
             now + Duration::from_secs(11),
             chrono::DateTime::UNIX_EPOCH,
+            false,
         );
         assert!(bus.entries[&4].identified);
         bus.handle(
             &f("84230004"),
             now + Duration::from_secs(12),
             chrono::DateTime::UNIX_EPOCH,
+            false,
         );
         assert_eq!(bus.entries[&4].vendor, None);
         assert!(!bus.entries[&4].identified);

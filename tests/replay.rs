@@ -3043,3 +3043,330 @@ fn retargeted_standby_does_not_keep_old_address_acknowledgements() {
         vec!["standby_target_absent"]
     );
 }
+
+fn console_physical_change_config() -> Config {
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let console = config
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_a")
+        .unwrap();
+    console.matches.physical = None;
+    console.matches.vendor = Some("0009BF".into());
+    console.matches.osd = Some("Console A".into());
+    config
+}
+
+fn console_before_physical_change(mode: Mode) -> (Engine, Instant) {
+    let now = Instant::now();
+    let mut config = console_physical_change_config();
+    config.mode = mode;
+    let mut engine = Engine::new(config, now, vec![]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    for data in ["84230004", "870009BF", "47436F6E736F6C652041", "822300"] {
+        frame(&mut engine, now, 8, 15, data);
+    }
+    engine.handle(Event::Tick, now + Duration::from_secs(2), wall());
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    (engine, now + Duration::from_secs(3))
+}
+
+#[test]
+fn physical_address_flap_during_receiver_power_up_keeps_role_on() {
+    let now = Instant::now();
+    let mut identity = restored_identity(8, 0x2300);
+    identity.vendor = Some(0x0009bf);
+    identity.osd = Some("Console A".into());
+    let mut engine = Engine::new(console_physical_change_config(), now, vec![identity]);
+    engine.handle(Event::BridgeOnline, now, wall());
+    assert!(
+        engine
+            .roles
+            .values()
+            .all(|role| role.power == RolePower::Off)
+    );
+    let mut reasons = Vec::new();
+    let mut actions = Vec::new();
+    let mut collect = |engine: &mut Engine, effects: Vec<Action>| {
+        assert!(
+            effects
+                .iter()
+                .all(|action| *action != Action::TvOff && !service(action, "turn_off"))
+        );
+        actions.extend(effects);
+        reasons.extend(
+            engine
+                .decisions
+                .drain(..)
+                .filter(|decision| decision.role.as_deref() == Some("console_a"))
+                .map(|decision| decision.reason),
+        );
+        assert_eq!(engine.identity.roles["console_a"], 8);
+        assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    };
+    for (ms, data, to) in [
+        (0, Some("84230004"), 15),
+        (800, Some("47436F6E736F6C652041"), 5),
+        (2_000, None, 0),
+        (2_100, Some("870009BF"), 15),
+        (2_700, Some("84100004"), 15),
+        (3_050, Some("870009BF"), 15),
+        (3_400, Some("47436F6E736F6C652041"), 0),
+        (5_100, Some("84100004"), 15),
+        (6_100, Some("84230004"), 15),
+        (10_300, Some("870009BF"), 15),
+        (10_400, Some("822300"), 15),
+    ] {
+        let at = now + Duration::from_millis(ms);
+        while let Some(deadline) = engine.next_deadline().filter(|deadline| *deadline < at) {
+            let effects = engine.handle(Event::Tick, deadline, wall());
+            collect(&mut engine, effects);
+        }
+        let effects = if let Some(data) = data {
+            frame(&mut engine, at, 8, to, data)
+        } else {
+            engine.handle(Event::Tick, at, wall())
+        };
+        collect(&mut engine, effects);
+    }
+    assert_eq!(reasons, ["ReportPhysicalAddress", "takeover_settled"]);
+    assert_eq!(actions.iter().filter(|a| **a == Action::WakeTv).count(), 1);
+    assert!(actions.iter().any(|action| service(action, "turn_on")));
+    assert_eq!(engine.bus.entries[&8].physical, Some(0x2300));
+    assert_eq!(engine.bus.active_source, Some(0x2300));
+}
+
+#[test]
+fn physical_address_change_requeries_and_a_different_device_is_corrected() {
+    for mode in [Mode::Shadow, Mode::Active] {
+        for changed_key in ["870010FA", "4753747265616D6572"] {
+            let (mut engine, now) = console_before_physical_change(mode);
+            let actions = frame(&mut engine, now, 8, 15, "84100004");
+            assert_eq!(engine.identity.roles["console_a"], 8);
+            assert_eq!(engine.roles["console_a"].power, RolePower::On);
+            assert_eq!(
+                actions,
+                vec![Action::Identify {
+                    la: 8,
+                    queries: IdentifyQueries::ALL
+                }]
+            );
+            assert!(engine.decisions.is_empty());
+            frame(
+                &mut engine,
+                now + Duration::from_secs(1),
+                8,
+                15,
+                changed_key,
+            );
+            assert!(!engine.identity.roles.contains_key("console_a"));
+            assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+            assert!(!engine.bus.entries[&8].verified);
+            assert!(
+                engine
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.reason == "identity_lost")
+            );
+        }
+    }
+}
+
+#[test]
+fn physical_address_change_unbinds_roles_matched_by_physical() {
+    let (mut engine, now) = setup();
+    for data in ["84230004", "870009BF", "47436F6E736F6C652041", "04"] {
+        frame(&mut engine, now, 8, 0, data);
+    }
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    frame(&mut engine, now + Duration::from_secs(1), 8, 15, "84100004");
+    assert!(!engine.identity.roles.contains_key("console_a"));
+    assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+    assert_eq!(engine.bus.entries[&8].vendor, Some(0x0009bf));
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "identity_lost")
+    );
+    frame(&mut engine, now + Duration::from_secs(2), 8, 15, "84230004");
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+}
+
+#[test]
+fn physical_address_change_with_unknown_keys_still_replaces() {
+    for (case, keys, verified) in [
+        ("no keys", &[][..], true),
+        ("vendor only", &["870009BF"][..], true),
+        ("OSD only", &["47436F6E736F6C652041"][..], true),
+        (
+            "both keys, unverified",
+            &["870009BF", "47436F6E736F6C652041"][..],
+            false,
+        ),
+    ] {
+        let (mut engine, now) = setup();
+        frame(&mut engine, now, 8, 15, "84230004");
+        for key in keys {
+            frame(&mut engine, now, 8, 15, key);
+        }
+        engine.bus.entries.get_mut(&8).unwrap().verified = verified;
+        frame(&mut engine, now, 8, 15, "822300");
+        frame(&mut engine, now + Duration::from_secs(1), 8, 15, "84100001");
+        let entry = &engine.bus.entries[&8];
+        assert_eq!(entry.vendor, None, "{case}");
+        assert_eq!(entry.osd, None, "{case}");
+        assert_eq!(entry.physical, Some(0x1000));
+        assert_eq!(entry.device_type, Some(1));
+        assert_eq!(entry.power, BusPower::Unknown);
+        assert_eq!(engine.bus.active_source, None);
+        assert!(!engine.identity.roles.contains_key("console_a"));
+    }
+}
+
+#[test]
+fn physical_address_change_via_active_source_preserves_confirmation_and_keys() {
+    let (mut engine, now) = console_before_physical_change(Mode::Shadow);
+    let before = engine.bus.entries[&8].clone();
+    let actions = engine.handle(
+        Event::Frame(Frame::from_hex(8, 15, "821000").unwrap()),
+        now,
+        wall() + chrono::Duration::seconds(10),
+    );
+    let after = &engine.bus.entries[&8];
+    assert_eq!(after.physical, Some(0x1000));
+    assert_eq!(after.vendor, before.vendor);
+    assert_eq!(after.osd, before.osd);
+    assert_eq!(after.device_type, before.device_type);
+    assert_eq!(after.confirmed_at, before.confirmed_at);
+    assert_eq!(after.verified, before.verified);
+    assert_eq!(after.power, BusPower::On);
+    assert_eq!(after.last_seen, Some(now));
+    assert_eq!(engine.bus.active_source, Some(0x1000));
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    assert!(engine.decisions.is_empty());
+    assert_eq!(
+        actions,
+        vec![Action::Identify {
+            la: 8,
+            queries: IdentifyQueries::ALL
+        }]
+    );
+}
+
+#[test]
+fn physical_address_change_queues_full_query_behind_shared_slot() {
+    let (mut engine, now) = console_before_physical_change(Mode::Shadow);
+    engine.handle(Event::Command(Command::Identify(8)), now, wall());
+    let changed_at = now + Duration::from_millis(100);
+    let confirmed = wall() + chrono::Duration::seconds(10);
+    let actions = engine.handle(
+        Event::Frame(Frame::from_hex(8, 15, "84100001").unwrap()),
+        changed_at,
+        confirmed,
+    );
+    assert!(actions.is_empty());
+    let entry = &engine.bus.entries[&8];
+    assert_eq!(entry.power, BusPower::On);
+    assert_eq!(entry.last_seen, Some(changed_at));
+    assert_eq!(entry.confirmed_at, Some(confirmed));
+    assert!(entry.verified);
+    assert_eq!(engine.bus.active_source, Some(0x1000));
+    assert_eq!(
+        engine.handle(Event::Tick, now + Duration::from_secs(1), wall()),
+        vec![Action::Identify {
+            la: 8,
+            queries: IdentifyQueries::ALL
+        }]
+    );
+}
+
+#[test]
+fn physical_address_change_of_stopped_role_does_not_rewake_it() {
+    let (mut engine, now) = console_before_address_move();
+    engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
+    engine.handle(
+        Event::Command(Command::Standby("console_b".into())),
+        now,
+        wall(),
+    );
+    frame(&mut engine, now + Duration::from_secs(1), 8, 15, "84100004");
+    frame(&mut engine, now + Duration::from_secs(1), 8, 0, "9000");
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    let retry_at = now + Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    let actions = engine.handle(Event::Tick, retry_at, wall());
+    assert!(!engine.identity.roles.contains_key("console_b"));
+    assert!(
+        actions
+            .iter()
+            .all(|action| !matches!(action, Action::CecSend { .. }))
+    );
+    assert_no_standby_decision(&engine, "console_b");
+}
+
+#[test]
+fn physical_address_change_defers_to_another_logical_address_holding_the_pa() {
+    let (mut engine, now) = console_before_physical_change(Mode::Shadow);
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now + Duration::from_secs(1), 8, 15, "84210004");
+    assert!(!engine.bus.entries.contains_key(&4));
+    let entry = &engine.bus.entries[&8];
+    assert_eq!(entry.physical, Some(0x2100));
+    assert_eq!(entry.vendor, Some(0x0010fa));
+    assert_eq!(entry.osd.as_deref(), Some("Apple TV"));
+    assert_eq!(engine.identity.roles["streamer"], 8);
+    assert!(!engine.identity.roles.contains_key("console_a"));
+    assert_eq!(engine.bus.active_source, None);
+}
+
+#[test]
+fn physical_address_change_from_bridge_still_replaces_its_keys() {
+    let (mut engine, now) = setup();
+    for data in ["84250004", "870009BF", "47436F6E736F6C652041", "822500"] {
+        frame(&mut engine, now, 0, 15, data);
+    }
+    frame(&mut engine, now + Duration::from_secs(1), 0, 15, "84100004");
+    assert_eq!(engine.bus.entries[&0].vendor, None);
+    assert_eq!(engine.bus.entries[&0].osd, None);
+    assert_eq!(engine.bus.active_source, None);
+}
+
+#[test]
+fn different_device_claiming_a_known_address_does_not_wake_the_old_role() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        let (mut engine, now) = console_before_physical_change(mode);
+        frame(&mut engine, now, 8, 0, "36");
+        assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+        assert_eq!(engine.identity.roles["console_a"], 8);
+        assert!(engine.bus.entries[&8].verified);
+        for (ms, data, to) in [
+            (100, "84240004", 15),
+            (200, "87080046", 15),
+            (300, "47436F6E736F6C652042", 0),
+            (400, "04", 0),
+            (500, "822400", 15),
+        ] {
+            let effects = frame(&mut engine, now + Duration::from_millis(ms), 8, to, data);
+            assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+            assert!(!engine.identity.roles.contains_key("console_a"));
+            assert!(
+                engine
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.role.as_deref() != Some("console_a"))
+            );
+            if ms <= 300 {
+                assert!(
+                    effects
+                        .iter()
+                        .all(|action| matches!(action, Action::Identify { .. }))
+                );
+            }
+        }
+        assert_eq!(engine.identity.roles["console_b"], 8);
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert_eq!(engine.bus.active_source, Some(0x2400));
+    }
+}
