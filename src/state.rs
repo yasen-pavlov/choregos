@@ -54,6 +54,8 @@ impl AppState {
             mode: config.mode,
             warming: true,
             bridge_online: false,
+            bridge_telemetry: None,
+            last_frame_at: None,
             bridge_logical_address: config.bridge.logical_address,
             roles: config
                 .device
@@ -217,6 +219,8 @@ pub struct Snapshot {
     pub mode: Mode,
     pub warming: bool,
     pub bridge_online: bool,
+    pub bridge_telemetry: Option<BridgeTelemetry>,
+    pub last_frame_at: Option<DateTime<Utc>>,
     pub bridge_logical_address: u8,
     pub roles: Vec<RoleView>,
     pub bus: Vec<BusEntryView>,
@@ -228,6 +232,14 @@ pub struct Snapshot {
     pub connections: Health,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BridgeTelemetry {
+    pub signal_dbm: i32,
+    pub link_count: u32,
+    pub uptime_s: u64,
+    pub at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum UiEvent {
@@ -236,6 +248,7 @@ pub enum UiEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Command {
     AllOff,
     SetMode(Mode),

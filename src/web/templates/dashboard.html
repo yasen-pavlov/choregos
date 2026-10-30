@@ -30,6 +30,16 @@
     <div class="group">
       <span class="label">bridge</span>
       <span class="conn {% if snapshot.bridge_online %}up{% else %}down{% endif %}">{% if snapshot.bridge_online %}online{% else %}offline{% endif %}</span>
+      {% if snapshot.bridge_online %}
+      {% if let Some(telemetry) = snapshot.bridge_telemetry %}
+      <span class="bridge-detail{% if view::bridge_degraded(snapshot) %} warn{% endif %}" title="Wi-Fi signal · Wi-Fi links since boot (1 = never reconnected) · uptime · age of the last telemetry">· {{ view::dbm(telemetry.signal_dbm) }} · {{ view::links(telemetry.link_count) }} · up {{ view::uptime(telemetry.uptime_s) }} · telemetry {{ view::since(telemetry.at) }}</span>
+      {% else %}
+      <span class="bridge-detail">· no telemetry yet</span>
+      {% endif %}
+      {% endif %}
+      {% if snapshot.last_frame_at.is_some() %}
+      <span class="bridge-detail">· last frame {{ view::ago(snapshot.last_frame_at) }}</span>
+      {% endif %}
     </div>
     <div class="group">
       <span class="label">active source</span>

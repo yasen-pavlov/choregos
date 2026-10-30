@@ -19,9 +19,14 @@ enum CliCommand {
         config: PathBuf,
     },
     Replay {
-        fixture: PathBuf,
+        #[arg(required = true, num_args = 1..)]
+        fixture: Vec<PathBuf>,
         #[arg(long, default_value = "choregos.toml")]
         config: PathBuf,
+        #[arg(long)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
     },
     Healthz {
         #[arg(long, default_value = "http://127.0.0.1:8095/healthz")]
@@ -49,9 +54,12 @@ async fn execute(command: CliCommand) -> anyhow::Result<()> {
     match command {
         CliCommand::Run { config } => cli::run(config).await?,
         CliCommand::CheckConfig { config } => print!("{}", cli::check_config(&config)?),
-        CliCommand::Replay { fixture, config } => {
-            cli::replay_file(&config, &fixture, &mut std::io::stdout())?
-        }
+        CliCommand::Replay {
+            fixture,
+            config,
+            since,
+            until,
+        } => cli::replay_files(&config, &fixture, since, until, &mut std::io::stdout())?,
         CliCommand::Healthz { url } => cli::healthz(&url).await?,
     }
     Ok(())

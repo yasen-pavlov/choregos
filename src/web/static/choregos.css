@@ -106,6 +106,8 @@ label.check { gap: 4px; }
 .group { display: flex; align-items: center; gap: 8px; }
 .group.end { margin-left: auto; }
 .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.bridge-detail { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.bridge-detail.warn { color: var(--amber); }
 .segmented { display: inline-flex; }
 .segmented button { border-radius: 0; text-transform: uppercase; font-family: var(--mono); font-size: 11px; }
 .segmented button:first-child { border-radius: var(--radius) 0 0 var(--radius); }

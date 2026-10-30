@@ -15,8 +15,8 @@ use super::router;
 use crate::{
     config::Config,
     state::{
-        AppState, BusEntryView, BusPower, Command, CommandError, DecisionView, FrameDirection,
-        FrameView, RolePower, UiEvent,
+        AppState, BridgeTelemetry, BusEntryView, BusPower, Command, CommandError, DecisionView,
+        FrameDirection, FrameView, RolePower, Snapshot, UiEvent,
     },
 };
 
@@ -825,6 +825,101 @@ async fn unreachable_tv_reads_as_off_while_other_entities_keep_the_error_state()
     let receiver = between(&html, "media_player.test_receiver", "</tr>");
     assert!(!receiver.contains("off (unreachable)"));
     assert!(classes_around(receiver, "unavailable</span>").contains(&"state-unavailable"));
+}
+
+/// Publishes the current snapshot after `edit`; returns the dashboard's bridge group and the
+/// header status block.
+async fn bridge_group(
+    h: &Harness,
+    cookie: &str,
+    edit: impl FnOnce(&mut Snapshot),
+) -> (String, String) {
+    let mut snapshot = h.state.snapshot();
+    edit(&mut snapshot);
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/", Some(cookie)).await).await;
+    let group = between(&html, "<span class=\"label\">bridge</span>", "</div>").to_owned();
+    let status = between(&html, "id=\"status\"", "</div>").to_owned();
+    (group, status)
+}
+
+fn telemetry(signal_dbm: i32, age: chrono::TimeDelta) -> BridgeTelemetry {
+    BridgeTelemetry {
+        signal_dbm,
+        link_count: 2,
+        uptime_s: 282_348,
+        at: chrono::Utc::now() - age,
+    }
+}
+
+#[tokio::test]
+async fn dashboard_bridge_line_shows_telemetry_and_last_frame() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let (group, status) = bridge_group(&h, &cookie, |snapshot| {
+        snapshot.bridge_online = true;
+        snapshot.connections.bridge_online = true;
+        snapshot.bridge_telemetry = Some(telemetry(-50, chrono::TimeDelta::minutes(2)));
+        snapshot.last_frame_at = Some(chrono::Utc::now() - chrono::TimeDelta::seconds(12));
+    })
+    .await;
+    // Exact ages are covered by the fixed-clock `view::ago_at` test; here only their presence.
+    let line = "· −50 dBm · 2 links · up 3d 6h · telemetry ";
+    assert!(group.contains(line), "{group}");
+    assert!(!classes_around(&group, line).contains(&"warn"));
+    assert!(
+        between(&group, line, "</span>").ends_with(" ago"),
+        "{group}"
+    );
+    assert!(
+        between(&group, "· last frame ", "</span>").ends_with(" ago"),
+        "{group}"
+    );
+    assert!(status.contains("title=\"CEC bridge online · −50 dBm\""));
+}
+
+#[tokio::test]
+async fn weak_signal_or_stale_telemetry_is_flagged_while_online() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    for (signal, age) in [
+        (-80, chrono::TimeDelta::minutes(1)),
+        (-50, chrono::TimeDelta::minutes(16)),
+    ] {
+        let (group, _) = bridge_group(&h, &cookie, |snapshot| {
+            snapshot.bridge_online = true;
+            snapshot.bridge_telemetry = Some(telemetry(signal, age));
+        })
+        .await;
+        assert!(
+            classes_around(&group, " dBm").contains(&"warn"),
+            "{signal} dBm, {age}: {group}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bridge_without_telemetry_says_so_and_offline_shows_none() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let (online, _) = bridge_group(&h, &cookie, |snapshot| snapshot.bridge_online = true).await;
+    assert!(online.contains("online</span>"));
+    assert!(online.contains("· no telemetry yet"));
+    assert!(!online.contains("last frame"));
+
+    let (offline, status) = bridge_group(&h, &cookie, |snapshot| {
+        snapshot.bridge_online = false;
+        snapshot.bridge_telemetry = Some(telemetry(-80, chrono::TimeDelta::minutes(30)));
+    })
+    .await;
+    assert!(offline.contains("offline</span>"));
+    for absent in ["dBm", "telemetry", "links", "warn"] {
+        assert!(
+            !offline.contains(absent),
+            "offline shows {absent}: {offline}"
+        );
+    }
+    assert!(status.contains("title=\"CEC bridge offline\""));
 }
 
 #[tokio::test]

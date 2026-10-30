@@ -11,6 +11,9 @@ client_id = "choregos"
 topic = "tasmota_cec"  # tele/<topic>/SENSOR, cmnd/<topic>/HdmiSend, stat/<topic>/RESULT, tele/<topic>/LWT
 logical_address = 0       # what the bridge claims; frames To:<this> are "to the TV"
 
+[trace]
+keep_days = 30            # UTC daily replay traces beside the state file; 0 disables (0–365)
+
 [home_assistant]
 url = "http://homeassistant.lan:8123"
 # token: env CHOREGOS_HA_TOKEN  (long-lived access token)

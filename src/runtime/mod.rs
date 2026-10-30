@@ -2,6 +2,7 @@ pub mod cli;
 pub mod executor;
 pub mod ha;
 pub mod mqtt;
+pub mod trace;
 pub mod webos;
 pub mod wol;
 
@@ -11,8 +12,8 @@ use crate::{
     config::{Config, ConfigError},
     engine::{Engine, Event},
     state::{
-        AppState, BusEntryView, Command, CommandError, DecisionView, FrameDirection, FrameView,
-        HaEntityView, HaView, Mode, RoleView, Snapshot, UiEvent,
+        AppState, BridgeTelemetry, BusEntryView, Command, CommandError, DecisionView,
+        FrameDirection, FrameView, HaEntityView, HaView, Mode, RoleView, Snapshot, UiEvent,
     },
 };
 use chrono::{DateTime, Utc};
@@ -34,7 +35,15 @@ pub(crate) enum Request {
 }
 pub(crate) enum Input {
     Event(Event),
-    Connection { mqtt: bool, connected: bool },
+    BridgeTelemetry(BridgeTelemetry),
+    BridgeResult {
+        payload: serde_json::Value,
+        event: Option<Event>,
+    },
+    Connection {
+        mqtt: bool,
+        connected: bool,
+    },
     Request(Request),
 }
 struct Adapters {
@@ -281,6 +290,7 @@ struct Runtime {
     last_states: String,
     removed_roles: BTreeSet<String>,
     writer: Option<StateWriter>,
+    trace: Option<trace::TraceWriter>,
     last_identities: Option<Vec<LearnedIdentity>>,
     decisions_dirty: bool,
 }
@@ -316,6 +326,12 @@ impl Runtime {
             },
             2000,
         );
+        let trace = trace::TraceWriter::start(
+            state_directory(&state_path).to_path_buf(),
+            engine.config.trace.keep_days,
+            wall,
+            PersistedState::capture(&engine, &snapshot.decisions).identities,
+        );
         let mut runtime = Self {
             snapshot,
             state,
@@ -326,6 +342,7 @@ impl Runtime {
             last_states: String::new(),
             removed_roles: BTreeSet::new(),
             writer: Some(StateWriter::start(state_path)),
+            trace: Some(trace),
             last_identities: None,
             decisions_dirty: true,
         };
@@ -350,12 +367,43 @@ impl Runtime {
             Input::Event(event) => {
                 if let Event::Frame(frame) = &event {
                     let view = frame_view(frame, wall, FrameDirection::Received, &self.engine);
+                    self.snapshot.last_frame_at = Some(wall);
                     push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
                     ui_events.push(UiEvent::Frame(view));
                 }
                 vec![event]
             }
-            Input::Connection { mqtt, connected } => self.handle_connection(mqtt, connected),
+            Input::BridgeTelemetry(telemetry) => {
+                self.snapshot.bridge_telemetry = Some(telemetry);
+                vec![]
+            }
+            Input::BridgeResult { payload, event } => {
+                if self.engine.config.trace.keep_days != 0 {
+                    self.trace_entry(
+                        wall,
+                        trace::TraceEntry::Result {
+                            bridge: self.engine.config.bridge.topic.clone(),
+                            payload,
+                        },
+                    );
+                }
+                event.into_iter().collect()
+            }
+            Input::Connection { mqtt, connected } => {
+                if mqtt {
+                    self.trace_entry(wall, trace::TraceEntry::Connection { mqtt: connected });
+                }
+                let events = self.handle_connection(mqtt, connected);
+                // Trace connection loss separately, never as a bridge-origin LWT.
+                for event in &events {
+                    if !mqtt {
+                        self.trace_event(event, wall);
+                    }
+                }
+                self.apply_events(events, now, wall, &mut ui_events);
+                self.publish_snapshot(now, wall, ui_events).await;
+                return Ok(());
+            }
             Input::Request(Request::Command(command, reply)) => {
                 self.handle_command(command, reply).await
             }
@@ -363,6 +411,9 @@ impl Runtime {
                 self.handle_config_save(text, reply).await
             }
         };
+        for event in &events {
+            self.trace_event(event, wall);
+        }
         self.apply_events(events, now, wall, &mut ui_events);
         self.publish_snapshot(now, wall, ui_events).await;
         Ok(())
@@ -481,6 +532,20 @@ impl Runtime {
             let actions = self.engine.handle(event, now, wall);
             self.record_decisions(wall, ui_events);
             for frame in self.adapters().dispatch(actions, &self.engine) {
+                if self.engine.config.trace.keep_days != 0 {
+                    self.trace_entry(
+                        wall,
+                        trace::TraceEntry::Sent {
+                            bridge: self.engine.config.bridge.topic.clone(),
+                            to: frame.to,
+                            data: frame
+                                .opcode
+                                .into_iter()
+                                .chain(frame.params.iter().copied())
+                                .collect(),
+                        },
+                    );
+                }
                 let view = frame_view(&frame, wall, FrameDirection::Sent, &self.engine);
                 push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
                 ui_events.push(UiEvent::Frame(view));
@@ -520,6 +585,58 @@ impl Runtime {
         }
     }
 
+    fn trace_entry(&self, wall: DateTime<Utc>, entry: trace::TraceEntry) {
+        if self.engine.config.trace.keep_days != 0
+            && let Some(writer) = &self.trace
+        {
+            writer.record(wall, entry);
+        }
+    }
+
+    fn trace_event(&self, event: &Event, wall: DateTime<Utc>) {
+        use trace::TraceEntry;
+        if let Event::ConfigReloaded(config) = event {
+            if config.trace.keep_days != self.engine.config.trace.keep_days
+                && let Some(writer) = &self.trace
+            {
+                writer.configure(wall, config.trace.keep_days);
+            }
+            return;
+        }
+        if self.engine.config.trace.keep_days == 0 {
+            return;
+        }
+        let bridge = &self.engine.config.bridge.topic;
+        let entry = match event {
+            Event::Frame(frame) => TraceEntry::Received {
+                bridge: bridge.clone(),
+                frame: frame.clone(),
+            },
+            Event::BridgeOnline => TraceEntry::Lwt {
+                bridge: bridge.clone(),
+                online: true,
+            },
+            Event::BridgeOffline => TraceEntry::Lwt {
+                bridge: bridge.clone(),
+                online: false,
+            },
+            Event::HaState {
+                entity,
+                state,
+                attrs,
+                changed,
+            } => TraceEntry::HaState {
+                entity: entity.clone(),
+                state: state.clone(),
+                attrs: trace_ha_attrs(attrs),
+                changed: *changed,
+            },
+            Event::Command(command) => TraceEntry::Command(command.clone()),
+            Event::ConfigReloaded(_) | Event::Tick | Event::SendResult { .. } => return,
+        };
+        self.trace_entry(wall, entry);
+    }
+
     async fn publish_snapshot(
         &mut self,
         now: Instant,
@@ -528,11 +645,12 @@ impl Runtime {
     ) {
         update_snapshot(&mut self.snapshot, &self.engine, now, wall);
         let entity_states = format!(
-            "{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}",
             self.snapshot.mode,
             self.snapshot.bridge_online,
             self.snapshot.active_role,
             self.snapshot.conflicts.len(),
+            self.snapshot.bridge_telemetry,
             self.snapshot
                 .roles
                 .iter()
@@ -543,12 +661,11 @@ impl Runtime {
             self.adapters().executor.mqtt.states(&self.snapshot);
             self.last_states = entity_states;
         }
-        if self.decisions_dirty
-            || self
-                .last_identities
-                .as_ref()
-                .is_none_or(|saved| !PersistedState::identities_match(saved, &self.engine))
-        {
+        let identities_changed = self
+            .last_identities
+            .as_ref()
+            .is_none_or(|saved| !PersistedState::identities_match(saved, &self.engine));
+        if self.decisions_dirty || identities_changed {
             let saved = PersistedState::capture(&self.engine, &self.snapshot.decisions);
             match serde_json::to_vec(&saved) {
                 Ok(bytes) => {
@@ -556,6 +673,9 @@ impl Runtime {
                         .as_ref()
                         .expect("state writer running")
                         .submit(bytes);
+                    if identities_changed && let Some(writer) = &self.trace {
+                        writer.identities(saved.identities.clone());
+                    }
                     self.last_identities = Some(saved.identities);
                     self.decisions_dirty = false;
                 }
@@ -586,6 +706,9 @@ impl Runtime {
             self.handle_input(input, Instant::now(), Utc::now()).await?;
         }
         if let Some(writer) = self.writer.take() {
+            writer.flush().await;
+        }
+        if let Some(writer) = self.trace.take() {
             writer.flush().await;
         }
         Ok(())
@@ -665,6 +788,28 @@ fn push_ring<T>(items: &mut VecDeque<T>, item: T, max: usize) {
     }
     items.push_back(item);
 }
+
+fn state_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn trace_ha_attrs(
+    attrs: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        crate::engine::HA_ATTRS
+            .iter()
+            .filter_map(|key| {
+                attrs
+                    .get(*key)
+                    .map(|value| ((*key).to_owned(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
 fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandError> {
     let error = match command {
         Command::Identify(la) if *la >= 15 => Some("identify address must be 0–14"),
@@ -1363,5 +1508,48 @@ mod persistence_tests {
         let restored = PersistedState::load(&path, wall).await.unwrap();
         assert_eq!(restored.identities.len(), 1);
         assert_eq!(restored.identities[0].la, 4);
+    }
+}
+
+#[cfg(test)]
+mod trace_reload_tests {
+    #[test]
+    fn bare_config_path_uses_current_directory_for_trace_files() {
+        let state_path =
+            std::path::Path::new("choregos.toml").with_file_name("choregos.state.json");
+        assert_eq!(
+            super::state_directory(&state_path),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            super::state_directory(&state_path).join("cec-bus.2026-10-30.jsonl"),
+            std::path::Path::new("./cec-bus.2026-10-30.jsonl")
+        );
+    }
+
+    #[test]
+    fn trace_ha_attributes_exclude_media_tokens_and_viewing_history() {
+        let attrs = serde_json::from_value(serde_json::json!({
+            "source": "Streamer", "entity_picture": "/api/media_player_proxy?token=test-secret",
+            "media_title": "Private title", "app_name": "Private app", "volume_level": 0.5,
+        }))
+        .unwrap();
+        assert_eq!(
+            super::trace_ha_attrs(&attrs),
+            serde_json::json!({"source":"Streamer"})
+        );
+        assert_eq!(
+            super::trace_ha_attrs(&Default::default()),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn trace_retention_is_live_reloadable() {
+        let current =
+            crate::config::Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let mut changed = current.clone();
+        changed.trace.keep_days = 0;
+        assert!(super::validate_reload(&changed, &current).is_ok());
     }
 }

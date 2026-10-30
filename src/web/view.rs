@@ -3,7 +3,15 @@
 use chrono::{DateTime, Utc};
 
 use super::auth::{Ctx, SessionUser};
-use crate::state::{BusPower, FrameDirection, HaEntityView, Health, Mode, RolePower, Snapshot};
+use crate::state::{
+    BridgeTelemetry, BusPower, FrameDirection, HaEntityView, Health, Mode, RolePower, Snapshot,
+};
+
+/// Bridge Wi-Fi signal below this (dBm) is flagged on the dashboard.
+pub(crate) const WEAK_SIGNAL_DBM: i32 = -75;
+/// The bridge publishes telemetry every `TelePeriod` (300 s by default); three missed
+/// periods while it is online means the telemetry (or the link) is stuck.
+pub(crate) const STALE_TELEMETRY: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// Chrome rendered by `base.html` around every authenticated page.
 pub(crate) struct Layout {
@@ -13,6 +21,8 @@ pub(crate) struct Layout {
     pub(crate) mode: Mode,
     pub(crate) warming: bool,
     pub(crate) health: Health,
+    /// Header bridge badge tooltip suffix (`−50 dBm`) once telemetry exists.
+    pub(crate) bridge_signal: Option<String>,
 }
 
 impl Layout {
@@ -24,6 +34,10 @@ impl Layout {
             mode: snapshot.mode,
             warming: snapshot.warming,
             health: snapshot.connections.clone(),
+            bridge_signal: snapshot
+                .bridge_telemetry
+                .as_ref()
+                .map(|telemetry| dbm(&telemetry.signal_dbm)),
         }
     }
 
@@ -43,7 +57,11 @@ pub(crate) fn iso(timestamp: &DateTime<Utc>) -> String {
 }
 
 pub(crate) fn ago(timestamp: &Option<DateTime<Utc>>) -> String {
-    timestamp.map_or_else(|| "never".to_owned(), |ts| ago_at(ts, Utc::now()))
+    timestamp.as_ref().map_or_else(|| "never".to_owned(), since)
+}
+
+pub(crate) fn since(timestamp: &DateTime<Utc>) -> String {
+    ago_at(*timestamp, Utc::now())
 }
 
 fn ago_at(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -54,6 +72,52 @@ fn ago_at(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
         3600..86_400 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86_400),
     }
+}
+
+/// Compact uptime: the two most significant units (`3d 6h`, `6h 25m`), else one (`25m`, `48s`).
+pub(crate) fn uptime(seconds: &u64) -> String {
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        seconds % 86_400 / 3600,
+        seconds % 3600 / 60,
+    );
+    match (days, hours, minutes) {
+        (1.., ..) => format!("{days}d {hours}h"),
+        (0, 1.., _) => format!("{hours}h {minutes}m"),
+        (0, 0, 1..) => format!("{minutes}m"),
+        (0, 0, 0) => format!("{seconds}s"),
+    }
+}
+
+/// Signal strength with a typographic minus (`−50 dBm`).
+pub(crate) fn dbm(signal: &i32) -> String {
+    let magnitude = signal.unsigned_abs();
+    if *signal < 0 {
+        format!("−{magnitude} dBm")
+    } else {
+        format!("{magnitude} dBm")
+    }
+}
+
+pub(crate) fn links(count: &u32) -> String {
+    if *count == 1 {
+        "1 link".to_owned()
+    } else {
+        format!("{count} links")
+    }
+}
+
+/// Whether an online bridge's link looks degraded: weak signal or telemetry gone quiet.
+pub(crate) fn bridge_degraded(snapshot: &Snapshot) -> bool {
+    snapshot.bridge_online
+        && snapshot
+            .bridge_telemetry
+            .as_ref()
+            .is_some_and(|telemetry| telemetry_degraded_at(telemetry, Utc::now()))
+}
+
+fn telemetry_degraded_at(telemetry: &BridgeTelemetry, now: DateTime<Utc>) -> bool {
+    telemetry.signal_dbm < WEAK_SIGNAL_DBM || now - telemetry.at > STALE_TELEMETRY
 }
 
 pub(crate) fn opt<T: std::fmt::Display>(value: &Option<T>) -> String {
@@ -144,11 +208,38 @@ mod tests {
     fn ago_buckets_and_clamps_future_timestamps() {
         let now = Utc.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap();
         let at = |seconds| now - chrono::Duration::seconds(seconds);
+        assert_eq!(ago_at(at(12), now), "12s ago");
         assert_eq!(ago_at(at(59), now), "59s ago");
         assert_eq!(ago_at(at(60), now), "1m ago");
+        assert_eq!(ago_at(at(120), now), "2m ago");
         assert_eq!(ago_at(at(3_599), now), "59m ago");
         assert_eq!(ago_at(at(3_600), now), "1h ago");
         assert_eq!(ago_at(at(86_400 * 3), now), "3d ago");
         assert_eq!(ago_at(at(-5), now), "0s ago");
+    }
+
+    #[test]
+    fn uptime_keeps_the_two_most_significant_units() {
+        assert_eq!(uptime(&0), "0s");
+        assert_eq!(uptime(&48), "48s");
+        assert_eq!(uptime(&60), "1m");
+        assert_eq!(uptime(&(25 * 60 + 59)), "25m");
+        assert_eq!(uptime(&(6 * 3600 + 25 * 60 + 7)), "6h 25m");
+        assert_eq!(uptime(&3600), "1h 0m");
+        assert_eq!(uptime(&282_348), "3d 6h");
+    }
+
+    #[test]
+    fn telemetry_is_degraded_by_weak_signal_or_age_past_the_thresholds() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
+        let telemetry = |signal_dbm, age_s| BridgeTelemetry {
+            signal_dbm,
+            link_count: 1,
+            uptime_s: 60,
+            at: now - chrono::Duration::seconds(age_s),
+        };
+        assert!(!telemetry_degraded_at(&telemetry(-75, 900), now));
+        assert!(telemetry_degraded_at(&telemetry(-76, 0), now));
+        assert!(telemetry_degraded_at(&telemetry(-50, 901), now));
     }
 }

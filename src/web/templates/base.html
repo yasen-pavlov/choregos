@@ -24,7 +24,7 @@
   <div id="status" class="status">
     <span class="badge {% if layout.is_active() %}mode-active{% else %}mode-shadow{% endif %}" title="operating mode">{{ layout.mode }}</span>
     {% if layout.warming %}<span class="badge warming" title="waiting for the bus to answer the startup resync">warming</span>{% endif %}
-    <span class="conn {% if layout.health.bridge_online %}up{% else %}down{% endif %}" title="CEC bridge {% if layout.health.bridge_online %}online{% else %}offline{% endif %}">bridge</span>
+    <span class="conn {% if layout.health.bridge_online %}up{% else %}down{% endif %}" title="CEC bridge {% if layout.health.bridge_online %}online{% if let Some(signal) = layout.bridge_signal %} · {{ signal }}{% endif %}{% else %}offline{% endif %}">bridge</span>
     <span class="conn {% if layout.health.mqtt_connected %}up{% else %}down{% endif %}" title="MQTT {% if layout.health.mqtt_connected %}connected{% else %}disconnected{% endif %}">mqtt</span>
     <span class="conn {% if layout.health.ha_connected %}up{% else %}down{% endif %}" title="Home Assistant {% if layout.health.ha_connected %}connected{% else %}disconnected{% endif %}">ha</span>
   </div>

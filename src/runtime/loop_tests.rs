@@ -583,7 +583,7 @@ async fn shadow_fixture_wake_updates_snapshots_discovery_and_retained_power_with
                 .iter()
                 .filter(|p| p.topic.starts_with("homeassistant/"))
                 .count()
-                >= harness.config.device.len() + 5
+                >= harness.config.device.len() + 8
         })
         .await;
     let retained = harness.peer.retained("choregos/state/streamer").await;
@@ -791,6 +791,33 @@ async fn broker_restart_reinterrogates_the_bridge_and_ha_disconnect_invalidates_
     .await;
     assert!(snapshot.connections.mqtt_connected);
     harness.shutdown().await;
+    use super::trace::{self, TraceEntry};
+    let text = std::fs::read_to_string(
+        harness
+            .path
+            .with_file_name(format!("cec-bus.{}.jsonl", chrono::Utc::now().date_naive())),
+    )
+    .unwrap();
+    let entries: Vec<_> = text
+        .lines()
+        .filter_map(trace::parse)
+        .map(|(_, entry)| entry)
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Connection { mqtt: false }))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Connection { mqtt: true }))
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Lwt { online: false, .. }))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1001,4 +1028,160 @@ async fn wait_persisted(
     })
     .await
     .expect("state file did not converge");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_captures_replay_inputs_and_publishes_retained_bridge_telemetry() {
+    use super::trace::{self, TraceEntry};
+    let mut harness = Harness::start().await;
+    assert!(harness.state.snapshot().bridge_telemetry.is_none());
+    assert!(
+        !harness
+            .peer
+            .view
+            .borrow()
+            .publications
+            .iter()
+            .any(|p| p.topic == "choregos/state/bridge_signal")
+    );
+    harness.publish_wake().await;
+    harness.command(Command::Identify(4)).await;
+    harness
+        .peer
+        .publish(
+            &format!("stat/{}/RESULT", harness.config.bridge.topic),
+            false,
+            r#"{"HdmiSend":{"Ack":false}}"#,
+        )
+        .await;
+    let before = chrono::Utc::now();
+    harness
+        .peer
+        .publish(
+            &format!("tele/{}/STATE", harness.config.bridge.topic),
+            false,
+            r#"{"UptimeSec":282348.0,"Wifi":{"RSSI":100,"Signal":-50.0,"LinkCount":2.0}}"#,
+        )
+        .await;
+    let snapshot = wait_snapshot(&harness.state, |s| s.bridge_telemetry.is_some()).await;
+    let telemetry = snapshot.bridge_telemetry.unwrap();
+    assert_eq!(
+        (
+            telemetry.signal_dbm,
+            telemetry.link_count,
+            telemetry.uptime_s
+        ),
+        (-50, 2, 282348)
+    );
+    assert!(telemetry.at >= before);
+    assert!(snapshot.last_frame_at.is_some());
+    for (name, value) in [
+        ("bridge_signal", "-50"),
+        ("bridge_link_count", "2"),
+        ("bridge_uptime", "282348"),
+    ] {
+        harness.peer.wait_state(name, value).await;
+        let retained = harness
+            .peer
+            .retained(&format!("choregos/state/{name}"))
+            .await;
+        assert_eq!(retained.payload.as_ref(), value.as_bytes());
+        let discovery = harness
+            .peer
+            .retained(&format!("homeassistant/sensor/choregos/{name}/config"))
+            .await;
+        let payload: Value = serde_json::from_slice(&discovery.payload).unwrap();
+        assert_eq!(payload["entity_category"], "diagnostic");
+        match name {
+            "bridge_signal" => {
+                assert_eq!(payload["unit_of_measurement"], "dBm");
+                assert_eq!(payload["device_class"], "signal_strength");
+                assert_eq!(payload["state_class"], "measurement");
+            }
+            "bridge_link_count" => assert_eq!(payload["state_class"], "total_increasing"),
+            _ => {
+                assert_eq!(payload["unit_of_measurement"], "s");
+                assert_eq!(payload["device_class"], "duration");
+            }
+        }
+    }
+    harness.shutdown().await;
+    let mut entries = vec![];
+    for file in std::fs::read_dir(harness.path.parent().unwrap()).unwrap() {
+        let file = file.unwrap();
+        if file.file_name().to_string_lossy().starts_with("cec-bus.") {
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            assert!(matches!(
+                trace::parse(text.lines().next().unwrap()).unwrap().1,
+                TraceEntry::Identities(_)
+            ));
+            entries.extend(text.lines().map(|line| trace::parse(line).unwrap().1));
+        }
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Received { .. }))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Lwt { online: true, .. }))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Sent { .. }))
+    );
+    assert!(entries.iter().any(|entry| matches!(entry, TraceEntry::Result { payload, .. } if payload["HdmiSend"]["Ack"] == false)));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::HaState { .. }))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, TraceEntry::Command(Command::Identify(4))))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_after_offline_does_not_mark_the_bridge_online() {
+    let mut harness = Harness::start().await;
+    harness
+        .peer
+        .publish(
+            &format!("tele/{}/LWT", harness.config.bridge.topic),
+            true,
+            "Offline",
+        )
+        .await;
+    let offline = wait_snapshot(&harness.state, |snapshot| !snapshot.bridge_online).await;
+    assert!(offline.bridge_telemetry.is_none());
+    assert!(!offline.connections.bridge_online);
+    harness
+        .peer
+        .publish(
+            &format!("tele/{}/STATE", harness.config.bridge.topic),
+            false,
+            r#"{"UptimeSec":60,"Wifi":{"Signal":-80,"LinkCount":3}}"#,
+        )
+        .await;
+    let snapshot = wait_snapshot(&harness.state, |snapshot| {
+        snapshot.bridge_telemetry.is_some()
+    })
+    .await;
+    assert!(!snapshot.bridge_online);
+    assert!(!snapshot.connections.bridge_online);
+    let telemetry = snapshot.bridge_telemetry.unwrap();
+    assert_eq!(
+        (
+            telemetry.signal_dbm,
+            telemetry.link_count,
+            telemetry.uptime_s
+        ),
+        (-80, 3, 60)
+    );
+    harness.shutdown().await;
 }

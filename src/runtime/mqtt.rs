@@ -3,7 +3,7 @@ use crate::{
     cec::Frame,
     config::Config,
     engine,
-    state::{Command, Mode, Snapshot},
+    state::{BridgeTelemetry, Command, Mode, Snapshot},
 };
 use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS};
 use serde_json::{Value, json};
@@ -17,7 +17,33 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-type OutstandingSends = VecDeque<(u8, Vec<u8>, Instant)>;
+#[derive(Default)]
+pub(crate) struct OutstandingSends(VecDeque<(u8, Vec<u8>, Instant)>);
+
+impl OutstandingSends {
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub(crate) fn record(&mut self, to: u8, data: Vec<u8>, now: Instant) {
+        if self.0.len() == 64 {
+            self.0.pop_front();
+        }
+        self.0.push_back((to, data, now));
+    }
+    pub(crate) fn result(&mut self, payload: &Value, now: Instant) -> Option<engine::Event> {
+        let result = payload.get("HdmiSend")?;
+        while self
+            .0
+            .front()
+            .is_some_and(|(_, _, at)| now.saturating_duration_since(*at) > Duration::from_secs(5))
+        {
+            self.0.pop_front();
+        }
+        let (to, data, _) = self.0.pop_front()?;
+        let ack = result.get("Ack")?.as_bool()?;
+        Some(engine::Event::SendResult { to, data, ack })
+    }
+}
 
 #[derive(Clone)]
 pub struct Mqtt {
@@ -40,7 +66,7 @@ impl Mqtt {
                 client,
                 topic: "fake_bridge".into(),
                 connected: Arc::new(AtomicBool::new(connected)),
-                ingress: Arc::new(Mutex::new(VecDeque::new())),
+                ingress: Arc::new(Mutex::new(OutstandingSends::default())),
             },
             eventloop,
         )
@@ -65,7 +91,7 @@ impl Mqtt {
             client,
             topic: config.bridge.topic.clone(),
             connected: Arc::new(AtomicBool::new(false)),
-            ingress: Arc::new(Mutex::new(VecDeque::new())),
+            ingress: Arc::new(Mutex::new(OutstandingSends::default())),
         };
         let transport = adapter.clone();
         let config = config.clone();
@@ -198,10 +224,7 @@ impl Mqtt {
         ) {
             return false;
         }
-        if outstanding.len() == 64 {
-            outstanding.pop_front();
-        }
-        outstanding.push_back((to, data.to_vec(), Instant::now()));
+        outstanding.record(to, data.to_vec(), Instant::now());
         true
     }
     pub fn states(&self, snapshot: &Snapshot) {
@@ -231,6 +254,13 @@ impl Mqtt {
                 .into(),
             )
         }));
+        if let Some(telemetry) = &snapshot.bridge_telemetry {
+            states.extend([
+                ("bridge_signal".into(), telemetry.signal_dbm.to_string()),
+                ("bridge_link_count".into(), telemetry.link_count.to_string()),
+                ("bridge_uptime".into(), telemetry.uptime_s.to_string()),
+            ]);
+        }
         for (name, value) in states {
             self.publish(format!("choregos/state/{name}"), true, value);
         }
@@ -260,6 +290,7 @@ fn setup_messages(config: &Config, removed_roles: &[String]) -> VecDeque<Setup> 
     let mut messages: VecDeque<_> = [
         format!("tele/{}/SENSOR", config.bridge.topic),
         format!("tele/{}/LWT", config.bridge.topic),
+        format!("tele/{}/STATE", config.bridge.topic),
         format!("stat/{}/RESULT", config.bridge.topic),
         "choregos/cmd/+".into(),
     ]
@@ -290,6 +321,13 @@ fn decode(
     payload: &[u8],
     outstanding: &mut OutstandingSends,
 ) -> Option<Input> {
+    if topic == format!("tele/{}/STATE", config.bridge.topic) {
+        let telemetry = decode_telemetry(payload);
+        if telemetry.is_none() {
+            tracing::debug!("ignoring malformed bridge telemetry");
+        }
+        return telemetry.map(Input::BridgeTelemetry);
+    }
     if topic == format!("tele/{}/SENSOR", config.bridge.topic) {
         return Frame::parse(payload)
             .ok()
@@ -310,18 +348,12 @@ fn decode(
     }
     if topic == format!("stat/{}/RESULT", config.bridge.topic) {
         let result = serde_json::from_slice::<Value>(payload).ok()?;
-        let hdmi_send = result.get("HdmiSend")?;
-        while outstanding
-            .front()
-            .is_some_and(|(_, _, sent_at)| sent_at.elapsed() > Duration::from_secs(5))
-        {
-            outstanding.pop_front();
-        }
-        let (to, data, _) = outstanding.pop_front()?;
-        let ack = hdmi_send.get("Ack").and_then(Value::as_bool);
-        tracing::debug!(to, opcode = ?data.first(), ack, result = %hdmi_send, "bridge HdmiSend result");
-        let ack = ack?;
-        return Some(Input::Event(engine::Event::SendResult { to, data, ack }));
+        result.get("HdmiSend")?;
+        let event = outstanding.result(&result, Instant::now());
+        return Some(Input::BridgeResult {
+            payload: result,
+            event,
+        });
     }
     let command = match topic.strip_prefix("choregos/cmd/")? {
         "mode" => match payload {
@@ -333,6 +365,28 @@ fn decode(
         _ => return None,
     };
     Some(Input::Request(super::Request::Command(command, None)))
+}
+
+fn decode_telemetry(payload: &[u8]) -> Option<BridgeTelemetry> {
+    fn integer(value: &Value) -> Option<i64> {
+        if let Some(value) = value.as_i64() {
+            return Some(value);
+        }
+        let value = value.as_f64()?;
+        // Preserve integral Tasmota floats without saturating out-of-range casts.
+        (value.is_finite()
+            && value.fract() == 0.0
+            && value >= i64::MIN as f64
+            && value < -(i64::MIN as f64))
+            .then_some(value as i64)
+    }
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    Some(BridgeTelemetry {
+        signal_dbm: i32::try_from(integer(value.get("Wifi")?.get("Signal")?)?).ok()?,
+        link_count: u32::try_from(integer(value.get("Wifi")?.get("LinkCount")?)?).ok()?,
+        uptime_s: u64::try_from(integer(value.get("UptimeSec")?)?).ok()?,
+        at: chrono::Utc::now(),
+    })
 }
 
 pub fn discovery(config: &Config) -> Vec<(String, Value)> {
@@ -348,6 +402,9 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
             ("button", "all_off", "All off"),
             ("binary_sensor", "bridge", "Bridge"),
             ("sensor", "conflicts", "Conflicts"),
+            ("sensor", "bridge_signal", "Bridge signal"),
+            ("sensor", "bridge_link_count", "Bridge link count"),
+            ("sensor", "bridge_uptime", "Bridge uptime"),
         ]
         .map(|(a, b, c)| (a.into(), b.into(), c.into())),
     );
@@ -356,6 +413,20 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
         if component != "button" { payload["state_topic"] = json!(format!("choregos/state/{name}")); }
         if component == "select" { payload["options"] = json!(["shadow","active"]); }
         if component == "select" || component == "button" { payload["command_topic"] = json!(format!("choregos/cmd/{name}")); }
+        match name.as_str() {
+            "bridge_signal" => {
+                payload["unit_of_measurement"] = json!("dBm");
+                payload["device_class"] = json!("signal_strength");
+                payload["state_class"] = json!("measurement");
+            }
+            "bridge_link_count" => payload["state_class"] = json!("total_increasing"),
+            "bridge_uptime" => {
+                payload["unit_of_measurement"] = json!("s");
+                payload["device_class"] = json!("duration");
+            }
+            _ => {}
+        }
+        if name.starts_with("bridge_") { payload["entity_category"] = json!("diagnostic"); }
         (format!("homeassistant/{component}/choregos/{name}/config"), payload)
     }).collect()
 }
@@ -363,6 +434,33 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_accepts_integer_floats_and_rejects_missing_fractional_or_overflow_fields() {
+        for payload in [
+            json!({"UptimeSec":282348,"Wifi":{"Signal":-50,"LinkCount":2}}),
+            json!({"UptimeSec":282348.0,"Wifi":{"Signal":-50.0,"LinkCount":2.0}}),
+        ] {
+            let telemetry = decode_telemetry(payload.to_string().as_bytes()).unwrap();
+            assert_eq!(
+                (
+                    telemetry.signal_dbm,
+                    telemetry.link_count,
+                    telemetry.uptime_s
+                ),
+                (-50, 2, 282348)
+            );
+        }
+        for payload in [
+            json!({"UptimeSec":1,"Wifi":{"RSSI":100,"LinkCount":2}}),
+            json!({"UptimeSec":1,"Wifi":{"Signal":-50.5,"LinkCount":2}}),
+            json!({"UptimeSec":1,"Wifi":{"Signal":-50,"LinkCount":-1}}),
+            json!({"UptimeSec":-1,"Wifi":{"Signal":-50,"LinkCount":2}}),
+            json!({"UptimeSec":1,"Wifi":{"Signal":-50,"LinkCount":4294967296_u64}}),
+        ] {
+            assert!(decode_telemetry(payload.to_string().as_bytes()).is_none());
+        }
+    }
 
     #[test]
     fn only_patched_acks_emit_results_but_all_hdmisend_replies_consume_fifo_entries() {
@@ -406,23 +504,30 @@ mod tests {
                 &mut outstanding,
             );
             if let Some(expected_ack) = expected_ack {
-                let Some(Input::Event(engine::Event::SendResult { to, data, ack })) = input else {
+                let Some(Input::BridgeResult {
+                    event: Some(engine::Event::SendResult { to, data, ack }),
+                    ..
+                }) = input
+                else {
                     panic!("expected correlated send result");
                 };
                 assert_eq!((to, data, ack), (expected_to, expected_data, expected_ack));
             } else {
-                assert!(input.is_none());
+                assert!(matches!(
+                    input,
+                    Some(Input::BridgeResult { event: None, .. })
+                ));
             }
         }
-        assert!(
+        assert!(matches!(
             decode(
                 &config,
                 &result_topic,
                 br#"{"HdmiSend":"Done"}"#,
-                &mut outstanding,
-            )
-            .is_none()
-        );
+                &mut outstanding
+            ),
+            Some(Input::BridgeResult { event: None, .. })
+        ));
     }
 
     #[test]
@@ -434,12 +539,16 @@ mod tests {
             assert!(mqtt.send(4, &[opcode]));
         }
         let mut outstanding = mqtt.ingress.lock().unwrap();
-        let Some(Input::Event(engine::Event::SendResult { to, data, ack })) = decode(
+        let Some(Input::BridgeResult {
+            event: Some(engine::Event::SendResult { to, data, ack }),
+            ..
+        }) = decode(
             &config,
             &format!("stat/{}/RESULT", mqtt.topic),
             br#"{"HdmiSend":{"Ack":true}}"#,
             &mut outstanding,
-        ) else {
+        )
+        else {
             panic!("expected the oldest retained send");
         };
         assert_eq!((to, data, ack), (4, vec![1], true));
@@ -462,15 +571,15 @@ mod tests {
                 )
                 .is_some()
             );
-            assert!(
+            assert!(matches!(
                 decode(
                     &config,
                     &format!("stat/{}/RESULT", mqtt.topic),
                     br#"{"HdmiSend":{"Ack":false}}"#,
-                    &mut outstanding,
-                )
-                .is_none()
-            );
+                    &mut outstanding
+                ),
+                Some(Input::BridgeResult { event: None, .. })
+            ));
         }
     }
 
@@ -478,16 +587,20 @@ mod tests {
     fn send_results_discard_entries_older_than_five_seconds() {
         let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
         let now = Instant::now();
-        let mut outstanding = VecDeque::from([
+        let mut outstanding = OutstandingSends(VecDeque::from([
             (4, vec![0x36], now - Duration::from_secs(6)),
             (8, vec![0x8f], now),
-        ]);
-        let Some(Input::Event(engine::Event::SendResult { to, data, ack })) = decode(
+        ]));
+        let Some(Input::BridgeResult {
+            event: Some(engine::Event::SendResult { to, data, ack }),
+            ..
+        }) = decode(
             &config,
             &format!("stat/{}/RESULT", config.bridge.topic),
             br#"{"HdmiSend":{"Ack":false}}"#,
             &mut outstanding,
-        ) else {
+        )
+        else {
             panic!("expected the non-expired send");
         };
         assert_eq!((to, data, ack), (8, vec![0x8f], false));
@@ -643,7 +756,7 @@ mod tests {
                 .subscribe("cmnd/test_bridge/HdmiSend", QoS::AtLeastOnce)
                 .await
                 .unwrap();
-            assert_retained_discovery(&mut received, config.device.len() + 5).await;
+            assert_retained_discovery(&mut received, config.device.len() + 8).await;
             observer
                 .publish(
                     "tele/test_bridge/SENSOR",
@@ -676,7 +789,10 @@ mod tests {
                 .await
                 .unwrap();
             let (to, data, ack) = next_input(&mut rx, |input| match input {
-                Input::Event(engine::Event::SendResult { to, data, ack }) => Some((to, data, ack)),
+                Input::BridgeResult {
+                    event: Some(engine::Event::SendResult { to, data, ack }),
+                    ..
+                } => Some((to, data, ack)),
                 _ => None,
             })
             .await;
@@ -731,7 +847,10 @@ mod tests {
                 .unwrap();
             loop {
                 match rx.recv().await.unwrap() {
-                    Input::Event(engine::Event::SendResult { .. }) => {
+                    Input::BridgeResult {
+                        event: Some(engine::Event::SendResult { .. }),
+                        ..
+                    } => {
                         panic!("stale pre-reconnect send result was correlated");
                     }
                     Input::Event(engine::Event::Frame(frame)) if frame.from == 8 => break,
@@ -754,7 +873,7 @@ mod failure_tests {
     fn fast_lane_drops_disconnected_and_full_publishes_without_enqueuing_stale_work() {
         let (mqtt, mut eventloop) = Mqtt::test_transport(false, 1);
         assert!(!mqtt.send(4, &[0x36]));
-        assert!(mqtt.ingress.lock().unwrap().is_empty());
+        assert!(mqtt.ingress.lock().unwrap().0.is_empty());
         eventloop.clean();
         assert!(eventloop.pending.is_empty());
         mqtt.connected.store(true, Ordering::Release);
@@ -763,16 +882,20 @@ mod failure_tests {
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
         config.bridge.topic.clone_from(&mqtt.topic);
         let mut outstanding = mqtt.ingress.lock().unwrap();
-        let Some(Input::Event(engine::Event::SendResult { to, data, ack })) = decode(
+        let Some(Input::BridgeResult {
+            event: Some(engine::Event::SendResult { to, data, ack }),
+            ..
+        }) = decode(
             &config,
             &format!("stat/{}/RESULT", mqtt.topic),
             br#"{"HdmiSend":{"Ack":false}}"#,
             &mut outstanding,
-        ) else {
+        )
+        else {
             panic!("expected only the successful publish in the FIFO");
         };
         assert_eq!((to, data, ack), (4, vec![0x8f], false));
-        assert!(outstanding.is_empty());
+        assert!(outstanding.0.is_empty());
         eventloop.clean();
         assert_eq!(eventloop.pending.len(), 1);
         assert!(
