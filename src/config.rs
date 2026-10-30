@@ -55,6 +55,8 @@ pub struct Config {
     pub mode: Mode,
     pub mqtt: MqttConfig,
     pub bridge: BridgeConfig,
+    #[serde(default)]
+    pub trace: TraceConfig,
     pub home_assistant: HomeAssistantConfig,
     pub tv: TvConfig,
     pub receiver: ReceiverConfig,
@@ -82,6 +84,18 @@ pub struct MqttConfig {
 pub struct BridgeConfig {
     pub topic: String,
     pub logical_address: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TraceConfig {
+    pub keep_days: u32,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self { keep_days: 30 }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -377,6 +391,9 @@ impl Config {
         self.validate_devices()?;
         self.validate_timing()?;
         self.validate_fake_tv()?;
+        if self.trace.keep_days > 365 {
+            return invalid("trace keep_days must be in 0..=365");
+        }
         if self.bridge.logical_address > 14 {
             return invalid("bridge logical address must be in 0..=14");
         }
@@ -794,6 +811,41 @@ mod review_tests {
                 .unwrap()
                 .fake_tv
                 .replies
+        );
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn trace_retention_defaults_validates_boundaries_and_rejects_unknown_fields() {
+        let text = include_str!("../choregos.example.toml");
+        for days in [0, 30, 365] {
+            assert_eq!(
+                Config::parse(&text.replace("keep_days = 30", &format!("keep_days = {days}")))
+                    .unwrap()
+                    .trace
+                    .keep_days,
+                days
+            );
+        }
+        for days in ["366", "-1", "4294967296"] {
+            assert!(
+                Config::parse(&text.replace("keep_days = 30", &format!("keep_days = {days}")))
+                    .is_err()
+            );
+        }
+        assert!(Config::parse(&text.replace("keep_days = 30", "unknown = 30")).is_err());
+        let mut config: toml::Value = toml::from_str(text).unwrap();
+        config.as_table_mut().unwrap().remove("trace");
+        assert_eq!(
+            Config::parse(&toml::to_string(&config).unwrap())
+                .unwrap()
+                .trace
+                .keep_days,
+            30
         );
     }
 }

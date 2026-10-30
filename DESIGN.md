@@ -289,6 +289,13 @@ an `84` are persisted; empty entries and the bridge LA are excluded. On load,
 drop confirmations older than the fixed 30-day lifetime. Missing files start
 empty; corrupt or unknown versions warn and start empty without failing startup.
 
+- A separate mpsc writer appends engine inputs and actual outgoing CEC frames to
+  `cec-bus.<UTC-date>.jsonl` beside the state file, with learned identities at
+  every open and retention from live-reloadable `[trace].keep_days` (default 30,
+  0 disables, maximum 365). Runtime and replay share one JSONL codec. Trace I/O
+  never blocks the engine. Bridge STATE telemetry is a runtime input, retained
+  only in the snapshot and exposed as diagnostic HA sensors, not an engine event.
+
 `Engine::new(config, now, restored)` receives the seed without I/O. Restored
 entries have Unknown power, no last-seen time, and verified = false; their
 restore instant anchors the first retry deadline. Duplicate restored physical

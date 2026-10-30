@@ -2,6 +2,51 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-30 — Bus trace and bridge telemetry
+
+- Bridge Wi-Fi signal, link count and uptime are runtime `Input` data, not
+  engine `Event`s: diagnostics must not influence the pure decision engine.
+  The snapshot keeps their arrival time and the last received-frame time.
+- Runtime and replay use one JSONL encoder/decoder. Raw `HdmiSend` RESULT
+  payloads, including uncorrelated and stock firmware replies, are captured
+  before passing correlated ACK/NACK events to the engine. Replay correlates
+  them against recorded `cmnd` lines with the live adapter's bounded FIFO and
+  five-second expiry, never against its own generated sends: filtered windows,
+  shadow suppression and configuration changes can produce different actions.
+- Identity headers bypass `--since`/`--until`; otherwise a time window would
+  discard the seed needed to match a device whose vendor/OSD predates it.
+  The last header before the first in-window event wins, including restart
+  headers carrying a newer restored seed. If none precedes that event, a
+  pre-scan supplies the first header as a fallback. Headers after replay starts
+  never reset the reconstructed model.
+- Append-only UTC daily files flush once per line. At roughly 300 lines/hour
+  this is inexpensive, limits buffered data loss and keeps incident slices
+  immediately available. Capture runs in a separate mpsc task with a bounded
+  1024-record queue; overload drops records with one warning per drop streak.
+  Retention and identities use a separate latest-value watch channel, so a full
+  record queue cannot lose a reload or leave future headers permanently stale.
+  I/O errors warn once per failure streak and never stop room control. Retention
+  uses the UTC date encoded in strictly named trace files, leaving other files
+  untouched; pruning failures do not prevent opening the current day's file.
+  A newline before headers appended to non-empty files separates torn writes.
+- Commands retain their existing tuple variants and use adjacent serde tags:
+  `kind` is snake_case and `data` holds a tuple value or the `SendRaw` object.
+  This round-trips all commands without changing engine/UI callers.
+- Traces include only the HA attributes listed in the engine's `HA_ATTRS`
+  contract (currently `source`), excluding media proxy tokens and viewing
+  history. The full attributes remain available to the live snapshot.
+- Recorded commands were already accepted by the live runtime. Replay passes
+  them directly to the engine without repeating runtime validation against a
+  filtered window's incomplete or warming model. File replay warns with
+  `file:line` and skips invalid JSON fragments left by torn writes; valid JSON
+  with invalid envelopes or known-topic payloads still fails with that context.
+  Text fixture replay remains strict. Inputs must be chronological; backwards
+  timestamps fail with an explicit ordering error and file/line location.
+- Broker disconnect/reconnect is `choregos/connection` with `{"mqtt":false}`
+  or `{"mqtt":true}`, distinct from bridge-origin LWT. Replay clears its send
+  FIFO on either marker and maps disconnect to `BridgeOffline`, just like the
+  runtime; reconnect alone never asserts that the bridge is online.
+
 ## 2026-10-29 — Physical address changes keep the role
 
 - During receiver power-up, a running console at LA 8 announced PA 2.3.0.0,

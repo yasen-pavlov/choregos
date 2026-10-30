@@ -22,6 +22,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// HA attributes read by the decision engine and therefore needed in replay traces.
+pub const HA_ATTRS: &[&str] = &["source"];
+
 #[derive(Clone, Debug)]
 pub enum Event {
     Frame(Frame),

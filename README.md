@@ -153,6 +153,7 @@ accepted **only through environment variables**, never as TOML keys:
 | root | `mode`: `shadow` or `active`. Switchable at runtime; persisted back to the file. |
 | `mqtt` | `host`, `port`, `username`, `client_id` |
 | `bridge` | Tasmota `topic` and the `logical_address` the bridge claims (0–14) |
+| `trace` | Optional `keep_days` (default 30, 0–365): UTC daily bus traces beside the state file; 0 disables capture. Live-reloadable. |
 | `home_assistant` | HTTP(S) base `url`; the websocket is `/api/websocket` |
 | `tv` | HA `entity`; `wake` is `{kind="wol", mac, broadcast, port}` or `{kind="http", url, header, token_env}` (POST, header value from the environment); `off` defaults to `{kind="ha"}` or uses `{kind="webos", host, port=3001, key_env}` |
 | `receiver` | HA `entity`, `select_source` boolean |
@@ -204,11 +205,19 @@ on load. Writes are coalesced, atomic and off the event loop; a missing,
 corrupt or unknown-version file logs a warning and starts empty. Delete it
 while stopped to forget everything and re-interrogate the bus.
 
+The separate append-only `cec-bus.<YYYY-MM-DD>.jsonl` files capture received
+and sent frames, bridge availability/results, HA state and accepted commands.
+Each open writes a learned-identities header; daily rollover and startup prune
+files older than `[trace].keep_days`. Trace I/O failures warn without stopping
+control. Bridge telemetry remains runtime-only and is not part of the trace.
+HA traces retain only engine-read attributes (currently `source`), not media
+proxy tokens, titles or application names.
+
 ### MQTT exposure
 
 | Topic | Direction | Purpose |
 | --- | --- | --- |
-| `tele/<bridge.topic>/SENSOR`, `tele/<bridge.topic>/LWT`, `stat/<bridge.topic>/RESULT` | in | CEC frames, bridge availability, send results |
+| `tele/<bridge.topic>/SENSOR`, `tele/<bridge.topic>/LWT`, `tele/<bridge.topic>/STATE`, `stat/<bridge.topic>/RESULT` | in | CEC frames, bridge availability, Wi-Fi/uptime telemetry, send results |
 | `cmnd/<bridge.topic>/HdmiSend` | out | CEC frames to send |
 | `homeassistant/…/config` (retained) | out | HA discovery: role power sensors, active source, conflicts, mode select, all-off button, bridge sensor |
 | `choregos/status` | out | `online`/`offline` (last will) |
@@ -262,10 +271,32 @@ cargo run -- check-config --config choregos.toml
 cargo run -- replay fixtures/capture-streamer-wake.jsonl --config choregos.example.toml
 ```
 
-`replay` feeds a captured MQTT log (timestamps plus bus/LWT payloads) through
-the engine, advances its timers, and prints the resulting decisions and actions
-as JSON. It never connects to anything and needs no secrets. Engine behaviour
-tests in [`tests/replay.rs`](tests/replay.rs) use the same injected time. The
+### Replay
+
+`replay` feeds captures through the engine, advances timers, and prints one
+decision JSON object per line. It never connects to anything and needs no secrets.
+Live traces are `cec-bus.<date>.jsonl` beside `choregos.state.json`
+(`/config` in Docker); a regression fixture is a slice of this file, retaining
+its `choregos/identities` header. Multiple files are consumed in argument order:
+
+```sh
+choregos replay /config/cec-bus.2026-10-29.jsonl /config/cec-bus.2026-10-30.jsonl \
+  --config choregos.toml --since 2026-10-29T23:55:00Z --until 2026-10-30T00:10:00Z
+```
+
+`--since`/`--until` are inclusive RFC3339 bounds; identity headers bypass those
+bounds. The last header before the first in-window event supplies its seed;
+if none precedes it, the first header found is the fallback. Later headers do
+not reset replay state. Files must be supplied in chronological order. Unknown
+topics are ignored. File replay warns with `file:line` and skips torn invalid-JSON
+lines; valid JSON with malformed envelopes or known-topic payloads still fails.
+Text fixture replay remains strict.
+The shared JSONL codec accepts existing bus/LWT fixtures and captures HA state, accepted
+commands (`kind` plus `data` for tuple/struct variants), and send acknowledgements.
+Recorded `cmnd` lines correlate subsequent bridge results; replay never executes
+the engine's actions.
+
+Engine behaviour tests in [`tests/replay.rs`](tests/replay.rs) use the same injected time. The
 production loop is tested against an in-process `rumqttd` broker and a fake HA
 websocket: shadow suppression, mode/config persistence, retained discovery and
 state, broker restart and HA disconnect, with reconnects that really close
