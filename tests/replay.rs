@@ -290,6 +290,107 @@ fn takeover_retries_unconfirmed_standby_in_order_then_expires() {
     assert_no_standby_decision(&engine, "streamer");
 }
 
+fn stop_non_verifying_console(policy: Takeover, all_off: bool) -> (Engine, Instant, Duration) {
+    let (mut engine, now) = setup();
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.mode = Mode::Active;
+    let console = config
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_a")
+        .unwrap();
+    console.takeover = policy;
+    assert!(!console.verify_standby);
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 8, 15, "84230004");
+    frame(&mut engine, now, 8, 15, "822300");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    let takeover = now + Duration::from_secs(1);
+    let (actions, reason) = if all_off {
+        (
+            engine.handle(Event::Command(Command::AllOff), takeover, wall()),
+            "all_off",
+        )
+    } else {
+        (frame(&mut engine, takeover, 4, 0, "04"), "taken_over")
+    };
+    let sent: Vec<_> = actions
+        .into_iter()
+        .filter(|action| matches!(action, Action::CecSend { to: 8, .. }))
+        .collect();
+    let mut expected = vec![];
+    if policy == Takeover::CecPauseStandby {
+        expected.push(Action::CecSend {
+            to: 8,
+            data: vec![0x41, 0x25],
+        });
+    }
+    expected.extend([
+        Action::CecSend {
+            to: 8,
+            data: vec![0x36],
+        },
+        Action::CecSend {
+            to: 8,
+            data: vec![0x8f],
+        },
+    ]);
+    assert_eq!(sent, expected);
+    assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+    assert!(engine.decisions.iter().any(|decision| {
+        decision.role.as_deref() == Some("console_a") && decision.reason == reason
+    }));
+    assert_no_standby_decision(&engine, "console_a");
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    (engine, takeover, settle)
+}
+
+#[test]
+fn disabled_standby_verification_sends_each_sequence_once_without_retry_or_expiry() {
+    for policy in [Takeover::CecStandby, Takeover::CecPauseStandby] {
+        let (mut engine, takeover, settle) = stop_non_verifying_console(policy, false);
+        for data in [vec![0x41, 0x25], vec![0x36], vec![0x8f]] {
+            engine.handle(
+                Event::SendResult {
+                    to: 8,
+                    data,
+                    ack: false,
+                },
+                takeover + Duration::from_millis(1),
+                wall(),
+            );
+            assert_no_standby_decision(&engine, "console_a");
+        }
+        for attempt in 1..=u32::from(engine.config.timing.standby_retries) + 2 {
+            let actions = engine.handle(Event::Tick, takeover + settle * attempt, wall());
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::CecSend { to: 8, .. }))
+            );
+            assert_no_standby_decision(&engine, "console_a");
+            assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+        }
+    }
+}
+
+#[test]
+fn all_off_sends_non_verifying_console_sequence_once_without_retries() {
+    for policy in [Takeover::CecStandby, Takeover::CecPauseStandby] {
+        let (mut engine, stopped, settle) = stop_non_verifying_console(policy, true);
+        for attempt in 1..=u32::from(engine.config.timing.standby_retries) + 2 {
+            let actions = engine.handle(Event::Tick, stopped + settle * attempt, wall());
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::CecSend { to: 8, .. }))
+            );
+            assert_no_standby_decision(&engine, "console_a");
+            assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+        }
+    }
+}
+
 fn exhaust_standby_with_results(results: &[(u8, u8, bool)]) -> Engine {
     let (mut engine, takeover, settle) = takeover_from_streamer();
     for attempt in 0..=engine.config.timing.standby_retries {
@@ -701,6 +802,12 @@ fn bridge_offline_clears_pending_standby_verification() {
 #[test]
 fn silent_role_woken_only_by_physical_address_is_not_assumed_in_standby() {
     let (mut engine, now) = setup();
+    std::sync::Arc::make_mut(&mut engine.config)
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_a")
+        .unwrap()
+        .verify_standby = true;
     engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
     identify_atv(&mut engine, now);
     frame(&mut engine, now, 8, 15, "84230004");

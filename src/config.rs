@@ -249,6 +249,8 @@ pub struct DeviceConfig {
     pub on: Vec<PowerEvent>,
     pub off: Vec<PowerEvent>,
     pub takeover: Takeover,
+    #[serde(default = "default_true")]
+    pub verify_standby: bool,
     pub media_player: Option<String>,
     pub presence: Presence,
 }
@@ -524,6 +526,17 @@ impl DeviceConfig {
         if self.takeover == Takeover::HaMediaStop && self.media_player.is_none() {
             return invalid("ha_media_stop takeover requires media_player");
         }
+        if !self.verify_standby
+            && matches!(
+                self.takeover,
+                Takeover::CecStandby | Takeover::CecPauseStandby
+            )
+            && self.on.contains(&PowerEvent::PowerOn)
+        {
+            return invalid(
+                "CEC takeover with verify_standby = false requires removing power_on from on events: the stop/query reply could wake the role",
+            );
+        }
         Ok(())
     }
 }
@@ -592,6 +605,40 @@ mod tests {
 
     fn example() -> Config {
         Config::parse(include_str!("../choregos.example.toml")).expect("valid example")
+    }
+
+    #[test]
+    fn rejects_non_verifying_cec_stops_that_can_wake_on_their_own_query_reply() {
+        for policy in [
+            Takeover::CecStandby,
+            Takeover::CecPauseStandby,
+            Takeover::HaMediaStop,
+            Takeover::None,
+        ] {
+            let mut config = example();
+            let device = &mut config.device[0];
+            device.takeover = policy;
+            device.media_player = Some("media_player.streamer".into());
+            device.verify_standby = false;
+            let result = config.validate();
+            if matches!(policy, Takeover::CecStandby | Takeover::CecPauseStandby) {
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::Validation(message))
+                        if message.contains("verify_standby = false")
+                            && message.contains("power_on")
+                ));
+                config.device[0].verify_standby = true;
+                assert!(config.validate().is_ok());
+                config.device[0].verify_standby = false;
+                config.device[0]
+                    .on
+                    .retain(|event| *event != PowerEvent::PowerOn);
+                assert!(config.validate().is_ok());
+            } else {
+                assert!(result.is_ok());
+            }
+        }
     }
 
     #[test]

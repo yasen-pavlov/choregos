@@ -2,6 +2,23 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-10-31 — Per-role standby verification
+
+- Add per-device `verify_standby`, default `true`, so a role can send its
+  complete CEC stop/query sequence once without scheduling verification,
+  retries, or `standby_*` decisions. Console-style sources structurally answer
+  Standby with `90 00`, re-announce, then silently sleep more than six seconds
+  later or vanish from the bus. Retrying cannot verify that transition in the
+  current window; `taken_over` already marks the role Off. Nothing confirms
+  the console actually slept once verification is disabled.
+- Opting out leaves `90 xx` replies on the ordinary configured `on`/`off`
+  event path, not a special suppression path. For CEC takeover policies,
+  reject `verify_standby = false` when `on` includes `power_on`: the stop
+  sequence's own query reply could wake the role and undo the takeover.
+- The streamer's verification window and timing defaults were deliberately left
+  alone pending more trace data: it is the source that needs standby retries.
+  Public example configuration uses generic console names.
+
 ## 2026-10-30 — Bus trace and bridge telemetry
 
 - Bridge Wi-Fi signal, link count and uptime are runtime `Input` data, not
