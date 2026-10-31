@@ -106,6 +106,7 @@ source = "Console A"
 on = ["report_physical_address", "image_view_on", "active_source"]
 off = ["standby", "inactive_source"]
 takeover = "cec_standby"
+verify_standby = false            # taken_over already marks the role Off; nothing confirms the console actually slept
 presence = "poll"
 
 [web]

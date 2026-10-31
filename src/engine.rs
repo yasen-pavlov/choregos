@@ -83,11 +83,11 @@ struct StandbyVerification {
 }
 
 impl StandbyVerification {
-    fn actions(&self) -> Vec<Action> {
-        self.frames
+    fn actions(la: u8, frames: &[&[u8]]) -> Vec<Action> {
+        frames
             .iter()
             .map(|data| Action::CecSend {
-                to: self.la,
+                to: la,
                 data: data.to_vec(),
             })
             .collect()
@@ -809,27 +809,28 @@ impl Engine {
                 };
                 self.standby_verifications
                     .retain(|pending| pending.la != la);
-                let pending = StandbyVerification {
-                    la,
-                    role: role.into(),
-                    frames: if device.takeover == Takeover::CecPauseStandby {
-                        &[
-                            &[PLAY, PLAY_MODE_STILL],
-                            &[STANDBY],
-                            &[GIVE_DEVICE_POWER_STATUS],
-                        ]
-                    } else {
-                        &[&[STANDBY], &[GIVE_DEVICE_POWER_STATUS]]
-                    },
-                    deadline: now + Duration::from_millis(self.config.timing.takeover_settle_ms),
-                    attempts: 0,
-                    sent: 0,
-                    acked: false,
-                    nacked: 0,
+                let frames: &[&[u8]] = if device.takeover == Takeover::CecPauseStandby {
+                    &[
+                        &[PLAY, PLAY_MODE_STILL],
+                        &[STANDBY],
+                        &[GIVE_DEVICE_POWER_STATUS],
+                    ]
+                } else {
+                    &[&[STANDBY], &[GIVE_DEVICE_POWER_STATUS]]
                 };
-                let actions = pending.actions();
-                if self.config.mode == Mode::Active {
-                    self.standby_verifications.push(pending);
+                let actions = StandbyVerification::actions(la, frames);
+                if self.config.mode == Mode::Active && device.verify_standby {
+                    self.standby_verifications.push(StandbyVerification {
+                        la,
+                        role: role.into(),
+                        frames,
+                        deadline: now
+                            + Duration::from_millis(self.config.timing.takeover_settle_ms),
+                        attempts: 0,
+                        sent: 0,
+                        acked: false,
+                        nacked: 0,
+                    });
                 }
                 actions
             }
@@ -872,7 +873,7 @@ impl Engine {
             if cancelled || confirmed {
                 self.standby_verifications.swap_remove(index);
             } else if pending.attempts < self.config.timing.standby_retries {
-                let retry = pending.actions();
+                let retry = StandbyVerification::actions(pending.la, pending.frames);
                 let role = pending.role.clone();
                 let pending = &mut self.standby_verifications[index];
                 pending.attempts += 1;

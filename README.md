@@ -182,9 +182,10 @@ may not be `bridge`, `mode`, `conflicts`, `active_source` or `all_off`.
 | --- | --- |
 | `on` / `off` events | `image_view_on`, `text_view_on`, `active_source`, `power_on`, `standby`, `inactive_source`, `power_standby`, `report_physical_address` |
 | `takeover` | `cec_standby` (Standby `36`, then power query `8F`), `cec_pause_standby` (`Play: Still` `41 25`, `36`, `8F`: for sources that ignore Standby while playing), `ha_media_stop` (needs `media_player`), `none` |
+| `verify_standby` | Boolean, default `true`; `false` sends the CEC stop/query sequence once without verification, retries, or `standby_*` decisions |
 | `presence` | `events`, or `poll` for playback devices that leave the bus in standby |
 
-In active mode every CEC stop is verified: only an observed Standby or
+In active mode CEC stops are verified by default: only an observed Standby or
 Transition power report from that address counts. The sequence is sent once,
 then re-sent after each `takeover_settle_ms` up to `standby_retries` more times
 (`0` disables retries). Exhaustion records `standby_unconfirmed`, or, with
@@ -192,6 +193,15 @@ patched firmware, `standby_target_absent` when every frame was NACKed and none
 ACKed (normal for devices that leave the bus in standby).
 Replies to the verification query update bus state but can never wake a role
 back up; a real On event from the user still cancels verification.
+
+Set a role's `verify_standby = false` when it replies On (`90 00`) before
+silently sleeping or leaving the bus. `taken_over` already marks the role Off;
+nothing confirms the console actually slept. The initial stop/query sequence
+is unchanged; no verification is scheduled. Replies follow the normal
+`on`/`off` event lists. For CEC takeover policies, configuration rejects this
+opt-out when `on` includes `power_on`, because the query's `90 00` reply could
+wake the role and undo the takeover. Keep verification enabled for sources
+that need standby retries.
 
 ### Persisted state
 
