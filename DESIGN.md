@@ -2,9 +2,10 @@
 
 Choregos (χορηγός, the patron who ran the chorus at the Dionysia) is the
 conductor of a living-room home theater: it watches the HDMI-CEC bus through a
-Tasmota CEC bridge, keeps a model of who is on the bus and who is the active
-source, and drives the non-CEC parts of the room (TV, receiver, Sonos, Kodi)
-through Home Assistant, with native TV wake/power-off, so that every device can be used with its own remote.
+CEC bridge (patched Tasmota or the native aether firmware), keeps a model of
+who is on the bus and who is the active source, and drives the non-CEC parts
+of the room (TV, receiver, Sonos, Kodi) through Home Assistant, with native TV
+wake/power-off, so that every device can be used with its own remote.
 
 This document is the contract between the implementation slices. It is
 authoritative until superseded by code review decisions recorded in
@@ -18,19 +19,25 @@ TV ──────────── HDMI ──── AV receiver (CEC audio
   Native WoL + webOS SSAP     │ in2 Kodi box        (recording device)
                               │ in3 console A       (playback; leaves the bus entirely in standby)
                               │ in4 console B       (playback)
-                              │ in5 the bridge      (Tasmota HDMI-CEC device, claims the TV role, LA 0)
+                              │ in5 the bridge      (HDMI-CEC device claiming the TV role, LA 0; Tasmota or aether firmware)
 Sonos (line-in of a separate amp, not on HDMI)
 home server: MQTT broker, Home Assistant (websocket), choregos (this)
 ```
 
 The TV's CEC is physically disconnected: the bridge is the only "TV" on the
-bus. Every CEC frame the bridge sees is published as
-`tele/tasmota_cec/SENSOR` → `{"HdmiReceived":{"From":4,"To":0,"Data":"04"}}`
+bus. Two bridge firmwares are supported; `[bridge].kind` selects the adapter
+in `src/runtime/bridge/`. Everything downstream (engine, snapshot, UI, HA
+discovery, trace replay) sees only `Event`s, `BridgeTelemetry` and
+`TraceEntry`s, never bridge topics.
+
+`kind = "tasmota"` (patched Tasmota HDMI-CEC driver): every CEC frame the
+bridge sees is published as
+`tele/<topic>/SENSOR` → `{"HdmiReceived":{"From":4,"To":0,"Data":"04"}}`
 (`Data` = opcode + operands, uppercase hex, no separators; empty for polling
 messages). The bridge publishes frames addressed to itself, to broadcast (15)
 and (patched firmware) to the audio system (5). Choregos sends frames with
-`cmnd/tasmota_cec/HdmiSend` → `{"To":<la>,"Data":"<hex>"}`; the bridge answers
-`stat/tasmota_cec/RESULT` → `{"HdmiSend":"Done"|"Sending failed"}` (stock) or
+`cmnd/<topic>/HdmiSend` → `{"To":<la>,"Data":"<hex>"}`; the bridge answers
+`stat/<topic>/RESULT` → `{"HdmiSend":"Done"|"Sending failed"}` (stock) or
 `{"HdmiSend":{"Ack":bool}}` (patched). Only the patched response reports a
 target's ACK/NACK. Stock `"Done"` means queued; `"Sending failed"` means the
 bridge refused to transmit (busy or no logical address), not a target NACK.
@@ -42,6 +49,63 @@ strings without ACK information. Clear the FIFO on bridge `Offline`/`Online`,
 MQTT disconnect/reconnect, and any config reload (which replaces the transport).
 Results only tune labels/decisions, never gate safety. Raw send data is limited
 to 14 bytes: the bridge rejects payloads of 15 bytes or more.
+`tele/<topic>/LWT` `Online`/`Offline` → `BridgeOnline`/`BridgeOffline`;
+`tele/<topic>/STATE` Wi-Fi fields → `BridgeTelemetry`, stale after 15 min.
+
+`kind = "aether"` (aether MQTT protocol v1, `aether-cec/docs/protocol.md`;
+topics `aether/<node>/{status,bus,tx,telemetry,cfg}`, all JSON, unknown keys
+ignored):
+- `status` (retained; LWT `{"online":false}`): `online:true` → `BridgeOnline`;
+  `online:false` → `BridgeOffline` (pending sends dropped; `boot`/`seq` kept so
+  a same-boot reconnect still dedupes); a changed `boot` while online (retained
+  LWT lost or missed) → `BridgeOffline` then `BridgeOnline`; the same `boot`
+  again with a newer `status.t_us` is a fresh publish from the board (it
+  publishes `status` on every broker connect, so this covers a broker restart
+  that left a stale retained `online:true`, and `la`/bus-state changes) →
+  `BridgeOnline` (resync); the same `boot` and `t_us` (retained redelivery) →
+  no event. `v` ≠ 1 → one error log per connection, no `BridgeOnline`, and
+  `bus` events are ignored until a supported `status` arrives. `status.bus` →
+  `Snapshot.bridge_bus`. On every MQTT (re)connect of its own the adapter
+  drops pending sends and availability (the redelivered retained `status` is
+  an `Online` again) but keeps the board's `boot`/`seq` history, so a QoS 1
+  redelivery around a broker restart still dedupes.
+  Before any `status` has been seen since the last clear the state is
+  *unknown*: `bus` events are decoded without a `BridgeOnline` (this is what
+  a trace replay window or a daily trace file without a `status` line sees;
+  live, the retained `status` always precedes the first `bus` event).
+- `bus` (QoS 1; one ordered stream with a per-boot `seq`): `rx` →
+  `Event::Frame` carrying `ack` and `t_us`; a directed `rx` with `ack:false`
+  was cut short by a NACK (protocol §5.1 publishes the blocks received so
+  far), so the engine receives it header-only (`opcode: None`, no params) as
+  presence evidence while the trace and UI keep the raw frame — a truncated
+  `47`/`84` must never replace a learned identity; `tx` with `origin:"host"` →
+  `Event::SendResult` for the pending send with that `id` (unknown or expired
+  ids are debug-logged and ignored, so manual `mosquitto_pub` sends never reach
+  the engine; `status:"rejected"` → warn with `reason`, no event); `tx` with
+  `origin:"local"` → the UI frame ring only (`FrameDirection::Local`, `ack`
+  `Some(true)` for `ack`, `Some(false)` for `nack`, `None` otherwise), never an
+  engine event; `line` → `Snapshot.bridge_bus`; `err` → debug log. An event
+  whose `seq` is not greater than the last `seq` seen for the current `boot` is
+  a QoS 1 duplicate and is dropped; a gap is logged at warn.
+- Sends: `aether/<node>/tx` → `{"id":"s-<n>","to":<la>,"data":"<HEX>"}`, `n`
+  from one process-wide counter (adapters are replaced on config reload and a
+  late outcome of the old adapter's send must not match the new one's);
+  `retries` is omitted (firmware default: 0 for polls, 1 otherwise, so NACK
+  stays absence evidence). Pending sends live in an id map with the Tasmota
+  FIFO's bounds (64 entries, five-second expiry) and clear points; a late
+  outcome for an id issued before the last clear matches nothing. Raw send
+  data is limited to 15 bytes.
+- `telemetry` → `BridgeTelemetry{signal_dbm: rssi, link_count, uptime_s:
+  t_us / 1e6}`, stale after 3 × `cfg.telemetry_s` (180 s until `cfg` is seen;
+  `telemetry_s = 0` disables telemetry, so `stale_after_s = 0` disables the
+  age check and only the weak-signal check remains).
+- `cfg` (retained): the adapter warns once per connection when `cfg.la`
+  differs from `[bridge].logical_address` and when `[fake_tv].replies` is on
+  while `cfg.replies` is non-empty (both sides would answer the same query).
+  `cmd/*` (including `cmd/state`), `ota` and `log` are not used by Choregos.
+- Promiscuous receive: frames whose `from` is the bridge's own LA (its own
+  sends echoed as `rx`, or another TV during a migration overlap) are published
+  to the UI but never reach the bus model, role signals or the fake TV.
 `fixtures/capture-streamer-wake.jsonl` is a real capture (Kodi standby,
 streaming box wake, standby, re-announce, remote volume presses) and is the
 primary replay fixture.
@@ -62,14 +126,17 @@ primary replay fixture.
 src/main.rs            CLI (clap): run | check-config | replay <fixture>
 src/config.rs          TOML config + env secrets, validation            [core]
 src/cec/mod.rs         pub use                                           [core]
-src/cec/frame.rs       Frame {from, to, opcode: Option<u8>, params: Vec<u8>}; parse HdmiReceived JSON; to_hdmisend() [core]
+src/cec/frame.rs       Frame {from, to, opcode: Option<u8>, params: Vec<u8>, ack: Option<bool>, t_us: Option<u64>}; parse HdmiReceived JSON; to_hdmisend() [core]
 src/cec/opcode.rs      const names for the opcodes used + name lookup for the UI [core]
 src/cec/bus.rs         BusModel: per-LA device table, active source, vendor/osd/physical learning [core]
 src/identity.rs        role resolution (config match rules × bus table)  [core]
 src/engine.rs          pure state machine: Event → Vec<Action> (+ timers) [core]
 src/action.rs          Action enum + Decision log entry                  [core]
 src/runtime/mod.rs     event loop: channels → engine → executor          [core]
-src/runtime/mqtt.rs    rumqttc client; bridge topics; HA discovery; state topics [core]
+src/runtime/mqtt.rs    rumqttc client; HA discovery; state topics; hands bridge topics to src/runtime/bridge [core]
+src/runtime/bridge/mod.rs      kind-selected bridge adapter: topic list, send, and the TraceEntry → Event correlation shared by live decode and replay [core]
+src/runtime/bridge/tasmota.rs  SENSOR/LWT/STATE/RESULT/HdmiSend codec + 64-entry send FIFO [core]
+src/runtime/bridge/aether.rs   status/bus/tx/telemetry/cfg codec + id map, boot tracking, seq dedupe [core]
 src/runtime/ha.rs      HA websocket client: auth, call_service, state subscriptions, reconnect [core]
 src/runtime/wol.rs     magic packet to directed broadcast                [core]
 src/runtime/webos.rs   native TLS SSAP TV power-off                       [core]
@@ -100,8 +167,11 @@ username = "choregos"
 # password: env CHOREGOS_MQTT_PASSWORD
 client_id = "choregos"
 
-[bridge]                  # the Tasmota CEC device
-topic = "tasmota_cec"  # tele/<topic>/SENSOR, cmnd/<topic>/HdmiSend, stat/<topic>/RESULT, tele/<topic>/LWT
+[bridge]                  # the CEC bridge; `kind` selects the adapter (required, no default)
+kind = "tasmota"          # tasmota | aether
+topic = "tasmota_cec"     # tasmota: tele/<topic>/SENSOR, cmnd/<topic>/HdmiSend, stat/<topic>/RESULT, tele/<topic>/LWT, tele/<topic>/STATE
+# kind = "aether"
+# node = "aether"         # aether: aether/<node>/{status,bus,tx,telemetry,cfg}
 logical_address = 0       # what the bridge claims; frames To:<this> are "to the TV"
 
 [home_assistant]
@@ -279,7 +349,7 @@ Pairing-required responses are permanent errors and are never retried.
 After an acknowledged power-off, websocket close is best-effort.
 
 ### 5.6 Startup / resync
-On start and on bridge LWT `Online`: send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
+On start and on bridge online (Tasmota LWT `Online`; aether `status.online:true` or a `boot` change): send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
 Resync additionally sends `83` immediately to each unverified restored LA. This counts as its first query; without identification progress, the next `83` waits `identify_retry_s`, not merely the one-second send slot.
 
 #### Persisted state
@@ -296,8 +366,16 @@ empty; corrupt or unknown versions warn and start empty without failing startup.
   `cec-bus.<UTC-date>.jsonl` beside the state file, with learned identities at
   every open and retention from live-reloadable `[trace].keep_days` (default 30,
   0 disables, maximum 365). Runtime and replay share one JSONL codec. Trace I/O
-  never blocks the engine. Bridge STATE telemetry is a runtime input, retained
+  never blocks the engine. Bridge telemetry is a runtime input, retained
   only in the snapshot and exposed as diagnostic HA sensors, not an engine event.
+- Trace lines are the bridge's own topics and payloads. Tasmota: `tele/<t>/SENSOR`,
+  `tele/<t>/LWT`, `cmnd/<t>/HdmiSend`, `stat/<t>/RESULT`. Aether: the raw
+  `aether/<node>/status` and `aether/<node>/bus` payloads and the
+  `aether/<node>/tx` requests Choregos published (with their `id`). The live
+  adapter and replay turn a `TraceEntry` into engine `Event`s through one
+  shared correlation (`bridge::Correlation`: Tasmota FIFO, aether id map, boot
+  tracking, `seq` dedupe), so replaying a trace reproduces exactly the events
+  the engine saw. `telemetry` and `cfg` are not traced.
 
 `Engine::new(config, now, restored)` receives the seed without I/O. Restored
 entries have Unknown power, no last-seen time, and verified = false; their
@@ -343,13 +421,23 @@ Everything else: no reply (Feature Abort is a firmware concern).
 Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT). Entities: `binary_sensor.choregos_<role>` (power, per role), `sensor.choregos_active_source` (role name or `none`), `select.choregos_mode` (shadow/active), `button.choregos_all_off`, `binary_sensor.choregos_bridge` (bridge LWT), `sensor.choregos_conflicts` (count). Commands arrive on `choregos/cmd/<entity>`. State topics `choregos/state/<name>` retained.
 
 ### 5.12 Events into the engine
-`Frame`, `SendResult{to, data, ack}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
-`SendResult` correlates patched `{"Ack":true|false}` bridge results with
+`Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`Frame.ack` (observed ACK bit) and `Frame.t_us` (bridge-monotonic µs) are
+`None` on Tasmota; the engine never reads them — the aether adapter already reduced a NACK-cut directed `rx` to header-only before the engine sees it (§1).
+`SendResult.status: SendStatus = Ack | Nack | ArbLost | LineError | Busy`,
+`attempts: Option<u8>`. Only `Ack` marks a standby verification acknowledged and
+only `Nack` counts toward `standby_target_absent`; `ArbLost`, `LineError` and
+`Busy` are neither (the target was never asked). Tasmota `{"Ack":true|false}`
+maps to `Ack`/`Nack` with `attempts: None` (its `false` conflates NACK with
+transmit aborts; unchanged behaviour).
+Tasmota `SendResult`s correlate patched `{"Ack":true|false}` bridge results with
 successfully queued `HdmiSend` publishes. Stock `"Done"` / `"Sending failed"`
 and other non-ACK responses consume the FIFO entry without emitting an event:
 they do not establish whether the target is present. Uncorrelated results are
 ignored. Correlated results, including resync NACKs for absent LAs, are
 debug-level logs rather than warnings.
+The raw-send byte limit is a `BridgeConfig` property (14 Tasmota, 15 aether),
+enforced by the engine's `SendRaw` validation and the UI form.
 HA's parsed `last_changed` takes precedence; absent/invalid timestamps use injected
 wall time on state-string changes, otherwise retain the cached timestamp.
 Optimistic state writes preserve the last HA-observed timestamp; sending a
@@ -389,7 +477,7 @@ impl AppState {
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }
-pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView>, pub decisions: VecDeque<DecisionView>, pub connections: Health }
+pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
 pub enum UiEvent { Frame(FrameView), Decision(DecisionView) }   // snapshots are pulled via snapshot(), never broadcast
 pub enum Command { AllOff, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
 
@@ -404,6 +492,6 @@ All `*View` structs are plain `Clone + Serialize` data (no `Instant`s; use
 
 - `src/cec/*`, `src/identity.rs`: unit tests, no I/O. Engine behavior tests live in `tests/replay.rs`, driven by `Event`s with injected monotonic and wall times.
 - `tests/replay.rs`: feeds `fixtures/*.jsonl` through `BusModel` + `Engine` with the reference config and asserts the decision sequence (Kodi off → streaming box on → takeover actions → streaming box off → off-timer → TV/receiver off → streaming box on again → volume keys forwarded only when Sonos playing).
-- Runtime adapters (`mqtt`, `ha`, `wol`): thin; tested with a local broker (`rumqttd` in-process) and a fake HA websocket server in tests where cheap, otherwise exercised by the lead's smoke run against the real stack in shadow mode.
+- Runtime adapters (`mqtt`, `bridge/*`, `ha`, `wol`): thin; tested with a local broker (`rumqttd` in-process) and a fake HA websocket server in tests where cheap, otherwise exercised by the lead's smoke run against the real stack in shadow mode. Bridge codecs are unit-tested per kind on raw payloads (status/boot transitions, seq dedupe and gaps, id correlation and expiry, every `tx` status, rejected/local/err/line events, telemetry) and replayed through `bridge::Correlation` from trace lines so live and replay cannot diverge; `fixtures/aether-*.jsonl` are real captures from the board on the reference bus.
 - Web: handler tests with `axum::body` + a fake `AppState` for the pages; auth middleware tests (unauthenticated → redirect, local login happy path, CSRF rejection).
 - No tests of wiring/copies; coverage target on new code ≥ 80 % honestly.

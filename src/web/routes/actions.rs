@@ -14,9 +14,6 @@ use crate::{
     web::{WebError, WebState, render},
 };
 
-/// Data bytes after the header block; the bridge firmware rejects frames of 15 data bytes or more.
-const MAX_RAW_DATA: usize = 14;
-
 #[derive(Template)]
 #[template(path = "partials/flash.html")]
 struct Flash {
@@ -157,7 +154,8 @@ pub(crate) async fn send_raw(
     let Some(to) = form.to.trim().parse::<u8>().ok().filter(|to| *to <= 15) else {
         return rejected("Destination must be a logical address 0–15.");
     };
-    let data = match parse_hex(&form.data) {
+    let max_bytes = web.app.bridge_max_raw_bytes();
+    let data = match parse_hex(&form.data, max_bytes) {
         Ok(data) => data,
         Err(message) => return rejected(message),
     };
@@ -165,15 +163,16 @@ pub(crate) async fn send_raw(
     run(&web, Command::SendRaw { to, data }, done).await
 }
 
-/// Accepts `8F`, `44 41`, `44:41`; requires 1–14 bytes.
-fn parse_hex(text: &str) -> Result<Vec<u8>, &'static str> {
+/// Accepts `8F`, `44 41`, `44:41`; requires 1–`max_bytes` bytes (the bridge's raw-send limit).
+fn parse_hex(text: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     let digits: String = text
         .chars()
         .filter(|c| !c.is_whitespace() && *c != ':')
         .collect();
-    let data = hex::decode(&digits).map_err(|_| "Data must be hex bytes, e.g. 44 41.")?;
-    if data.is_empty() || data.len() > MAX_RAW_DATA {
-        return Err("Data must be 1–14 bytes.");
+    let data =
+        hex::decode(&digits).map_err(|_| "Data must be hex bytes, e.g. 44 41.".to_owned())?;
+    if data.is_empty() || data.len() > max_bytes {
+        return Err(format!("Data must be 1–{max_bytes} bytes."));
     }
     Ok(data)
 }
@@ -183,14 +182,14 @@ mod tests {
     use super::parse_hex;
 
     #[test]
-    fn raw_data_accepts_separators_and_enforces_frame_length() {
-        assert_eq!(parse_hex("44 41").unwrap(), vec![0x44, 0x41]);
-        assert_eq!(parse_hex("8f").unwrap(), vec![0x8F]);
-        assert_eq!(parse_hex("44:41").unwrap(), vec![0x44, 0x41]);
-        assert!(parse_hex("").is_err());
-        assert!(parse_hex("4").is_err());
-        assert!(parse_hex("zz").is_err());
-        assert_eq!(parse_hex(&"00".repeat(14)).unwrap().len(), 14);
-        assert!(parse_hex(&"00".repeat(15)).is_err());
+    fn raw_data_accepts_separators_and_enforces_the_given_limit() {
+        assert_eq!(parse_hex("44 41", 14).unwrap(), vec![0x44, 0x41]);
+        assert_eq!(parse_hex("8f", 14).unwrap(), vec![0x8F]);
+        assert_eq!(parse_hex("44:41", 14).unwrap(), vec![0x44, 0x41]);
+        assert!(parse_hex("", 14).is_err());
+        assert!(parse_hex("4", 14).is_err());
+        assert!(parse_hex("zz", 14).is_err());
+        assert_eq!(parse_hex(&"00".repeat(14), 14).unwrap().len(), 14);
+        assert!(parse_hex(&"00".repeat(15), 14).is_err());
     }
 }

@@ -25,13 +25,23 @@ use std::{
 /// HA attributes read by the decision engine and therefore needed in replay traces.
 pub const HA_ATTRS: &[&str] = &["source"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendStatus {
+    Ack,
+    Nack,
+    ArbLost,
+    LineError,
+    Busy,
+}
+
 #[derive(Clone, Debug)]
 pub enum Event {
     Frame(Frame),
     SendResult {
         to: u8,
         data: Vec<u8>,
-        ack: bool,
+        status: SendStatus,
+        attempts: Option<u8>,
     },
     BridgeOnline,
     BridgeOffline,
@@ -118,7 +128,7 @@ impl Engine {
             .map(|d| (d.role.clone(), RoleState::default()))
             .collect();
         let mut bus = BusModel::new(
-            config.bridge.logical_address,
+            config.bridge.logical_address(),
             config.timing.identify_retry_s,
             Self::required_queries(&config),
         );
@@ -202,14 +212,16 @@ impl Engine {
                 } => self.handle_ha_state(entity, state, attrs, changed, wall),
                 Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
                 Event::Frame(frame) => self.handle_frame(frame, now, wall),
-                Event::SendResult { to, data, ack } => {
+                Event::SendResult {
+                    to, data, status, ..
+                } => {
                     if let Some(pending) = self.standby_verifications.iter_mut().find(|pending| {
                         pending.la == to && pending.frames.contains(&data.as_slice())
                     }) {
-                        if ack {
-                            pending.acked = true;
-                        } else {
-                            pending.nacked = pending.nacked.saturating_add(1);
+                        match status {
+                            SendStatus::Ack => pending.acked = true,
+                            SendStatus::Nack => pending.nacked = pending.nacked.saturating_add(1),
+                            _ => {}
                         }
                     }
                     vec![]
@@ -277,8 +289,7 @@ impl Engine {
     }
 
     fn handle_config_reloaded(&mut self, config: Arc<Config>, now: Instant) -> Vec<Action> {
-        let bridge_changed = self.config.bridge.topic != config.bridge.topic
-            || self.config.bridge.logical_address != config.bridge.logical_address;
+        let bridge_changed = self.config.bridge != config.bridge;
         self.config = config;
         self.standby_verifications.clear();
         self.roles
@@ -292,7 +303,7 @@ impl Engine {
         }
         if bridge_changed {
             self.bus = BusModel::new(
-                self.config.bridge.logical_address,
+                self.config.bridge.logical_address(),
                 self.config.timing.identify_retry_s,
                 Self::required_queries(&self.config),
             );
@@ -314,6 +325,9 @@ impl Engine {
     }
 
     fn handle_frame(&mut self, frame: Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
+        if frame.from == self.bus.bridge {
+            return vec![];
+        }
         let mut previous_roles = self.identity.roles.clone();
         let keep_running = previous_roles
             .iter()
@@ -597,7 +611,8 @@ impl Engine {
                 }
             }
             Command::SendRaw { to, data } => {
-                if to <= 15 && !data.is_empty() && data.len() <= 14 {
+                if to <= 15 && !data.is_empty() && data.len() <= self.config.bridge.max_raw_bytes()
+                {
                     actions.push(Action::CecSend { to, data });
                 }
             }

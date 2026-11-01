@@ -7,8 +7,12 @@ username = "choregos"
 # password: env CHOREGOS_MQTT_PASSWORD
 client_id = "choregos"
 
-[bridge]                  # the Tasmota CEC device
-topic = "tasmota_cec"  # tele/<topic>/SENSOR, cmnd/<topic>/HdmiSend, stat/<topic>/RESULT, tele/<topic>/LWT
+[bridge]                  # required adapter kind: tasmota | aether
+kind = "tasmota"
+topic = "tasmota_cec"      # tele/<topic>/{SENSOR,LWT,STATE}, stat/<topic>/RESULT, cmnd/<topic>/HdmiSend
+# Alternative: replace kind/topic above with:
+# kind = "aether"
+# node = "cec-bridge"      # aether/<node>/{status,bus,tx,telemetry,cfg}
 logical_address = 0       # what the bridge claims; frames To:<this> are "to the TV"
 
 [trace]

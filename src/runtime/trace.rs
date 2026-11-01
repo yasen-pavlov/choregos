@@ -33,9 +33,18 @@ pub enum TraceEntry {
         bridge: String,
         to: u8,
         data: Vec<u8>,
+        id: Option<String>,
     },
     Result {
         bridge: String,
+        payload: Value,
+    },
+    AetherStatus {
+        node: String,
+        payload: Value,
+    },
+    AetherBus {
+        node: String,
         payload: Value,
     },
     HaState {
@@ -68,13 +77,28 @@ pub fn line(ts: DateTime<Utc>, entry: &TraceEntry) -> String {
             format!("tele/{bridge}/LWT"),
             json!(if *online { "Online" } else { "Offline" }),
         ),
-        TraceEntry::Sent { bridge, to, data } => (
-            format!("cmnd/{bridge}/HdmiSend"),
-            json!({"To":to,"Data":hex::encode_upper(data)}),
-        ),
+        TraceEntry::Sent {
+            bridge,
+            to,
+            data,
+            id,
+        } => match id {
+            Some(id) => (
+                format!("aether/{bridge}/tx"),
+                json!({"id":id,"to":to,"data":hex::encode_upper(data)}),
+            ),
+            None => (
+                format!("cmnd/{bridge}/HdmiSend"),
+                json!({"To":to,"Data":hex::encode_upper(data)}),
+            ),
+        },
         TraceEntry::Result { bridge, payload } => {
             (format!("stat/{bridge}/RESULT"), payload.clone())
         }
+        TraceEntry::AetherStatus { node, payload } => {
+            (format!("aether/{node}/status"), payload.clone())
+        }
+        TraceEntry::AetherBus { node, payload } => (format!("aether/{node}/bus"), payload.clone()),
         TraceEntry::HaState {
             entity,
             state,
@@ -125,6 +149,7 @@ fn known_topic(topic: &str) -> bool {
         (Some("tele"), Some(_), Some("SENSOR" | "LWT"), None)
             | (Some("cmnd"), Some(_), Some("HdmiSend"), None)
             | (Some("stat"), Some(_), Some("RESULT"), None)
+            | (Some("aether"), Some(_), Some("status" | "bus" | "tx"), None)
     )
 }
 
@@ -170,10 +195,25 @@ fn parse_mqtt(topic: &str, payload: Value) -> Option<TraceEntry> {
             bridge,
             to: u8::try_from(payload.get("To")?.as_u64()?).ok()?,
             data: hex::decode(payload.get("Data")?.as_str()?).ok()?,
+            id: None,
         },
         ("stat", "RESULT") if payload.get("HdmiSend").is_some() => {
             TraceEntry::Result { bridge, payload }
         }
+        ("aether", "status") if payload.is_object() => TraceEntry::AetherStatus {
+            node: bridge,
+            payload,
+        },
+        ("aether", "bus") if payload.is_object() => TraceEntry::AetherBus {
+            node: bridge,
+            payload,
+        },
+        ("aether", "tx") => TraceEntry::Sent {
+            bridge,
+            to: u8::try_from(payload.get("to")?.as_u64()?).ok()?,
+            data: hex::decode(payload.get("data")?.as_str()?).ok()?,
+            id: Some(payload.get("id")?.as_str()?.into()),
+        },
         _ => return None,
     })
 }
@@ -430,6 +470,7 @@ mod tests {
                 bridge: "tasmota_cec".into(),
                 to: 4,
                 data: vec![0x36],
+                id: None,
             },
             TraceEntry::Result {
                 bridge: "tasmota_cec".into(),
@@ -696,6 +737,49 @@ mod review_tests {
             records
                 .iter()
                 .all(|entry| matches!(entry, TraceEntry::Command(Command::AllOff)))
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    #[test]
+    fn native_raw_payloads_and_correlated_requests_roundtrip_without_topic_aliases() {
+        let ts = "2026-11-01T00:00:00Z".parse().unwrap();
+        for entry in [
+            TraceEntry::AetherStatus {
+                node: "cec-bridge".into(),
+                payload: json!({"online":true,"v":1,"boot":3,"extra":"preserved"}),
+            },
+            TraceEntry::AetherBus {
+                node: "cec-bridge".into(),
+                payload: json!({"ev":"line","seq":4,"bus":"ok","extra":123}),
+            },
+            TraceEntry::Sent {
+                bridge: "cec-bridge".into(),
+                to: 4,
+                data: vec![0x36],
+                id: Some("s-1".into()),
+            },
+        ] {
+            let text = line(ts, &entry);
+            let (_, parsed) = parse_checked(&text).unwrap().unwrap();
+            assert_eq!(line(ts, &parsed), text);
+        }
+        assert!(
+            parse_checked(
+                &json!({"ts":ts,"topic":"aether/cec-bridge/bus/extra","payload":{}}).to_string()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            parse_checked(
+                &json!({"ts":ts,"topic":"aether/cec-bridge/telemetry","payload":{}}).to_string()
+            )
+            .unwrap()
+            .is_none()
         );
     }
 }

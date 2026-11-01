@@ -2,6 +2,47 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-01 — Aether bridge adapter
+
+- Require `[bridge].kind` explicitly: Tasmota and native aether use different
+  topics, raw-send limits and outcome semantics. Adapter changes restart the
+  transport and reset the bus model rather than guessing a legacy default.
+- Keep native status/bus trace payloads raw and share one correlation decoder
+  between live ingress and replay: boot changes, sequence deduplication and
+  ID-based outcomes must reproduce the same engine inputs.
+- Firmware-local transmissions are visible in the UI as `local`, never engine
+  inputs or host sends. Promiscuous receive from the bridge's own address is
+  likewise UI-only and cannot create an identity or activate a role.
+- Snapshot exposes the current adapter's raw-send limit for the UI; the engine
+  and command validator use the same `BridgeConfig::max_raw_bytes()` property.
+- `cmd/state` and receive-error HA sensors are deferred; line state is
+  diagnostic snapshot data, not a decision-engine input. Tasmota `Ack:false`
+  remains `Nack` for compatibility; native arbitration/line/busy failures do
+  not establish target absence.
+- A directed native `rx` with `ack:false` is presence evidence only: the shared
+  adapter emits a header-only engine frame but retains the full bytes for the UI
+  ring and raw trace. A NACK-cut identity reply must not replace a running device.
+- Availability starts unknown and accepts bus events without inventing an online
+  event, so daily files and `--since` windows replay even without a status prefix.
+  Explicit offline or unsupported protocol status blocks bus events until a
+  supported online status arrives.
+- A board LWT clears pending sends but preserves boot and sequence history.
+  Only a different boot resets sequence deduplication; a newer same-boot status
+  timestamp triggers resync, while equal/older retained redelivery does not.
+- Allocate native `s-<n>` send IDs from one process-wide atomic counter, not an
+  adapter-local counter, so late results cannot collide across config reloads.
+- Remove the unreachable generic frame-input branch; bridge ingress is the sole
+  frame/UI path. One native telemetry-period constant supplies the 180-second
+  initial stale threshold; configured zero disables the age check, not weak RSSI.
+- Expose a lock-only raw-send-limit accessor rather than cloning the snapshot for
+  command validation. Local transmission ACK metadata is true only for `ack`,
+  false only for `nack`, and absent for every other outcome.
+- Name the real identify capture `fixtures/aether-identify.jsonl`; keep its
+  authentic OSD/vendor bytes rather than rewriting bus evidence. Native loop
+  verification takes back the stopped engine and injects its settle tick instead
+  of waiting a real second. Cross-kind save/reload is exercised with an in-process
+  broker and retained native status; the existing ephemeral-port harness stays.
+
 ## 2026-10-31 — Per-role standby verification
 
 - Add per-device `verify_standby`, default `true`, so a role can send its

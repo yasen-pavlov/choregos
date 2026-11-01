@@ -37,7 +37,7 @@ impl Executor {
         action: &Action,
         config: &Config,
         known_las: &[u8],
-    ) -> Option<Vec<crate::cec::Frame>> {
+    ) -> Option<Vec<(crate::cec::Frame, Option<String>)>> {
         if matches!(
             action,
             Action::WakeTv | Action::TvOff | Action::HaCall { .. }
@@ -49,18 +49,23 @@ impl Executor {
         }
         let mut frames = vec![];
         let mut send = |to, data: &[u8]| {
-            if self.mqtt.send(to, data) {
-                frames.push(crate::cec::Frame {
-                    from: config.bridge.logical_address,
-                    to,
-                    opcode: data.first().copied(),
-                    params: data.get(1..).unwrap_or_default().to_vec(),
-                });
+            if let Some(id) = self.mqtt.send(to, data) {
+                frames.push((
+                    crate::cec::Frame {
+                        from: config.bridge.logical_address(),
+                        to,
+                        opcode: data.first().copied(),
+                        params: data.get(1..).unwrap_or_default().to_vec(),
+                        ack: None,
+                        t_us: None,
+                    },
+                    id,
+                ));
             }
         };
         match action {
             Action::Identify { la, queries } => {
-                if *la < 15 && *la != config.bridge.logical_address {
+                if *la < 15 && *la != config.bridge.logical_address() {
                     for (needed, opcode) in [
                         (queries.physical, 0x83),
                         (queries.vendor, 0x8c),

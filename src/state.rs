@@ -54,9 +54,11 @@ impl AppState {
             mode: config.mode,
             warming: true,
             bridge_online: false,
+            bridge_bus: None,
             bridge_telemetry: None,
             last_frame_at: None,
-            bridge_logical_address: config.bridge.logical_address,
+            bridge_logical_address: config.bridge.logical_address(),
+            bridge_max_raw_bytes: config.bridge.max_raw_bytes(),
             roles: config
                 .device
                 .iter()
@@ -123,6 +125,14 @@ impl AppState {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn bridge_max_raw_bytes(&self) -> usize {
+        self.inner
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bridge_max_raw_bytes
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
@@ -219,9 +229,11 @@ pub struct Snapshot {
     pub mode: Mode,
     pub warming: bool,
     pub bridge_online: bool,
+    pub bridge_bus: Option<String>,
     pub bridge_telemetry: Option<BridgeTelemetry>,
     pub last_frame_at: Option<DateTime<Utc>>,
     pub bridge_logical_address: u8,
+    pub bridge_max_raw_bytes: usize,
     pub roles: Vec<RoleView>,
     pub bus: Vec<BusEntryView>,
     pub ha: HaView,
@@ -238,6 +250,7 @@ pub struct BridgeTelemetry {
     pub link_count: u32,
     pub uptime_s: u64,
     pub at: DateTime<Utc>,
+    pub stale_after_s: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -385,6 +398,7 @@ pub struct FrameView {
     pub opcode_name: String,
     pub params: Vec<u8>,
     pub data: String,
+    pub ack: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -392,6 +406,7 @@ pub struct FrameView {
 pub enum FrameDirection {
     Received,
     Sent,
+    Local,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

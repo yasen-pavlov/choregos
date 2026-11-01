@@ -60,6 +60,7 @@ main { padding: 12px; display: flex; flex-direction: column; gap: 12px; max-widt
 .pill.power-standby, .pill.state-paused, .pill.state-idle { color: var(--amber); border-color: var(--amber); }
 .pill.power-transition { color: var(--accent); border-color: var(--accent); }
 .pill.state-unavailable { color: var(--red); border-color: var(--red); }
+.pill.bus-fault { color: var(--red); border-color: var(--red); }
 .conn { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .conn::before {
   content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -143,6 +144,8 @@ label.check { gap: 4px; }
 .op { color: var(--accent); }
 .dir { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 tr.tx .dir { color: var(--amber); }
+tr.local .dir { color: var(--accent); font-style: italic; }
+.nack { font-family: var(--mono); font-size: 10px; color: var(--dim); border: 1px dashed var(--line); border-radius: var(--radius); padding: 0 4px; }
 tr.decision { background: #141b24; }
 tr.decision td { white-space: normal; }
 tr.decision .dir { color: var(--green); }

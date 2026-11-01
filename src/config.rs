@@ -79,11 +79,36 @@ pub struct MqttConfig {
     pub client_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BridgeConfig {
-    pub topic: String,
-    pub logical_address: u8,
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeConfig {
+    Tasmota { topic: String, logical_address: u8 },
+    Aether { node: String, logical_address: u8 },
+}
+
+impl BridgeConfig {
+    pub fn logical_address(&self) -> u8 {
+        match self {
+            Self::Tasmota {
+                logical_address, ..
+            }
+            | Self::Aether {
+                logical_address, ..
+            } => *logical_address,
+        }
+    }
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Tasmota { topic, .. } => topic,
+            Self::Aether { node, .. } => node,
+        }
+    }
+    pub fn max_raw_bytes(&self) -> usize {
+        match self {
+            Self::Tasmota { .. } => 14,
+            Self::Aether { .. } => 15,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -396,8 +421,23 @@ impl Config {
         if self.trace.keep_days > 365 {
             return invalid("trace keep_days must be in 0..=365");
         }
-        if self.bridge.logical_address > 14 {
+        if self.bridge.logical_address() > 14 {
             return invalid("bridge logical address must be in 0..=14");
+        }
+        match &self.bridge {
+            BridgeConfig::Tasmota { topic, .. } if topic.trim().is_empty() => {
+                return invalid("bridge topic must not be empty");
+            }
+            BridgeConfig::Aether { node, .. }
+                if node.is_empty()
+                    || node.len() > 16
+                    || !node
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+            {
+                return invalid("bridge node must match [a-z0-9-]{1,16}");
+            }
+            _ => {}
         }
         if let WakeConfig::Wol { mac, .. } = &self.tv.wake {
             parse_mac(mac)?;
@@ -893,6 +933,77 @@ mod trace_tests {
                 .trace
                 .keep_days,
             30
+        );
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn bridge_kind_is_required_and_each_variant_has_strict_fields_and_limits() {
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(Config::parse(&text.replace("kind = \"tasmota\"\n", "")).is_err());
+        assert_eq!(config.bridge.max_raw_bytes(), 14);
+        for node in [
+            "cec_bridge",
+            "",
+            "Upper",
+            "has/slash",
+            "space node",
+            "12345678901234567",
+            "é",
+        ] {
+            // Nodes intentionally use hyphens, unlike role IDs, which allow underscores.
+            config.bridge = BridgeConfig::Aether {
+                node: node.into(),
+                logical_address: 0,
+            };
+            assert!(
+                Config::parse(&toml::to_string(&config).unwrap()).is_err(),
+                "{node}"
+            );
+        }
+        for node in ["cec-bridge", "a", "0123456789abcdef"] {
+            config.bridge = BridgeConfig::Aether {
+                node: node.into(),
+                logical_address: 14,
+            };
+            let parsed = Config::parse(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(parsed.bridge, config.bridge);
+            assert_eq!(parsed.bridge.max_raw_bytes(), 15);
+            assert_eq!(parsed.bridge.logical_address(), 14);
+        }
+        for bridge in [
+            BridgeConfig::Aether {
+                node: "cec-bridge".into(),
+                logical_address: 15,
+            },
+            BridgeConfig::Tasmota {
+                topic: "".into(),
+                logical_address: 0,
+            },
+            BridgeConfig::Tasmota {
+                topic: "cec".into(),
+                logical_address: 15,
+            },
+        ] {
+            config.bridge = bridge;
+            assert!(config.validate().is_err());
+        }
+        assert!(
+            toml::from_str::<BridgeConfig>(
+                "kind='aether'\nnode='cec'\nlogical_address=0\ntopic='extra'"
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<BridgeConfig>(
+                "kind='tasmota'\ntopic='cec'\nlogical_address=0\nnode='extra'"
+            )
+            .is_err()
         );
     }
 }

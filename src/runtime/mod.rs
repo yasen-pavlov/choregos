@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod cli;
 pub mod executor;
 pub mod ha;
@@ -36,9 +37,9 @@ pub(crate) enum Request {
 pub(crate) enum Input {
     Event(Event),
     BridgeTelemetry(BridgeTelemetry),
-    BridgeResult {
-        payload: serde_json::Value,
-        event: Option<Event>,
+    Bridge {
+        entry: trace::TraceEntry,
+        decoded: bridge::Decoded,
     },
     Connection {
         mqtt: bool,
@@ -81,7 +82,7 @@ impl Adapters {
             worker,
         }
     }
-    fn dispatch(&self, actions: Vec<Action>, engine: &Engine) -> Vec<Frame> {
+    fn dispatch(&self, actions: Vec<Action>, engine: &Engine) -> Vec<(Frame, Option<String>)> {
         let known_las: Vec<_> = engine.identity.roles.values().copied().collect();
         let mut ordered = vec![];
         let mut sent = vec![];
@@ -364,30 +365,34 @@ impl Runtime {
     ) -> anyhow::Result<()> {
         let mut ui_events = vec![];
         let events = match input {
-            Input::Event(event) => {
-                if let Event::Frame(frame) = &event {
-                    let view = frame_view(frame, wall, FrameDirection::Received, &self.engine);
-                    self.snapshot.last_frame_at = Some(wall);
-                    push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
-                    ui_events.push(UiEvent::Frame(view));
-                }
-                vec![event]
-            }
+            Input::Event(event) => vec![event],
             Input::BridgeTelemetry(telemetry) => {
                 self.snapshot.bridge_telemetry = Some(telemetry);
                 vec![]
             }
-            Input::BridgeResult { payload, event } => {
-                if self.engine.config.trace.keep_days != 0 {
-                    self.trace_entry(
-                        wall,
-                        trace::TraceEntry::Result {
-                            bridge: self.engine.config.bridge.topic.clone(),
-                            payload,
-                        },
-                    );
+            Input::Bridge { entry, decoded } => {
+                self.trace_entry(wall, entry);
+                // Local replies are UI-only: never engine inputs or host sends.
+                for frame in decoded.local {
+                    let view = frame_view(&frame, wall, FrameDirection::Local, &self.engine);
+                    push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
+                    ui_events.push(UiEvent::Frame(view));
                 }
-                event.into_iter().collect()
+                for event in &decoded.events {
+                    if let Event::Frame(frame) = event {
+                        let frame = decoded.raw_received.as_ref().unwrap_or(frame);
+                        let view = frame_view(frame, wall, FrameDirection::Received, &self.engine);
+                        self.snapshot.last_frame_at = Some(wall);
+                        push_ring(&mut self.snapshot.recent_frames, view.clone(), 2000);
+                        ui_events.push(UiEvent::Frame(view));
+                    }
+                }
+                self.apply_events(decoded.events, now, wall, &mut ui_events);
+                if let Some(bus) = decoded.bus {
+                    self.snapshot.bridge_bus = Some(bus);
+                }
+                self.publish_snapshot(now, wall, ui_events).await;
+                return Ok(());
             }
             Input::Connection { mqtt, connected } => {
                 if mqtt {
@@ -529,20 +534,25 @@ impl Runtime {
         ui_events: &mut Vec<UiEvent>,
     ) {
         for event in events {
+            if matches!(event, Event::BridgeOffline) {
+                self.snapshot.bridge_bus = None;
+                self.snapshot.bridge_telemetry = None;
+            }
             let actions = self.engine.handle(event, now, wall);
             self.record_decisions(wall, ui_events);
-            for frame in self.adapters().dispatch(actions, &self.engine) {
+            for (frame, id) in self.adapters().dispatch(actions, &self.engine) {
                 if self.engine.config.trace.keep_days != 0 {
                     self.trace_entry(
                         wall,
                         trace::TraceEntry::Sent {
-                            bridge: self.engine.config.bridge.topic.clone(),
+                            bridge: self.engine.config.bridge.name().into(),
                             to: frame.to,
                             data: frame
                                 .opcode
                                 .into_iter()
                                 .chain(frame.params.iter().copied())
                                 .collect(),
+                            id,
                         },
                     );
                 }
@@ -606,20 +616,7 @@ impl Runtime {
         if self.engine.config.trace.keep_days == 0 {
             return;
         }
-        let bridge = &self.engine.config.bridge.topic;
         let entry = match event {
-            Event::Frame(frame) => TraceEntry::Received {
-                bridge: bridge.clone(),
-                frame: frame.clone(),
-            },
-            Event::BridgeOnline => TraceEntry::Lwt {
-                bridge: bridge.clone(),
-                online: true,
-            },
-            Event::BridgeOffline => TraceEntry::Lwt {
-                bridge: bridge.clone(),
-                online: false,
-            },
             Event::HaState {
                 entity,
                 state,
@@ -632,7 +629,12 @@ impl Runtime {
                 changed: *changed,
             },
             Event::Command(command) => TraceEntry::Command(command.clone()),
-            Event::ConfigReloaded(_) | Event::Tick | Event::SendResult { .. } => return,
+            Event::Frame(_)
+            | Event::BridgeOnline
+            | Event::BridgeOffline
+            | Event::ConfigReloaded(_)
+            | Event::Tick
+            | Event::SendResult { .. } => return,
         };
         self.trace_entry(wall, entry);
     }
@@ -818,7 +820,9 @@ fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandErr
         Command::Forget(la) if !engine.bus.entries.contains_key(la) => {
             Some("unknown logical address")
         }
-        Command::SendRaw { to, data } if *to > 15 || data.is_empty() || data.len() > 14 => {
+        Command::SendRaw { to, data }
+            if *to > 15 || data.is_empty() || data.len() > engine.config.bridge.max_raw_bytes() =>
+        {
             Some("invalid CEC destination or payload length")
         }
         Command::Identify(la) if *la == engine.bus.bridge => Some("cannot identify the bridge"),
@@ -931,6 +935,7 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     snapshot.warming = engine.warming;
     snapshot.bridge_online = engine.bridge_online;
     snapshot.bridge_logical_address = engine.bus.bridge;
+    snapshot.bridge_max_raw_bytes = engine.config.bridge.max_raw_bytes();
     snapshot.active_role = engine.active_role.clone();
     snapshot.conflicts = engine.identity.conflicts.clone();
     snapshot.connections.bridge_online = engine.bridge_online;
@@ -1040,6 +1045,7 @@ fn frame_view(
         opcode_name: frame.opcode.map(opcode::name).unwrap_or("Poll").into(),
         params: frame.params.clone(),
         data: frame.data(),
+        ack: frame.ack,
     }
 }
 
@@ -1191,14 +1197,20 @@ mod tests {
     #[test]
     fn snapshots_expose_the_configured_bridge_address_and_refresh_it_after_reload() {
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        config.bridge.logical_address = 14;
+        config.bridge = crate::config::BridgeConfig::Tasmota {
+            topic: config.bridge.name().into(),
+            logical_address: 14,
+        };
         let state = AppState::new(config.clone(), String::new());
         let mut snapshot = state.snapshot();
         assert_eq!(snapshot.bridge_logical_address, 14);
 
         let now = Instant::now();
         let mut engine = Engine::new(config.clone(), now, vec![]);
-        config.bridge.logical_address = 0;
+        config.bridge = crate::config::BridgeConfig::Tasmota {
+            topic: config.bridge.name().into(),
+            logical_address: 0,
+        };
         engine.handle(Event::ConfigReloaded(Arc::new(config)), now, Utc::now());
         update_snapshot(&mut snapshot, &engine, now, Utc::now());
         assert_eq!(snapshot.bridge_logical_address, 0);
@@ -1359,7 +1371,7 @@ mod review_tests {
             &engine,
         );
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data(), "9000");
+        assert_eq!(frames[0].0.data(), "9000");
         eventloop.clean();
         assert_eq!(eventloop.pending.len(), 1);
         adapters.worker.abort();
