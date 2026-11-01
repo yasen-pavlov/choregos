@@ -2,9 +2,9 @@
 {% when BusRow::Frame(frame) %}
 <tr class="frame {{ view::direction(frame.direction) }}">
   <td class="mono dim" title="{{ view::iso(frame.timestamp) }}">{{ view::clock(frame.timestamp) }}</td>
-  <td class="dir">{{ view::direction(frame.direction) }}</td>
+  <td class="dir"{% if frame.direction == crate::state::FrameDirection::Local %} title="The bridge answered on its own (local reply)"{% endif %}>{{ view::direction(frame.direction) }}</td>
   <td><span class="mono la">{{ frame.from }}</span> {{ frame.from_name }}</td>
-  <td><span class="mono la">{{ frame.to }}</span> {{ frame.to_name }}</td>
+  <td><span class="mono la">{{ frame.to }}</span> {{ frame.to_name }}{% if frame.ack == Some(false) %} <span class="nack" title="Not acknowledged on the bus">nack</span>{% endif %}</td>
   <td class="mono op">{{ view::opcode(frame.opcode) }}</td>
   <td>{{ frame.opcode_name }}</td>
   <td class="mono">{{ view::hex_bytes(frame.params) }}</td>

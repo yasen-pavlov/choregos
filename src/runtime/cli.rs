@@ -2,7 +2,7 @@ use crate::{
     config::{self, Config},
     engine::{Engine, Event},
     runtime::{
-        mqtt::OutstandingSends,
+        bridge::Correlation,
         trace::{self, TraceEntry},
     },
 };
@@ -142,7 +142,7 @@ struct Replay {
     previous_ts: Option<chrono::DateTime<chrono::Utc>>,
     identities: Option<Vec<crate::cec::bus::LearnedIdentity>>,
     fallback_identities: Option<Vec<crate::cec::bus::LearnedIdentity>>,
-    outstanding: OutstandingSends,
+    correlation: Correlation,
     since: Option<chrono::DateTime<chrono::Utc>>,
     until: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -166,7 +166,7 @@ impl Replay {
             previous_ts: None,
             identities: None,
             fallback_identities: None,
-            outstanding: OutstandingSends::default(),
+            correlation: Correlation::default(),
             since,
             until,
         })
@@ -212,21 +212,14 @@ impl Replay {
             emit(engine, Event::Tick, deadline, wall, output)?;
         }
         let events = match entry {
-            TraceEntry::Received { frame, .. } => vec![Event::Frame(frame)],
-            TraceEntry::Lwt { online, .. } => {
-                self.outstanding.clear();
-                vec![if online {
-                    Event::BridgeOnline
-                } else {
-                    Event::BridgeOffline
-                }]
-            }
-            TraceEntry::Sent { to, data, .. } => {
-                self.outstanding.record(to, data, now);
+            TraceEntry::Received { .. }
+            | TraceEntry::Lwt { .. }
+            | TraceEntry::Result { .. }
+            | TraceEntry::AetherStatus { .. }
+            | TraceEntry::AetherBus { .. } => self.correlation.apply(&entry, now).events,
+            TraceEntry::Sent { to, data, id, .. } => {
+                self.correlation.record_send(id, to, data, now);
                 vec![]
-            }
-            TraceEntry::Result { payload, .. } => {
-                self.outstanding.result(&payload, now).into_iter().collect()
             }
             TraceEntry::HaState {
                 entity,
@@ -241,7 +234,7 @@ impl Replay {
             }],
             TraceEntry::Command(command) => vec![Event::Command(command)],
             TraceEntry::Connection { mqtt } => {
-                self.outstanding.clear();
+                self.correlation.clear();
                 if mqtt {
                     vec![]
                 } else {
@@ -306,7 +299,7 @@ mod tests {
         config.timing.standby_retries = 0;
         config.timing.takeover_settle_ms = 100;
         let epoch: chrono::DateTime<chrono::Utc> = "2026-10-30T12:00:00Z".parse().unwrap();
-        let bridge = config.bridge.topic.clone();
+        let bridge = config.bridge.name().to_owned();
         let entries = vec![
             (
                 0,
@@ -359,6 +352,7 @@ mod tests {
                     bridge: bridge.clone(),
                     to: 4,
                     data: vec![0x36],
+                    id: None,
                 },
             ),
             (
@@ -367,6 +361,7 @@ mod tests {
                     bridge: bridge.clone(),
                     to: 4,
                     data: vec![0x8f],
+                    id: None,
                 },
             ),
             (
@@ -430,7 +425,7 @@ mod tests {
             trace::line(
                 epoch,
                 &TraceEntry::Received {
-                    bridge: config.bridge.topic.clone(),
+                    bridge: config.bridge.name().to_owned(),
                     frame: crate::cec::Frame::from_hex(4, 15, "87000001").unwrap(),
                 },
             ),
@@ -655,7 +650,7 @@ mod review_tests {
 
     #[test]
     fn recorded_all_off_during_replay_warming_is_not_revalidated() {
-        let bridge = config().bridge.topic;
+        let bridge = config().bridge.name().to_owned();
         let lines = trace::line(
             ts(),
             &TraceEntry::Lwt {
@@ -708,7 +703,7 @@ mod review_tests {
     #[test]
     fn connection_loss_clears_recorded_sends_without_faking_a_bridge_lwt() {
         let mut runner = Replay::new(config(), None, None).unwrap();
-        let bridge = config().bridge.topic;
+        let bridge = config().bridge.name().to_owned();
         let mut output = vec![];
         for entry in [
             TraceEntry::Lwt {
@@ -719,6 +714,7 @@ mod review_tests {
                 bridge: bridge.clone(),
                 to: 4,
                 data: vec![0x36],
+                id: None,
             },
             TraceEntry::Connection { mqtt: false },
             TraceEntry::Result {
@@ -849,5 +845,202 @@ mod file_review_tests {
                 earlier.display()
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::{
+        config::BridgeConfig,
+        runtime::bridge::{self, Incoming},
+        state::{Command, Mode},
+    };
+    use serde_json::{Value, json};
+
+    #[test]
+    fn native_trace_replay_emits_the_same_decisions_as_live_decoding() {
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.bridge = BridgeConfig::Aether {
+            node: "cec-bridge".into(),
+            logical_address: 0,
+        };
+        config.mode = Mode::Active;
+        config.timing.standby_retries = 0;
+        config.timing.takeover_settle_ms = 100;
+        let rows = [
+            (
+                0,
+                "status",
+                json!({"online":true,"v":1,"boot":1,"bus":"ok"}),
+            ),
+            (
+                1,
+                "bus",
+                json!({"ev":"rx","seq":1,"from":4,"to":15,"data":"84210004","ack":true,"t_us":1000}),
+            ),
+            (
+                2,
+                "bus",
+                json!({"ev":"rx","seq":2,"from":4,"to":15,"data":"870010FA","ack":true,"t_us":2000}),
+            ),
+            (
+                3,
+                "bus",
+                json!({"ev":"rx","seq":3,"from":4,"to":0,"data":"4753747265616D6572","ack":true,"t_us":3000}),
+            ),
+            (
+                4,
+                "bus",
+                json!({"ev":"rx","seq":4,"from":4,"to":15,"data":"822100","ack":true,"t_us":4000}),
+            ),
+            (1000, "command", json!(Command::Standby("streamer".into()))),
+            (1001, "tx", json!({"id":"s-1","to":4,"data":"36"})),
+            (1002, "tx", json!({"id":"s-2","to":4,"data":"8F"})),
+            (
+                1003,
+                "bus",
+                json!({"ev":"tx","seq":5,"id":"s-1","origin":"host","status":"nack","attempts":2}),
+            ),
+            (
+                1004,
+                "bus",
+                json!({"ev":"tx","seq":6,"id":"s-2","origin":"host","status":"nack","attempts":2}),
+            ),
+        ];
+        let epoch: chrono::DateTime<chrono::Utc> = "2026-11-01T00:00:00Z".parse().unwrap();
+        let start = Instant::now();
+        let mut engine = Engine::new(config.clone(), start, vec![]);
+        let mut correlation = Correlation::default();
+        let mut live = vec![];
+        let mut lines = String::new();
+        for (ms, suffix, payload) in rows {
+            let ts = epoch + chrono::Duration::milliseconds(ms);
+            let now = start + Duration::from_millis(ms as u64);
+            while let Some(deadline) = engine.next_deadline().filter(|d| *d < now) {
+                let wall =
+                    epoch + chrono::Duration::from_std(deadline.duration_since(start)).unwrap();
+                emit(&mut engine, Event::Tick, deadline, wall, &mut live).unwrap();
+            }
+            let topic = if suffix == "command" {
+                "choregos/command".into()
+            } else {
+                format!("aether/cec-bridge/{suffix}")
+            };
+            lines.push_str(&json!({"ts":ts,"topic":topic,"payload":payload}).to_string());
+            lines.push('\n');
+            if suffix == "tx" {
+                correlation.record_send(
+                    Some(payload["id"].as_str().unwrap().into()),
+                    4,
+                    hex::decode(payload["data"].as_str().unwrap()).unwrap(),
+                    now,
+                );
+            } else if suffix == "command" {
+                emit(
+                    &mut engine,
+                    Event::Command(serde_json::from_value(payload).unwrap()),
+                    now,
+                    ts,
+                    &mut live,
+                )
+                .unwrap();
+            } else {
+                let Some(Incoming::Trace(entry)) = bridge::decode(
+                    &config.bridge,
+                    &topic,
+                    &serde_json::to_vec(&payload).unwrap(),
+                ) else {
+                    panic!("live codec failed")
+                };
+                for event in correlation.apply(&entry, now).events {
+                    emit(&mut engine, event, now, ts, &mut live).unwrap();
+                }
+            }
+        }
+        emit(
+            &mut engine,
+            Event::Tick,
+            start + Duration::from_millis(6004),
+            epoch + chrono::Duration::milliseconds(6004),
+            &mut live,
+        )
+        .unwrap();
+        let mut replayed = vec![];
+        replay(config, &lines, &mut replayed).unwrap();
+        assert_eq!(replayed, live);
+        assert!(
+            String::from_utf8(live)
+                .unwrap()
+                .contains("standby_target_absent")
+        );
+    }
+
+    #[test]
+    fn native_replay_without_status_and_since_after_status_keep_frames_and_decisions() {
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.bridge = BridgeConfig::Aether {
+            node: "cec-bridge".into(),
+            logical_address: 0,
+        };
+        let epoch: chrono::DateTime<chrono::Utc> = "2026-11-01T00:00:00Z".parse().unwrap();
+        let status = json!({"ts":epoch,"topic":"aether/cec-bridge/status","payload":{"online":true,"v":1,"boot":1,"t_us":0}}).to_string();
+        let frames: Vec<String> = [
+            (15, "84210004"),
+            (15, "870010FA"),
+            (0, "4753747265616D6572"),
+            (0, "04"),
+            (15, "822100"),
+        ].into_iter().enumerate().map(|(i, (to, data))| {
+            json!({"ts":epoch + chrono::Duration::seconds(i as i64 + 1),
+                "topic":"aether/cec-bridge/bus",
+                "payload":{"ev":"rx","seq":i+1,"from":4,"to":to,"data":data,"ack":true,"t_us":(i+1)*1000}}).to_string()
+        }).collect();
+        let run = |include_status, since| {
+            let mut replay = Replay::new(config.clone(), since, None).unwrap();
+            let mut output = vec![];
+            if include_status {
+                replay.line(&status, &mut output).unwrap();
+            }
+            for line in &frames {
+                replay.line(line, &mut output).unwrap();
+            }
+            replay.finish(&mut output).unwrap();
+            let engine = replay.engine.as_ref().unwrap();
+            assert_eq!(engine.bus.entries[&4].physical, Some(0x2100));
+            assert_eq!(engine.roles["streamer"].power, crate::state::RolePower::On);
+            assert_eq!(engine.bridge_online, include_status && since.is_none());
+            let decisions: Vec<Value> = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(decisions.iter().any(|d| d["reason"] == "ImageViewOn"));
+            decisions
+        };
+        let with_status = run(true, None);
+        assert_eq!(run(false, None), with_status);
+        assert_eq!(
+            run(true, Some(epoch + chrono::Duration::seconds(1))),
+            with_status
+        );
+
+        // The shared decoder delivers every frame regardless of the status prefix;
+        // only the prefix itself adds an availability event.
+        let now = Instant::now();
+        let (_, status_entry) = trace::parse_checked(&status).unwrap().unwrap();
+        let mut with = Correlation::default();
+        assert!(matches!(
+            &with.apply(&status_entry, now).events[..],
+            [Event::BridgeOnline]
+        ));
+        let mut without = Correlation::default();
+        for line in frames {
+            let (_, entry) = trace::parse_checked(&line).unwrap().unwrap();
+            let with_events = with.apply(&entry, now).events;
+            let without_events = without.apply(&entry, now).events;
+            assert!(matches!((&with_events[..], &without_events[..]),
+                ([Event::Frame(a)], [Event::Frame(b)]) if a == b));
+        }
     }
 }

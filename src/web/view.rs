@@ -9,9 +9,6 @@ use crate::state::{
 
 /// Bridge Wi-Fi signal below this (dBm) is flagged on the dashboard.
 pub(crate) const WEAK_SIGNAL_DBM: i32 = -75;
-/// The bridge publishes telemetry every `TelePeriod` (300 s by default); three missed
-/// periods while it is online means the telemetry (or the link) is stuck.
-pub(crate) const STALE_TELEMETRY: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// Chrome rendered by `base.html` around every authenticated page.
 pub(crate) struct Layout {
@@ -116,8 +113,21 @@ pub(crate) fn bridge_degraded(snapshot: &Snapshot) -> bool {
             .is_some_and(|telemetry| telemetry_degraded_at(telemetry, Utc::now()))
 }
 
+/// Telemetry older than its adapter's `stale_after_s` (three missed periods) means the
+/// telemetry, or the link, is stuck. `stale_after_s == 0` means periodic telemetry is
+/// disabled, so only the signal is judged.
 fn telemetry_degraded_at(telemetry: &BridgeTelemetry, now: DateTime<Utc>) -> bool {
-    telemetry.signal_dbm < WEAK_SIGNAL_DBM || now - telemetry.at > STALE_TELEMETRY
+    let weak_signal = telemetry.signal_dbm < WEAK_SIGNAL_DBM;
+    let stale = telemetry.stale_after_s != 0
+        && (now - telemetry.at).num_seconds()
+            > i64::try_from(telemetry.stale_after_s).unwrap_or(i64::MAX);
+    weak_signal || stale
+}
+
+/// The bridge's bus-line health worth flagging: `stuck_low`, `no_pullup`; nothing when `ok`
+/// or unknown.
+pub(crate) fn bus_fault(snapshot: &Snapshot) -> Option<&str> {
+    snapshot.bridge_bus.as_deref().filter(|bus| *bus != "ok")
 }
 
 pub(crate) fn opt<T: std::fmt::Display>(value: &Option<T>) -> String {
@@ -142,6 +152,7 @@ pub(crate) fn direction(direction: &FrameDirection) -> &'static str {
     match direction {
         FrameDirection::Received => "rx",
         FrameDirection::Sent => "tx",
+        FrameDirection::Local => "local",
     }
 }
 
@@ -229,17 +240,41 @@ mod tests {
         assert_eq!(uptime(&282_348), "3d 6h");
     }
 
-    #[test]
-    fn telemetry_is_degraded_by_weak_signal_or_age_past_the_thresholds() {
+    /// Whether telemetry `age_s` old with `signal_dbm`, under the adapter's `stale_after_s`,
+    /// is degraded on a fixed clock.
+    fn degraded(signal_dbm: i32, age_s: i64, stale_after_s: u64) -> bool {
         let now = Utc.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
-        let telemetry = |signal_dbm, age_s| BridgeTelemetry {
+        let telemetry = BridgeTelemetry {
             signal_dbm,
             link_count: 1,
             uptime_s: 60,
             at: now - chrono::Duration::seconds(age_s),
+            stale_after_s,
         };
-        assert!(!telemetry_degraded_at(&telemetry(-75, 900), now));
-        assert!(telemetry_degraded_at(&telemetry(-76, 0), now));
-        assert!(telemetry_degraded_at(&telemetry(-50, 901), now));
+        telemetry_degraded_at(&telemetry, now)
+    }
+
+    #[test]
+    fn telemetry_is_degraded_by_weak_signal_or_age_past_its_stale_after() {
+        // The age threshold is the adapter's, not a constant of the page.
+        for stale_after in [30, 900] {
+            let age = i64::try_from(stale_after).unwrap();
+            assert!(!degraded(-75, age - 1, stale_after));
+            assert!(!degraded(-75, age, stale_after));
+            assert!(degraded(-50, age + 1, stale_after));
+            assert!(degraded(-76, 0, stale_after));
+        }
+        // The same age is stale under one adapter's threshold and fresh under another's.
+        assert!(degraded(-75, 31, 30));
+        assert!(!degraded(-75, 31, 900));
+        // A threshold beyond any representable age never flags (and never panics).
+        assert!(!degraded(-75, 86_400 * 365, u64::MAX));
+    }
+
+    #[test]
+    fn zero_stale_after_disables_the_age_check_but_not_the_signal_check() {
+        let week = 7 * 86_400;
+        assert!(!degraded(-50, week, 0));
+        assert!(degraded(-80, week, 0));
     }
 }

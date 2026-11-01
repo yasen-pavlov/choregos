@@ -354,7 +354,8 @@ fn disabled_standby_verification_sends_each_sequence_once_without_retry_or_expir
                 Event::SendResult {
                     to: 8,
                     data,
-                    ack: false,
+                    status: choregos::engine::SendStatus::Nack,
+                    attempts: None,
                 },
                 takeover + Duration::from_millis(1),
                 wall(),
@@ -400,7 +401,12 @@ fn exhaust_standby_with_results(results: &[(u8, u8, bool)]) -> Engine {
                 Event::SendResult {
                     to,
                     data: vec![opcode],
-                    ack,
+                    status: if ack {
+                        choregos::engine::SendStatus::Ack
+                    } else {
+                        choregos::engine::SendStatus::Nack
+                    },
+                    attempts: None,
                 },
                 sent_at,
                 wall(),
@@ -480,7 +486,8 @@ fn repeated_standby_with_stale_nacks_still_records_target_absent() {
             Event::SendResult {
                 to: 4,
                 data: vec![opcode],
-                ack: false,
+                status: choregos::engine::SendStatus::Nack,
+                attempts: None,
             },
             stopped,
             wall(),
@@ -607,7 +614,8 @@ fn pause_standby_observed_standby_confirms_despite_nacked_trailing_query() {
             Event::SendResult {
                 to: 4,
                 data: vec![0x36],
-                ack: true,
+                status: choregos::engine::SendStatus::Ack,
+                attempts: None,
             },
             takeover + Duration::from_millis(10),
             wall(),
@@ -623,7 +631,8 @@ fn pause_standby_observed_standby_confirms_despite_nacked_trailing_query() {
             Event::SendResult {
                 to: 4,
                 data: vec![0x8f],
-                ack: false,
+                status: choregos::engine::SendStatus::Nack,
+                attempts: None,
             },
             takeover + Duration::from_millis(30),
             wall(),
@@ -687,7 +696,8 @@ fn pause_standby_nack_accounting_counts_all_three_frames_per_round() {
                         Event::SendResult {
                             to,
                             data,
-                            ack: false,
+                            status: choregos::engine::SendStatus::Nack,
+                            attempts: None,
                         },
                         sent_at,
                         wall(),
@@ -725,7 +735,12 @@ fn pause_standby_acked_standby_without_power_report_remains_unconfirmed() {
             engine.handle(
                 Event::SendResult {
                     to,
-                    ack: data == [0x36],
+                    status: if data == [0x36] {
+                        choregos::engine::SendStatus::Ack
+                    } else {
+                        choregos::engine::SendStatus::Nack
+                    },
+                    attempts: None,
                     data,
                 },
                 sent_at,
@@ -737,7 +752,8 @@ fn pause_standby_acked_standby_without_power_report_remains_unconfirmed() {
             Event::SendResult {
                 to: 4,
                 data: vec![0x8f],
-                ack: false,
+                status: choregos::engine::SendStatus::Nack,
+                attempts: None,
             },
             sent_at,
             wall(),
@@ -2839,7 +2855,8 @@ fn logical_address_move_retargets_pending_standby_without_replaying_wake() {
         Event::SendResult {
             to: 8,
             data: vec![0x36],
-            ack: false,
+            status: choregos::engine::SendStatus::Nack,
+            attempts: None,
         },
         now + Duration::from_secs(1),
         wall(),
@@ -2989,7 +3006,12 @@ fn retarget_after_last_standby_retry_clears_old_address_send_accounting() {
                     Event::SendResult {
                         to: 8,
                         data: vec![opcode],
-                        ack: acked,
+                        status: if acked {
+                            choregos::engine::SendStatus::Ack
+                        } else {
+                            choregos::engine::SendStatus::Nack
+                        },
+                        attempts: None,
                     },
                     sent_at,
                     wall(),
@@ -3110,7 +3132,8 @@ fn retargeted_standby_does_not_keep_old_address_acknowledgements() {
         Event::SendResult {
             to: 8,
             data: vec![0x36],
-            ack: true,
+            status: choregos::engine::SendStatus::Ack,
+            attempts: None,
         },
         now,
         wall(),
@@ -3132,7 +3155,8 @@ fn retargeted_standby_does_not_keep_old_address_acknowledgements() {
                 Event::SendResult {
                     to: 11,
                     data: vec![opcode],
-                    ack: false,
+                    status: choregos::engine::SendStatus::Nack,
+                    attempts: None,
                 },
                 sent_at,
                 wall(),
@@ -3429,14 +3453,14 @@ fn physical_address_change_defers_to_another_logical_address_holding_the_pa() {
 }
 
 #[test]
-fn physical_address_change_from_bridge_still_replaces_its_keys() {
+fn physical_address_change_from_bridge_never_creates_a_bus_identity() {
     let (mut engine, now) = setup();
     for data in ["84250004", "870009BF", "47436F6E736F6C652041", "822500"] {
         frame(&mut engine, now, 0, 15, data);
     }
     frame(&mut engine, now + Duration::from_secs(1), 0, 15, "84100004");
-    assert_eq!(engine.bus.entries[&0].vendor, None);
-    assert_eq!(engine.bus.entries[&0].osd, None);
+    assert!(!engine.bus.entries.contains_key(&0));
+    assert!(engine.identity.roles.is_empty());
     assert_eq!(engine.bus.active_source, None);
 }
 
@@ -3476,4 +3500,207 @@ fn different_device_claiming_a_known_address_does_not_wake_the_old_role() {
         assert_eq!(engine.roles["console_b"].power, RolePower::On);
         assert_eq!(engine.bus.active_source, Some(0x2400));
     }
+}
+
+#[test]
+fn native_transport_failures_neither_ack_nor_establish_target_absence() {
+    use choregos::engine::SendStatus;
+    for status in [SendStatus::ArbLost, SendStatus::LineError, SendStatus::Busy] {
+        for later_nacks in [false, true] {
+            let (mut engine, takeover, settle) =
+                takeover_from_streamer_with_policy(Mode::Active, Takeover::CecStandby);
+            for round in 0..=engine.config.timing.standby_retries {
+                let now = takeover + settle * u32::from(round) + Duration::from_millis(1);
+                for opcode in [0x36, 0x8f] {
+                    engine.handle(
+                        Event::SendResult {
+                            to: 4,
+                            data: vec![opcode],
+                            status,
+                            attempts: Some(5),
+                        },
+                        now,
+                        wall(),
+                    );
+                    if later_nacks {
+                        engine.handle(
+                            Event::SendResult {
+                                to: 4,
+                                data: vec![opcode],
+                                status: SendStatus::Nack,
+                                attempts: Some(1),
+                            },
+                            now,
+                            wall(),
+                        );
+                    }
+                }
+                engine.handle(
+                    Event::Tick,
+                    takeover + settle * (u32::from(round) + 1),
+                    wall(),
+                );
+            }
+            let reason = if later_nacks {
+                "standby_target_absent"
+            } else {
+                "standby_unconfirmed"
+            };
+            assert!(
+                engine.decisions.iter().any(|d| d.reason == reason),
+                "{status:?} {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_send_limit_is_specific_to_the_selected_bridge() {
+    use choregos::config::BridgeConfig;
+    for bridge in [
+        BridgeConfig::Tasmota {
+            topic: "cec".into(),
+            logical_address: 0,
+        },
+        BridgeConfig::Aether {
+            node: "cec-bridge".into(),
+            logical_address: 0,
+        },
+    ] {
+        let max = bridge.max_raw_bytes();
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        config.bridge = bridge;
+        let now = Instant::now();
+        let mut engine = Engine::new(config, now, vec![]);
+        for len in [14, 15, 16] {
+            let data = vec![0x44; len];
+            let actions = engine.handle(
+                Event::Command(Command::SendRaw {
+                    to: 4,
+                    data: data.clone(),
+                }),
+                now,
+                wall(),
+            );
+            assert_eq!(
+                actions,
+                if len <= max {
+                    vec![Action::CecSend { to: 4, data }]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn promiscuous_bridge_address_frames_never_learn_or_signal_a_role() {
+    let (mut engine, now) = setup();
+    for data in ["84210004", "870010FA", "4753747265616D6572", "822100", "04"] {
+        assert!(frame(&mut engine, now, 0, 15, data).is_empty());
+        assert!(engine.bus.entries.is_empty());
+        assert!(engine.decisions.is_empty());
+        assert!(engine.identity.roles.is_empty());
+        assert!(engine.active_role.is_none());
+        assert!(engine.bus.active_source.is_none());
+    }
+    // Also exercise BusModel directly: callers other than the engine must not insert own-LA entries.
+    let f = Frame::from_hex(0, 15, "84210004").unwrap();
+    assert!(engine.bus.handle(&f, now, wall(), false).is_empty());
+    assert!(engine.bus.entries.is_empty());
+}
+
+#[test]
+fn real_native_identify_capture_replays_announced_devices_and_excludes_own_echoes() {
+    use choregos::runtime::{
+        bridge::Correlation,
+        trace::{self, TraceEntry},
+    };
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    config.bridge = choregos::config::BridgeConfig::Aether {
+        node: "cec-bridge".into(),
+        logical_address: 0,
+    };
+    let text = include_str!("../fixtures/aether-identify.jsonl");
+    let mut output = vec![];
+    choregos::runtime::cli::replay(config.clone(), text, &mut output).unwrap();
+    let start = Instant::now();
+    let mut engine = Engine::new(config, start, vec![]);
+    let mut correlation = Correlation::default();
+    let mut epoch = None;
+    let mut outcomes = 0;
+    for line in text.lines() {
+        let (ts, entry) = trace::parse_checked(line).unwrap().unwrap();
+        let epoch = *epoch.get_or_insert(ts);
+        let now = start + (ts - epoch).to_std().unwrap();
+        while let Some(deadline) = engine.next_deadline().filter(|d| *d < now) {
+            engine.handle(Event::Tick, deadline, ts);
+        }
+        if let TraceEntry::Sent { to, data, id, .. } = entry {
+            correlation.record_send(id, to, data, now);
+        } else {
+            for event in correlation.apply(&entry, now).events {
+                if matches!(event, Event::SendResult { .. }) {
+                    outcomes += 1;
+                }
+                engine.handle(event, now, ts);
+            }
+        }
+        assert!(
+            !engine.bus.entries.contains_key(&0),
+            "own RX echo inserted bridge LA"
+        );
+    }
+    assert_eq!(
+        engine.bus.entries.keys().copied().collect::<Vec<_>>(),
+        [1, 4, 5, 11]
+    );
+    assert!(engine.bus.entries[&4].identified);
+    assert!(engine.bus.entries[&5].identified);
+    assert_eq!(engine.bus.entries[&4].physical, Some(0x2100));
+    assert_eq!(engine.bus.entries[&5].physical, Some(0x2000));
+    assert_eq!(engine.bus.entries[&11].osd.as_deref(), Some("Console B"));
+    // PA replies for 1/11 were timing errors in the actual capture: no invented PA or identification.
+    assert!(engine.bus.entries[&1].physical.is_none());
+    assert!(engine.bus.entries[&11].physical.is_none());
+    assert!(!engine.bus.entries[&1].identified);
+    assert!(!engine.bus.entries[&11].identified);
+    assert_eq!(outcomes, 26);
+}
+
+#[test]
+fn nack_cut_osd_reply_keeps_verified_identity_and_running_role() {
+    use choregos::runtime::{bridge::Correlation, trace::TraceEntry};
+    use serde_json::json;
+
+    let (mut engine, start) = setup();
+    frame(&mut engine, start, 1, 15, "84220001");
+    frame(&mut engine, start, 1, 0, "474B6F6469");
+    frame(&mut engine, start, 1, 15, "822200");
+    assert_eq!(engine.identity.roles["kodi"], 1);
+    assert_eq!(engine.roles["kodi"].power, RolePower::On);
+    let now = start + Duration::from_secs(4);
+    let entry = TraceEntry::AetherBus {
+        node: "cec-bridge".into(),
+        payload: json!({"ev":"rx","seq":1,"from":1,"to":0,"data":"474B6F","ack":false,"t_us":456}),
+    };
+    let decoded = Correlation::default().apply(&entry, now);
+    let raw = decoded.raw_received.unwrap();
+    assert_eq!(raw.data(), "474B6F");
+    assert_eq!(raw.ack, Some(false));
+    assert!(matches!(&decoded.events[..], [Event::Frame(Frame {
+        opcode: None, params, ack: Some(false), t_us: Some(456), ..
+    })] if params.is_empty()));
+    for event in decoded.events {
+        engine.handle(event, now, wall());
+        assert!(!engine.decisions.iter().any(|d| d.reason == "identity_lost"));
+    }
+    engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert_eq!(engine.bus.entries[&1].osd.as_deref(), Some("Kodi"));
+    assert!(engine.bus.entries[&1].verified);
+    assert_eq!(engine.identity.roles["kodi"], 1);
+    assert_eq!(engine.roles["kodi"].power, RolePower::On);
+    assert_eq!(engine.bus.entries[&1].last_seen, Some(now));
+    assert!(!engine.decisions.iter().any(|d| d.reason == "identity_lost"));
 }

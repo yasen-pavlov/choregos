@@ -24,7 +24,14 @@ const PASSWORD: &str = "test-only-password";
 const UNREACHABLE_ISSUER: &str = "http://127.0.0.1:9/";
 const PUBLIC_URL: &str = "https://choregos.example.com/";
 
+const TASMOTA_BRIDGE: &str = "kind = \"tasmota\"\ntopic = \"cec_bridge\"";
+const AETHER_BRIDGE: &str = "kind = \"aether\"\nnode = \"cec-bridge\"";
+
 fn config_text(issuer: &str, public_url: &str) -> String {
+    bridge_config_text(issuer, public_url, TASMOTA_BRIDGE)
+}
+
+fn bridge_config_text(issuer: &str, public_url: &str, bridge: &str) -> String {
     format!(
         r#"
 mode = "shadow"
@@ -36,7 +43,7 @@ username = "choregos"
 client_id = "choregos-test"
 
 [bridge]
-topic = "cec_bridge"
+{bridge}
 logical_address = 0
 
 [home_assistant]
@@ -120,7 +127,10 @@ fn harness(issuer: &str) -> Harness {
 }
 
 fn harness_at(issuer: &str, public_url: &str) -> Harness {
-    let text = config_text(issuer, public_url);
+    harness_from(config_text(issuer, public_url))
+}
+
+fn harness_from(text: String) -> Harness {
     let mut config = Config::parse(&text).expect("test config is valid");
     config
         .resolve_secrets(|name| {
@@ -442,6 +452,44 @@ fn answer_one_command(
 }
 
 #[tokio::test]
+async fn raw_send_length_follows_the_configured_bridge() {
+    for (bridge, limit) in [(TASMOTA_BRIDGE, 14), (AETHER_BRIDGE, 15)] {
+        let h = harness_from(bridge_config_text(UNREACHABLE_ISSUER, PUBLIC_URL, bridge));
+        let (cookie, csrf) = h.login().await;
+        let too_long = h
+            .post_form(
+                "/actions/send-raw",
+                &cookie,
+                Some(&csrf),
+                &format!("to=4&data={}", "00".repeat(limit + 1)),
+            )
+            .await;
+        assert_eq!(too_long.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = body(too_long).await;
+        assert!(
+            text.contains(&format!("Data must be 1–{limit} bytes.")),
+            "{bridge}: {text}"
+        );
+
+        let received = answer_one_command(&h.state, Ok(()));
+        let longest = h
+            .post_form(
+                "/actions/send-raw",
+                &cookie,
+                Some(&csrf),
+                &format!("to=4&data={}", "00".repeat(limit)),
+            )
+            .await;
+        assert_eq!(longest.status(), StatusCode::OK, "{bridge}");
+        let command = received.await.expect("runtime received the command");
+        assert!(
+            matches!(&command, Command::SendRaw { to: 4, data } if data.len() == limit),
+            "{bridge}: {command:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn forget_forwards_the_logical_address_and_reloads_only_on_success() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, csrf) = h.login().await;
@@ -651,7 +699,98 @@ fn frame(from: u8, to: u8, opcode: u8, opcode_name: &str) -> FrameView {
         opcode_name: opcode_name.to_owned(),
         params: vec![0x21, 0x00],
         data: format!("{opcode:02X}2100"),
+        ack: None,
     }
+}
+
+/// The `<tr>…</tr>` of the row that renders `text`.
+fn row_containing<'a>(html: &'a str, text: &str) -> &'a str {
+    let at = html
+        .find(text)
+        .unwrap_or_else(|| panic!("{text:?} is rendered"));
+    let open = html[..at].rfind("<tr").expect("text sits inside a row");
+    let close = at + html[at..].find("</tr>").expect("row is closed");
+    &html[open..close]
+}
+
+#[tokio::test]
+async fn bus_rows_mark_local_replies_and_nacked_frames() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    // A local reply that failed without a NACK (arbitration lost, line error, busy): the
+    // adapter reports no ack outcome, so the row must not claim a NACK.
+    let local = FrameView {
+        direction: FrameDirection::Local,
+        ack: None,
+        ..frame(0, 15, 0x84, "Report Physical Address")
+    };
+    let nacked = FrameView {
+        direction: FrameDirection::Sent,
+        ack: Some(false),
+        ..frame(0, 8, 0x8F, "Give Device Power Status")
+    };
+    let acked = FrameView {
+        ack: Some(true),
+        ..frame(4, 0, 0x90, "Report Power Status")
+    };
+    let mut snapshot = h.state.snapshot();
+    snapshot
+        .recent_frames
+        .extend([local, nacked, acked, frame(4, 15, 0x82, "Active Source")]);
+    h.state.publish(snapshot.clone(), []);
+    let page = body(h.get("/bus", Some(&cookie)).await).await;
+
+    let local_row = row_containing(&page, "Report Physical Address");
+    assert!(
+        local_row.starts_with("<tr class=\"frame local\""),
+        "{local_row}"
+    );
+    assert!(local_row.contains(">local</td>"), "{local_row}");
+    assert!(!local_row.contains("nack"), "{local_row}");
+
+    let nacked_row = row_containing(&page, "Give Device Power Status");
+    assert!(
+        nacked_row.starts_with("<tr class=\"frame tx\""),
+        "{nacked_row}"
+    );
+    assert!(
+        classes_around(nacked_row, "nack</span>").contains(&"nack"),
+        "{nacked_row}"
+    );
+    for unmarked in ["Report Power Status", "Active Source"] {
+        let row = row_containing(&page, unmarked);
+        assert!(row.starts_with("<tr class=\"frame rx\""), "{row}");
+        assert!(!row.contains("nack"), "{row}");
+    }
+
+    // Live rows come from the same partial: a local reply the destination NACKed.
+    let response = h.get("/bus/events", Some(&cookie)).await;
+    let mut stream = response.into_body().into_data_stream();
+    h.state.publish(
+        snapshot,
+        [UiEvent::Frame(FrameView {
+            timestamp: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            direction: FrameDirection::Local,
+            ack: Some(false),
+            ..frame(0, 4, 0x47, "Set OSD Name")
+        })],
+    );
+    let mut received = String::new();
+    while !received.contains("event: row") || !received.contains("Set OSD Name") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("SSE event arrives")
+            .expect("stream open")
+            .expect("chunk");
+        received.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    let live = &received[received.find("event: row").expect("live row")..];
+    let live_row = row_containing(live, "Set OSD Name");
+    assert!(
+        live_row.starts_with("<tr class=\"frame local\""),
+        "{live_row}"
+    );
+    assert!(live_row.contains("nack</span>"), "{live_row}");
 }
 
 /// A shadow-mode decision as the runtime records it: the suppressed action carries the
@@ -843,12 +982,14 @@ async fn bridge_group(
     (group, status)
 }
 
-fn telemetry(signal_dbm: i32, age: chrono::TimeDelta) -> BridgeTelemetry {
+/// Telemetry as an adapter reports it, `age` old, stale after the adapter's `stale_after_s`.
+fn telemetry(signal_dbm: i32, age: chrono::TimeDelta, stale_after_s: u64) -> BridgeTelemetry {
     BridgeTelemetry {
         signal_dbm,
         link_count: 2,
         uptime_s: 282_348,
         at: chrono::Utc::now() - age,
+        stale_after_s,
     }
 }
 
@@ -859,7 +1000,7 @@ async fn dashboard_bridge_line_shows_telemetry_and_last_frame() {
     let (group, status) = bridge_group(&h, &cookie, |snapshot| {
         snapshot.bridge_online = true;
         snapshot.connections.bridge_online = true;
-        snapshot.bridge_telemetry = Some(telemetry(-50, chrono::TimeDelta::minutes(2)));
+        snapshot.bridge_telemetry = Some(telemetry(-50, chrono::TimeDelta::minutes(2), 900));
         snapshot.last_frame_at = Some(chrono::Utc::now() - chrono::TimeDelta::seconds(12));
     })
     .await;
@@ -879,22 +1020,54 @@ async fn dashboard_bridge_line_shows_telemetry_and_last_frame() {
 }
 
 #[tokio::test]
-async fn weak_signal_or_stale_telemetry_is_flagged_while_online() {
+async fn weak_signal_or_telemetry_past_its_stale_after_is_flagged_while_online() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    for (signal, age) in [
-        (-80, chrono::TimeDelta::minutes(1)),
-        (-50, chrono::TimeDelta::minutes(16)),
+    // The fixed-clock `view` tests pin the boundaries; here the page follows the adapter's
+    // threshold, and a zero threshold (telemetry disabled) only judges the signal.
+    for (signal, age_s, stale_after_s, flagged) in [
+        (-80, 10, 600, true),
+        (-50, 120, 60, true),
+        (-50, 120, 600, false),
+        (-50, 86_400, 0, false),
+        (-80, 86_400, 0, true),
+    ] {
+        let age = chrono::TimeDelta::seconds(age_s);
+        let (group, _) = bridge_group(&h, &cookie, |snapshot| {
+            snapshot.bridge_online = true;
+            snapshot.bridge_telemetry = Some(telemetry(signal, age, stale_after_s));
+        })
+        .await;
+        assert_eq!(
+            classes_around(&group, " dBm").contains(&"warn"),
+            flagged,
+            "{signal} dBm, {age}, stale after {stale_after_s} s: {group}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bus_line_fault_is_flagged_only_when_not_ok() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    for (bus, pill) in [
+        (None, None),
+        (Some("ok"), None),
+        (Some("stuck_low"), Some("bus stuck_low</span>")),
+        (Some("no_pullup"), Some("bus no_pullup</span>")),
     ] {
         let (group, _) = bridge_group(&h, &cookie, |snapshot| {
             snapshot.bridge_online = true;
-            snapshot.bridge_telemetry = Some(telemetry(signal, age));
+            snapshot.bridge_bus = bus.map(str::to_owned);
         })
         .await;
-        assert!(
-            classes_around(&group, " dBm").contains(&"warn"),
-            "{signal} dBm, {age}: {group}"
-        );
+        match pill {
+            Some(pill) => assert!(
+                classes_around(&group, pill).contains(&"bus-fault"),
+                "{bus:?}: {group}"
+            ),
+            None => assert!(!group.contains("bus-fault"), "{bus:?}: {group}"),
+        }
     }
 }
 
@@ -909,11 +1082,13 @@ async fn bridge_without_telemetry_says_so_and_offline_shows_none() {
 
     let (offline, status) = bridge_group(&h, &cookie, |snapshot| {
         snapshot.bridge_online = false;
-        snapshot.bridge_telemetry = Some(telemetry(-80, chrono::TimeDelta::minutes(30)));
+        snapshot.bridge_telemetry = Some(telemetry(-80, chrono::TimeDelta::minutes(30), 900));
+        // Last known line state from before the bridge dropped: stale, like the telemetry.
+        snapshot.bridge_bus = Some("stuck_low".to_owned());
     })
     .await;
     assert!(offline.contains("offline</span>"));
-    for absent in ["dBm", "telemetry", "links", "warn"] {
+    for absent in ["dBm", "telemetry", "links", "warn", "bus-fault"] {
         assert!(
             !offline.contains(absent),
             "offline shows {absent}: {offline}"

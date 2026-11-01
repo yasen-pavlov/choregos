@@ -6,6 +6,8 @@ pub struct Frame {
     pub to: u8,
     pub opcode: Option<u8>,
     pub params: Vec<u8>,
+    pub ack: Option<bool>,
+    pub t_us: Option<u64>,
 }
 
 impl Frame {
@@ -41,6 +43,8 @@ impl Frame {
             to,
             opcode: bytes.first().copied(),
             params: bytes.get(1..).unwrap_or_default().to_vec(),
+            ack: None,
+            t_us: None,
         })
     }
 

@@ -1,7 +1,7 @@
 # Choregos
 
 **A home-theater conductor.** Choregos listens to the HDMI-CEC bus through a
-Tasmota CEC bridge and keeps the room in step: wake the TV and receiver when a
+Tasmota or native aether CEC bridge and keeps the room in step: wake the TV and receiver when a
 source wakes, pick the right input, put displaced sources to sleep, shut the
 room down when the last one goes quiet. Use each source's own remote; Choregos
 handles the rest.
@@ -52,7 +52,7 @@ testable model instead of a pile of automations.
 
 ```mermaid
 flowchart LR
-    bridge["Tasmota CEC bridge<br/>(claims the TV role)"] -- "frames, ACKs" --> mqtt[(MQTT)]
+    bridge["Tasmota / aether CEC bridge<br/>(claims the TV role)"] -- "frames, ACKs" --> mqtt[(MQTT)]
     mqtt -- "sends" --> bridge
     mqtt <--> choregos["Choregos<br/>bus model · roles · decisions"]
     choregos <-- "websocket" --> ha["Home Assistant"]
@@ -73,11 +73,12 @@ records the implementation choices made along the way.
 
 ## Requirements
 
-- A Tasmota device with HDMI-CEC support wired to a spare HDMI input, claiming
-  the TV logical address. Stock Tasmota works; the
-  [patched firmware](https://github.com/yasen-pavlov/Tasmota/tree/ht/cec-v16)
-  additionally reports whether each sent frame was ACKed, which lets a failed
-  standby be classified as "target left the bus" instead of merely unconfirmed.
+- A CEC bridge wired to a spare HDMI input, claiming the TV logical address:
+  either the native aether ESP32 firmware (aether MQTT protocol v1; separate
+  project, not yet published), or Tasmota with HDMI-CEC support. Stock Tasmota works;
+  the [patched firmware](https://github.com/yasen-pavlov/Tasmota/tree/ht/cec-v16)
+  additionally reports target ACK/NACK. Native aether also distinguishes
+  arbitration loss, line errors and busy outcomes from target absence.
 - An MQTT broker the bridge publishes to.
 - Home Assistant with `media_player` entities for the receiver and TV, plus a
   long-lived access token. Sonos is optional; a source needs an entity only if
@@ -152,7 +153,7 @@ accepted **only through environment variables**, never as TOML keys:
 | --- | --- |
 | root | `mode`: `shadow` or `active`. Switchable at runtime; persisted back to the file. |
 | `mqtt` | `host`, `port`, `username`, `client_id` |
-| `bridge` | Tasmota `topic` and the `logical_address` the bridge claims (0–14) |
+| `bridge` | Required `kind = "tasmota"` with `topic`, or `kind = "aether"` with `node` (`[a-z0-9-]{1,16}`); both require `logical_address` (0–14). Live-reloadable; adapter changes reset the bus. Raw sends allow 14 data bytes on Tasmota, 15 on aether. |
 | `trace` | Optional `keep_days` (default 30, 0–365): UTC daily bus traces beside the state file; 0 disables capture. Live-reloadable. |
 | `home_assistant` | HTTP(S) base `url`; the websocket is `/api/websocket` |
 | `tv` | HA `entity`; `wake` is `{kind="wol", mac, broadcast, port}` or `{kind="http", url, header, token_env}` (POST, header value from the environment); `off` defaults to `{kind="ha"}` or uses `{kind="webos", host, port=3001, key_env}` |
@@ -229,6 +230,9 @@ proxy tokens, titles or application names.
 | --- | --- | --- |
 | `tele/<bridge.topic>/SENSOR`, `tele/<bridge.topic>/LWT`, `tele/<bridge.topic>/STATE`, `stat/<bridge.topic>/RESULT` | in | CEC frames, bridge availability, Wi-Fi/uptime telemetry, send results |
 | `cmnd/<bridge.topic>/HdmiSend` | out | CEC frames to send |
+| `aether/<bridge.node>/status`, `aether/<bridge.node>/bus` | in | Native availability/boot/version and ordered RX, ID-correlated TX outcomes, local replies and line health |
+| `aether/<bridge.node>/telemetry`, `aether/<bridge.node>/cfg` | in | Native Wi-Fi/uptime telemetry (stale after 3 × configured period) and effective config; warns about LA or local-reply overlap |
+| `aether/<bridge.node>/tx` | out | Native CEC send request with process-wide `s-<n>` correlation IDs (unique across config reloads); firmware-default retries |
 | `homeassistant/…/config` (retained) | out | HA discovery: role power sensors, active source, conflicts, mode select, all-off button, bridge sensor |
 | `choregos/status` | out | `online`/`offline` (last will) |
 | `choregos/state/<name>` (retained) | out | Entity states |

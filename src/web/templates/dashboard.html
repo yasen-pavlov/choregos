@@ -31,6 +31,9 @@
       <span class="label">bridge</span>
       <span class="conn {% if snapshot.bridge_online %}up{% else %}down{% endif %}">{% if snapshot.bridge_online %}online{% else %}offline{% endif %}</span>
       {% if snapshot.bridge_online %}
+      {% if let Some(fault) = view::bus_fault(snapshot) %}
+      <span class="pill bus-fault" title="The bridge reports a CEC line fault: stuck_low = held low over 100 ms with no valid frame; no_pullup = read low at boot">bus {{ fault }}</span>
+      {% endif %}
       {% if let Some(telemetry) = snapshot.bridge_telemetry %}
       <span class="bridge-detail{% if view::bridge_degraded(snapshot) %} warn{% endif %}" title="Wi-Fi signal · Wi-Fi links since boot (1 = never reconnected) · uptime · age of the last telemetry">· {{ view::dbm(telemetry.signal_dbm) }} · {{ view::links(telemetry.link_count) }} · up {{ view::uptime(telemetry.uptime_s) }} · telemetry {{ view::since(telemetry.at) }}</span>
       {% else %}

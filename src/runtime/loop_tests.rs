@@ -342,12 +342,15 @@ struct Harness {
     ha: HaFake,
     broker: Broker,
     stop: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<anyhow::Result<()>>>,
+    task: Option<JoinHandle<anyhow::Result<crate::engine::Engine>>>,
     _directory: tempfile::TempDir,
     _wake: UdpSocket,
 }
 impl Harness {
     async fn start() -> Self {
+        Self::start_with_bridge(false).await
+    }
+    async fn start_with_bridge(native: bool) -> Self {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reservation.local_addr().unwrap();
         drop(reservation);
@@ -356,6 +359,28 @@ impl Harness {
         peer.wait_for(|view| view.connected && view.subscriptions > 0)
             .await;
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        if native {
+            config.bridge = crate::config::BridgeConfig::Aether {
+                node: "cec-bridge".into(),
+                logical_address: 0,
+            };
+            config.fake_tv.replies = false;
+            config.mode = Mode::Active;
+            // Publish before the runtime subscribes: only retained redelivery can start resync.
+            peer.publish(
+                "aether/cec-bridge/status",
+                true,
+                r#"{"online":true,"v":1,"boot":1,"bus":"ok"}"#,
+            )
+            .await;
+            peer.wait_for(|view| {
+                view.publications
+                    .iter()
+                    .any(|p| p.topic == "aether/cec-bridge/status")
+            })
+            .await;
+            peer.retained("aether/cec-bridge/status").await;
+        }
         let ha = HaFake::start(&config).await;
         config.mqtt.host = "127.0.0.1".into();
         config.mqtt.port = address.port();
@@ -366,7 +391,12 @@ impl Harness {
             broadcast: Ipv4Addr::LOCALHOST,
             port: wake.local_addr().unwrap().port(),
         };
-        config.timing.takeover_settle_ms = 25;
+        // Native outcome verification is ticked explicitly after taking back the
+        // stopped loop's engine, not by waiting for a wall-clock settle timer.
+        config.timing.takeover_settle_ms = if native { 60_000 } else { 25 };
+        if native {
+            config.timing.standby_retries = 0;
+        }
         config
             .resolve_secrets(|_| Some(DUMMY_SECRET.into()))
             .unwrap();
@@ -391,14 +421,16 @@ impl Harness {
             _directory: directory,
             _wake: wake,
         };
-        harness
-            .peer
-            .publish(
-                &format!("tele/{}/LWT", harness.config.bridge.topic),
-                true,
-                "Online",
-            )
-            .await;
+        if !native {
+            harness
+                .peer
+                .publish(
+                    &format!("tele/{}/LWT", harness.config.bridge.name()),
+                    true,
+                    "Online",
+                )
+                .await;
+        }
         wait_snapshot(&harness.state, |snapshot| {
             snapshot.connections.mqtt_connected
                 && snapshot.connections.ha_connected
@@ -422,7 +454,7 @@ impl Harness {
     ) -> (
         AppState,
         oneshot::Sender<()>,
-        JoinHandle<anyhow::Result<()>>,
+        JoinHandle<anyhow::Result<crate::engine::Engine>>,
     ) {
         let state = AppState::new(config.clone(), text);
         let (tx, mut rx) = mpsc::channel(256);
@@ -444,7 +476,8 @@ impl Harness {
                 })
                 .await;
             runtime.adapters.take().unwrap().stop().await;
-            result
+            result?;
+            Ok(runtime.engine)
         });
         (state, stop, task)
     }
@@ -471,7 +504,7 @@ impl Harness {
             }
             self.peer
                 .publish(
-                    &format!("tele/{}/SENSOR", self.config.bridge.topic),
+                    &format!("tele/{}/SENSOR", self.config.bridge.name()),
                     false,
                     payload,
                 )
@@ -498,16 +531,22 @@ impl Harness {
             .unwrap();
     }
     async fn stop_runtime(&mut self) {
+        self.take_engine().await;
+    }
+    async fn take_engine(&mut self) -> Option<crate::engine::Engine> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
-            tokio::time::timeout(WAIT, task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            return Some(
+                tokio::time::timeout(WAIT, task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            );
         }
+        None
     }
     async fn shutdown(&mut self) {
         self.stop_runtime().await;
@@ -754,7 +793,7 @@ async fn broker_restart_reinterrogates_the_bridge_and_ha_disconnect_invalidates_
     harness
         .peer
         .publish(
-            &format!("tele/{}/LWT", harness.config.bridge.topic),
+            &format!("tele/{}/LWT", harness.config.bridge.name()),
             true,
             "Online",
         )
@@ -763,7 +802,7 @@ async fn broker_restart_reinterrogates_the_bridge_and_ha_disconnect_invalidates_
         snapshot.connections.mqtt_connected && snapshot.bridge_online
     })
     .await;
-    let topic = format!("cmnd/{}/HdmiSend", harness.config.bridge.topic);
+    let topic = format!("cmnd/{}/HdmiSend", harness.config.bridge.name());
     harness
         .peer
         .wait_for(|view| {
@@ -884,7 +923,7 @@ async fn restart_restores_history_but_waits_for_physical_verification_to_match_r
     harness
         .peer
         .publish(
-            &format!("tele/{}/SENSOR", harness.config.bridge.topic),
+            &format!("tele/{}/SENSOR", harness.config.bridge.name()),
             false,
             serde_json::to_vec(&json!({"HdmiReceived":{"From":4,"To":15,"Data":"84210004"}}))
                 .unwrap(),
@@ -953,7 +992,7 @@ async fn state_writes_ignore_ordinary_frames_and_shutdown_flushes_latest_decisio
         harness
             .peer
             .publish(
-                &format!("tele/{}/SENSOR", harness.config.bridge.topic),
+                &format!("tele/{}/SENSOR", harness.config.bridge.name()),
                 false,
                 serde_json::to_vec(&json!({"HdmiReceived":{"From":4,"To":0,"Data":""}})).unwrap(),
             )
@@ -1049,7 +1088,7 @@ async fn runtime_captures_replay_inputs_and_publishes_retained_bridge_telemetry(
     harness
         .peer
         .publish(
-            &format!("stat/{}/RESULT", harness.config.bridge.topic),
+            &format!("stat/{}/RESULT", harness.config.bridge.name()),
             false,
             r#"{"HdmiSend":{"Ack":false}}"#,
         )
@@ -1058,7 +1097,7 @@ async fn runtime_captures_replay_inputs_and_publishes_retained_bridge_telemetry(
     harness
         .peer
         .publish(
-            &format!("tele/{}/STATE", harness.config.bridge.topic),
+            &format!("tele/{}/STATE", harness.config.bridge.name()),
             false,
             r#"{"UptimeSec":282348.0,"Wifi":{"RSSI":100,"Signal":-50.0,"LinkCount":2.0}}"#,
         )
@@ -1152,7 +1191,7 @@ async fn telemetry_after_offline_does_not_mark_the_bridge_online() {
     harness
         .peer
         .publish(
-            &format!("tele/{}/LWT", harness.config.bridge.topic),
+            &format!("tele/{}/LWT", harness.config.bridge.name()),
             true,
             "Offline",
         )
@@ -1163,7 +1202,7 @@ async fn telemetry_after_offline_does_not_mark_the_bridge_online() {
     harness
         .peer
         .publish(
-            &format!("tele/{}/STATE", harness.config.bridge.topic),
+            &format!("tele/{}/STATE", harness.config.bridge.name()),
             false,
             r#"{"UptimeSec":60,"Wifi":{"Signal":-80,"LinkCount":3}}"#,
         )
@@ -1183,5 +1222,238 @@ async fn telemetry_after_offline_does_not_mark_the_bridge_online() {
         ),
         (-80, 3, 60)
     );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_retained_status_resync_and_id_correlated_outcomes_reach_the_engine() {
+    let mut harness = Harness::start_with_bridge(true).await;
+    assert_eq!(harness.state.snapshot().bridge_bus.as_deref(), Some("ok"));
+    let topic = "aether/cec-bridge/tx";
+    let observed = harness
+        .peer
+        .wait_for(|view| {
+            view.publications
+                .iter()
+                .filter(|p| p.topic == topic)
+                .count()
+                >= 5
+        })
+        .await;
+    let resync: Vec<Value> = observed
+        .publications
+        .iter()
+        .filter(|p| p.topic == topic)
+        .map(|p| serde_json::from_slice(&p.payload).unwrap())
+        .collect();
+    let mut previous = 0;
+    for send in &resync {
+        let number = send["id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("s-")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(number > previous);
+        previous = number;
+        assert!(send.get("retries").is_none());
+    }
+    assert_eq!(resync[0]["to"], 15);
+    assert_eq!(resync[0]["data"], "85");
+    let mut seq = 0_u32;
+    for (from, to, data) in [
+        (0, 1, "8F"), // Promiscuous own-send echo must not create a bus entry.
+        (4, 15, "84210004"),
+        (4, 15, "870010FA"),
+        (4, 0, "4753747265616D6572"),
+        (4, 15, "822100"),
+    ] {
+        seq += 1;
+        harness.peer.publish("aether/cec-bridge/bus", false, json!({"ev":"rx","seq":seq,"t_us":seq*1000,"from":from,"to":to,"data":data,"ack":true}).to_string()).await;
+    }
+    let snapshot = wait_snapshot(&harness.state, role_on).await;
+    assert!(!snapshot.bus.iter().any(|entry| entry.logical_address == 0));
+    assert!(
+        snapshot
+            .recent_frames
+            .iter()
+            .any(|f| f.from == 0 && f.direction == FrameDirection::Received && f.ack == Some(true))
+    );
+    seq += 1;
+    harness.peer.publish("aether/cec-bridge/bus",false,json!({"ev":"tx","seq":seq,"t_us":6000,"origin":"local","from":0,"to":4,"data":"9000","status":"ack","attempts":1}).to_string()).await;
+    wait_snapshot(&harness.state, |s| {
+        s.recent_frames
+            .iter()
+            .any(|f| f.direction == FrameDirection::Local && f.ack == Some(true))
+    })
+    .await;
+    seq += 1;
+    harness.peer.publish("aether/cec-bridge/bus", false, json!({"ev":"rx","seq":seq,"t_us":seq*1000,"from":4,"to":0,"data":"475374","ack":false}).to_string()).await;
+    let snapshot = wait_snapshot(&harness.state, |s| {
+        s.recent_frames
+            .iter()
+            .any(|f| f.direction == FrameDirection::Received && f.data == "475374")
+    })
+    .await;
+    assert!(role_on(&snapshot));
+    assert!(snapshot.bus.iter().any(|entry| entry.logical_address == 4
+        && entry.verified
+        && entry.osd.as_deref() == Some("Streamer")));
+    let before = harness.peer.view.borrow().publications.len();
+    harness.command(Command::Standby("streamer".into())).await;
+    let observed = harness
+        .peer
+        .wait_for(|view| {
+            view.publications
+                .iter()
+                .skip(before)
+                .filter(|p| p.topic == topic)
+                .count()
+                >= 2
+        })
+        .await;
+    let sends: Vec<Value> = observed
+        .publications
+        .iter()
+        .skip(before)
+        .filter(|p| p.topic == topic)
+        .map(|p| serde_json::from_slice(&p.payload).unwrap())
+        .collect();
+    for send in sends
+        .iter()
+        .filter(|send| send["to"] == 4 && (send["data"] == "36" || send["data"] == "8F"))
+    {
+        seq += 1;
+        harness.peer.publish("aether/cec-bridge/bus",false,json!({"ev":"tx","seq":seq,"t_us":seq*1000,"origin":"host","from":0,"to":4,"data":send["data"],"id":send["id"],"status":"nack","attempts":2}).to_string()).await;
+    }
+    // The line marker is on the same ordered stream, so seeing it proves that
+    // both outcomes have already reached the engine before we take ownership.
+    seq += 1;
+    harness
+        .peer
+        .publish(
+            "aether/cec-bridge/bus",
+            false,
+            json!({"ev":"line","seq":seq,"bus":"stuck_low"}).to_string(),
+        )
+        .await;
+    wait_snapshot(&harness.state, |s| {
+        s.bridge_bus.as_deref() == Some("stuck_low")
+    })
+    .await;
+    let mut engine = harness.take_engine().await.unwrap();
+    let now = std::time::Instant::now() + Duration::from_secs(60);
+    engine.handle(crate::engine::Event::Tick, now, chrono::Utc::now());
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|d| d.reason == "standby_target_absent")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_bridge_kind_switch_subscribes_to_native_status_and_bus_and_resyncs() {
+    let mut harness = Harness::start().await;
+    assert_eq!(harness.state.bridge_max_raw_bytes(), 14);
+    harness
+        .peer
+        .publish(
+            "aether/cec-bridge/status",
+            true,
+            r#"{"online":true,"v":1,"boot":7,"t_us":1000,"bus":"ok"}"#,
+        )
+        .await;
+    harness
+        .peer
+        .wait_for(|view| {
+            view.publications
+                .iter()
+                .any(|p| p.topic == "aether/cec-bridge/status")
+        })
+        .await;
+    // Observer delivery proves the publish was processed before this retained read.
+    harness.peer.retained("aether/cec-bridge/status").await;
+    let before = harness.peer.view.borrow().publications.len();
+    let mut changed = harness.config.clone();
+    changed.bridge = crate::config::BridgeConfig::Aether {
+        node: "cec-bridge".into(),
+        logical_address: 0,
+    };
+    changed.fake_tv.replies = false;
+    let text = toml::to_string_pretty(&changed).unwrap();
+    harness.state.save_config(&text).await.unwrap();
+    let snapshot = wait_snapshot(&harness.state, |s| {
+        s.bridge_online && s.bridge_bus.as_deref() == Some("ok") && s.bridge_max_raw_bytes == 15
+    })
+    .await;
+    assert!(snapshot.connections.mqtt_connected);
+    assert_eq!(harness.state.bridge_max_raw_bytes(), 15);
+    let observed = harness
+        .peer
+        .wait_for(|view| {
+            view.publications
+                .iter()
+                .skip(before)
+                .filter(|p| p.topic == "aether/cec-bridge/tx")
+                .count()
+                >= 5
+        })
+        .await;
+    let sends: Vec<Value> = observed
+        .publications
+        .iter()
+        .skip(before)
+        .filter(|p| p.topic == "aether/cec-bridge/tx")
+        .map(|p| serde_json::from_slice(&p.payload).unwrap())
+        .collect();
+    assert_eq!(sends[0]["to"], 15);
+    assert_eq!(sends[0]["data"], "85");
+    assert!(
+        sends
+            .iter()
+            .all(|send| send["id"].as_str().unwrap().starts_with("s-"))
+    );
+
+    // Old bridge topics must no longer feed the model; the new bus subscription
+    // must decode identity and activation through the replacement adapter.
+    harness
+        .peer
+        .publish(
+            &format!("tele/{}/SENSOR", harness.config.bridge.name()),
+            false,
+            r#"{"HdmiReceived":{"From":8,"To":0,"Data":"04"}}"#,
+        )
+        .await;
+    for (seq, to, data) in [
+        (1, 15, "84210004"),
+        (2, 15, "870010FA"),
+        (3, 0, "4753747265616D6572"),
+        (4, 15, "822100"),
+    ] {
+        harness.peer.publish("aether/cec-bridge/bus", false,
+            json!({"ev":"rx","seq":seq,"from":4,"to":to,"data":data,"ack":true,"t_us":seq*1000}).to_string()).await;
+    }
+    let snapshot = wait_snapshot(&harness.state, role_on).await;
+    assert!(
+        snapshot
+            .bus
+            .iter()
+            .any(|entry| entry.logical_address == 4 && entry.identified)
+    );
+    assert!(!snapshot.bus.iter().any(|entry| entry.logical_address == 8));
+    assert_eq!(harness.state.config_text(), text);
+    assert_eq!(
+        tokio::fs::read_to_string(&harness.path).await.unwrap(),
+        text
+    );
+    harness
+        .peer
+        .publish("aether/cec-bridge/status", true, r#"{"online":false}"#)
+        .await;
+    let offline = wait_snapshot(&harness.state, |s| !s.bridge_online).await;
+    assert!(offline.bridge_bus.is_none());
     harness.shutdown().await;
 }

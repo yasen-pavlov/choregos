@@ -437,7 +437,7 @@ impl BusModel {
         wall: DateTime<Utc>,
         keep_running: bool,
     ) -> Vec<Action> {
-        if frame.from >= 15 {
+        if frame.from >= 15 || frame.from == self.bridge {
             return vec![];
         }
         let change = self.identity_change(frame, keep_running);
@@ -487,9 +487,6 @@ impl BusModel {
             entry.attempts = 0;
         }
         entry.identified = Self::missing(self.required, entry).is_empty();
-        if frame.from == self.bridge {
-            return vec![];
-        }
         // Wake announcements get one fresh attempt per base interval, even after replacement.
         if wake
             && !entry.identified

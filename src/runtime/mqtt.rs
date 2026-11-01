@@ -1,9 +1,12 @@
-use super::Input;
+use super::{
+    Input,
+    bridge::{self, Correlation},
+};
+#[cfg(test)]
+use crate::engine;
 use crate::{
-    cec::Frame,
-    config::Config,
-    engine,
-    state::{BridgeTelemetry, Command, Mode, Snapshot},
+    config::{BridgeConfig, Config},
+    state::{Command, Mode, Snapshot},
 };
 use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS};
 use serde_json::{Value, json};
@@ -11,46 +14,20 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
-#[derive(Default)]
-pub(crate) struct OutstandingSends(VecDeque<(u8, Vec<u8>, Instant)>);
-
-impl OutstandingSends {
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
-    }
-    pub(crate) fn record(&mut self, to: u8, data: Vec<u8>, now: Instant) {
-        if self.0.len() == 64 {
-            self.0.pop_front();
-        }
-        self.0.push_back((to, data, now));
-    }
-    pub(crate) fn result(&mut self, payload: &Value, now: Instant) -> Option<engine::Event> {
-        let result = payload.get("HdmiSend")?;
-        while self
-            .0
-            .front()
-            .is_some_and(|(_, _, at)| now.saturating_duration_since(*at) > Duration::from_secs(5))
-        {
-            self.0.pop_front();
-        }
-        let (to, data, _) = self.0.pop_front()?;
-        let ack = result.get("Ack")?.as_bool()?;
-        Some(engine::Event::SendResult { to, data, ack })
-    }
-}
+static SEND_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct Mqtt {
     client: AsyncClient,
-    topic: String,
+    bridge: BridgeConfig,
     connected: Arc<AtomicBool>,
-    ingress: Arc<Mutex<OutstandingSends>>,
+    ingress: Arc<Mutex<Correlation>>,
 }
 enum Setup {
     Subscribe(String),
@@ -64,9 +41,12 @@ impl Mqtt {
         (
             Self {
                 client,
-                topic: "fake_bridge".into(),
+                bridge: BridgeConfig::Tasmota {
+                    topic: "fake_bridge".into(),
+                    logical_address: 0,
+                },
                 connected: Arc::new(AtomicBool::new(connected)),
-                ingress: Arc::new(Mutex::new(OutstandingSends::default())),
+                ingress: Arc::new(Mutex::new(Correlation::default())),
             },
             eventloop,
         )
@@ -89,9 +69,9 @@ impl Mqtt {
         let (client, mut eventloop) = AsyncClient::new(options, 128);
         let adapter = Self {
             client,
-            topic: config.bridge.topic.clone(),
+            bridge: config.bridge.clone(),
             connected: Arc::new(AtomicBool::new(false)),
-            ingress: Arc::new(Mutex::new(OutstandingSends::default())),
+            ingress: Arc::new(Mutex::new(Correlation::default())),
         };
         let transport = adapter.clone();
         let config = config.clone();
@@ -197,7 +177,7 @@ impl Mqtt {
             .client
             .try_publish(
                 &topic,
-                if retain {
+                if retain || matches!(self.bridge, BridgeConfig::Aether { .. }) {
                     QoS::AtLeastOnce
                 } else {
                     QoS::AtMostOnce
@@ -212,20 +192,18 @@ impl Mqtt {
         }
         true
     }
-    pub fn send(&self, to: u8, data: &[u8]) -> bool {
-        let mut outstanding = self
+    pub fn send(&self, to: u8, data: &[u8]) -> Option<Option<String>> {
+        let mut correlation = self
             .ingress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.publish_locked(
-            format!("cmnd/{}/HdmiSend", self.topic),
-            false,
-            json!({"To":to,"Data":hex::encode_upper(data)}).to_string(),
-        ) {
-            return false;
+        let counter = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let (topic, payload, id) = bridge::publish_send(&self.bridge, counter, to, data);
+        if !self.publish_locked(topic, false, payload) {
+            return None;
         }
-        outstanding.record(to, data.to_vec(), Instant::now());
-        true
+        correlation.record_send(id.clone(), to, data.to_vec(), Instant::now());
+        Some(id)
     }
     pub fn states(&self, snapshot: &Snapshot) {
         let mut states = vec![
@@ -287,16 +265,11 @@ fn flush_setup(client: &AsyncClient, setup: &mut VecDeque<Setup>) {
     }
 }
 fn setup_messages(config: &Config, removed_roles: &[String]) -> VecDeque<Setup> {
-    let mut messages: VecDeque<_> = [
-        format!("tele/{}/SENSOR", config.bridge.topic),
-        format!("tele/{}/LWT", config.bridge.topic),
-        format!("tele/{}/STATE", config.bridge.topic),
-        format!("stat/{}/RESULT", config.bridge.topic),
-        "choregos/cmd/+".into(),
-    ]
-    .into_iter()
-    .map(Setup::Subscribe)
-    .collect();
+    let mut messages: VecDeque<_> = bridge::subscriptions(&config.bridge)
+        .into_iter()
+        .chain(std::iter::once("choregos/cmd/+".into()))
+        .map(Setup::Subscribe)
+        .collect();
     for role in removed_roles {
         messages.push_back(Setup::Publish(
             format!("homeassistant/binary_sensor/choregos/{role}/config"),
@@ -319,41 +292,25 @@ fn decode(
     config: &Config,
     topic: &str,
     payload: &[u8],
-    outstanding: &mut OutstandingSends,
+    correlation: &mut Correlation,
 ) -> Option<Input> {
-    if topic == format!("tele/{}/STATE", config.bridge.topic) {
-        let telemetry = decode_telemetry(payload);
-        if telemetry.is_none() {
-            tracing::debug!("ignoring malformed bridge telemetry");
-        }
-        return telemetry.map(Input::BridgeTelemetry);
-    }
-    if topic == format!("tele/{}/SENSOR", config.bridge.topic) {
-        return Frame::parse(payload)
-            .ok()
-            .map(|f| Input::Event(engine::Event::Frame(f)));
-    }
-    if topic == format!("tele/{}/LWT", config.bridge.topic) {
-        return match payload {
-            b"Online" => {
-                outstanding.clear();
-                Some(Input::Event(engine::Event::BridgeOnline))
+    if let Some(incoming) = bridge::decode(&config.bridge, topic, payload) {
+        return match incoming {
+            bridge::Incoming::Trace(entry) => {
+                let decoded = correlation.apply(&entry, Instant::now());
+                Some(Input::Bridge { entry, decoded })
             }
-            b"Offline" => {
-                outstanding.clear();
-                Some(Input::Event(engine::Event::BridgeOffline))
+            bridge::Incoming::Telemetry(mut telemetry) => {
+                if matches!(config.bridge, BridgeConfig::Aether { .. }) {
+                    telemetry.stale_after_s = correlation.telemetry_stale_after_s();
+                }
+                Some(Input::BridgeTelemetry(telemetry))
             }
-            _ => None,
+            bridge::Incoming::Cfg(payload) => {
+                correlation.configure(&payload, &config.bridge, config.fake_tv.replies);
+                None
+            }
         };
-    }
-    if topic == format!("stat/{}/RESULT", config.bridge.topic) {
-        let result = serde_json::from_slice::<Value>(payload).ok()?;
-        result.get("HdmiSend")?;
-        let event = outstanding.result(&result, Instant::now());
-        return Some(Input::BridgeResult {
-            payload: result,
-            event,
-        });
     }
     let command = match topic.strip_prefix("choregos/cmd/")? {
         "mode" => match payload {
@@ -365,28 +322,6 @@ fn decode(
         _ => return None,
     };
     Some(Input::Request(super::Request::Command(command, None)))
-}
-
-fn decode_telemetry(payload: &[u8]) -> Option<BridgeTelemetry> {
-    fn integer(value: &Value) -> Option<i64> {
-        if let Some(value) = value.as_i64() {
-            return Some(value);
-        }
-        let value = value.as_f64()?;
-        // Preserve integral Tasmota floats without saturating out-of-range casts.
-        (value.is_finite()
-            && value.fract() == 0.0
-            && value >= i64::MIN as f64
-            && value < -(i64::MIN as f64))
-            .then_some(value as i64)
-    }
-    let value: Value = serde_json::from_slice(payload).ok()?;
-    Some(BridgeTelemetry {
-        signal_dbm: i32::try_from(integer(value.get("Wifi")?.get("Signal")?)?).ok()?,
-        link_count: u32::try_from(integer(value.get("Wifi")?.get("LinkCount")?)?).ok()?,
-        uptime_s: u64::try_from(integer(value.get("UptimeSec")?)?).ok()?,
-        at: chrono::Utc::now(),
-    })
 }
 
 pub fn discovery(config: &Config) -> Vec<(String, Value)> {
@@ -434,177 +369,6 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn telemetry_accepts_integer_floats_and_rejects_missing_fractional_or_overflow_fields() {
-        for payload in [
-            json!({"UptimeSec":282348,"Wifi":{"Signal":-50,"LinkCount":2}}),
-            json!({"UptimeSec":282348.0,"Wifi":{"Signal":-50.0,"LinkCount":2.0}}),
-        ] {
-            let telemetry = decode_telemetry(payload.to_string().as_bytes()).unwrap();
-            assert_eq!(
-                (
-                    telemetry.signal_dbm,
-                    telemetry.link_count,
-                    telemetry.uptime_s
-                ),
-                (-50, 2, 282348)
-            );
-        }
-        for payload in [
-            json!({"UptimeSec":1,"Wifi":{"RSSI":100,"LinkCount":2}}),
-            json!({"UptimeSec":1,"Wifi":{"Signal":-50.5,"LinkCount":2}}),
-            json!({"UptimeSec":1,"Wifi":{"Signal":-50,"LinkCount":-1}}),
-            json!({"UptimeSec":-1,"Wifi":{"Signal":-50,"LinkCount":2}}),
-            json!({"UptimeSec":1,"Wifi":{"Signal":-50,"LinkCount":4294967296_u64}}),
-        ] {
-            assert!(decode_telemetry(payload.to_string().as_bytes()).is_none());
-        }
-    }
-
-    #[test]
-    fn only_patched_acks_emit_results_but_all_hdmisend_replies_consume_fifo_entries() {
-        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let (mqtt, _events) = Mqtt::test_transport(true, 16);
-        config.bridge.topic.clone_from(&mqtt.topic);
-        let result_topic = format!("stat/{}/RESULT", mqtt.topic);
-        let cases = [
-            (
-                4,
-                vec![0x36],
-                json!({"HdmiSend":{"Ack":false}}),
-                Some(false),
-            ),
-            (8, vec![0x8f], json!({"HdmiSend":"Done"}), None),
-            (11, vec![0x8f], json!({"HdmiSend":"Sending failed"}), None),
-            (4, vec![0x83], json!({"HdmiSend":"Invalid JSON"}), None),
-            (8, vec![0x83], json!({"HdmiSend":"Buffer empty"}), None),
-            (11, vec![0x83], json!({"HdmiSend":"Buffer too large"}), None),
-            (4, vec![0x8f], json!({"HdmiSend":"unknown"}), None),
-            (8, vec![0x36], json!({"HdmiSend":{"Ack":true}}), Some(true)),
-        ];
-        for (to, data, _, _) in &cases {
-            assert!(mqtt.send(*to, data));
-        }
-        let mut outstanding = mqtt.ingress.lock().unwrap();
-        assert!(
-            decode(
-                &config,
-                &result_topic,
-                br#"{"Other":"Done"}"#,
-                &mut outstanding,
-            )
-            .is_none()
-        );
-        for (expected_to, expected_data, payload, expected_ack) in cases {
-            let input = decode(
-                &config,
-                &result_topic,
-                &serde_json::to_vec(&payload).unwrap(),
-                &mut outstanding,
-            );
-            if let Some(expected_ack) = expected_ack {
-                let Some(Input::BridgeResult {
-                    event: Some(engine::Event::SendResult { to, data, ack }),
-                    ..
-                }) = input
-                else {
-                    panic!("expected correlated send result");
-                };
-                assert_eq!((to, data, ack), (expected_to, expected_data, expected_ack));
-            } else {
-                assert!(matches!(
-                    input,
-                    Some(Input::BridgeResult { event: None, .. })
-                ));
-            }
-        }
-        assert!(matches!(
-            decode(
-                &config,
-                &result_topic,
-                br#"{"HdmiSend":"Done"}"#,
-                &mut outstanding
-            ),
-            Some(Input::BridgeResult { event: None, .. })
-        ));
-    }
-
-    #[test]
-    fn send_fifo_drops_oldest_at_capacity() {
-        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let (mqtt, _events) = Mqtt::test_transport(true, 128);
-        config.bridge.topic.clone_from(&mqtt.topic);
-        for opcode in 0..65 {
-            assert!(mqtt.send(4, &[opcode]));
-        }
-        let mut outstanding = mqtt.ingress.lock().unwrap();
-        let Some(Input::BridgeResult {
-            event: Some(engine::Event::SendResult { to, data, ack }),
-            ..
-        }) = decode(
-            &config,
-            &format!("stat/{}/RESULT", mqtt.topic),
-            br#"{"HdmiSend":{"Ack":true}}"#,
-            &mut outstanding,
-        )
-        else {
-            panic!("expected the oldest retained send");
-        };
-        assert_eq!((to, data, ack), (4, vec![1], true));
-    }
-
-    #[test]
-    fn bridge_offline_and_online_clear_outstanding_sends() {
-        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let (mqtt, _events) = Mqtt::test_transport(true, 8);
-        config.bridge.topic.clone_from(&mqtt.topic);
-        for lwt in [b"Offline".as_slice(), b"Online".as_slice()] {
-            assert!(mqtt.send(4, &[0x36]));
-            let mut outstanding = mqtt.ingress.lock().unwrap();
-            assert!(
-                decode(
-                    &config,
-                    &format!("tele/{}/LWT", mqtt.topic),
-                    lwt,
-                    &mut outstanding,
-                )
-                .is_some()
-            );
-            assert!(matches!(
-                decode(
-                    &config,
-                    &format!("stat/{}/RESULT", mqtt.topic),
-                    br#"{"HdmiSend":{"Ack":false}}"#,
-                    &mut outstanding
-                ),
-                Some(Input::BridgeResult { event: None, .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn send_results_discard_entries_older_than_five_seconds() {
-        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let now = Instant::now();
-        let mut outstanding = OutstandingSends(VecDeque::from([
-            (4, vec![0x36], now - Duration::from_secs(6)),
-            (8, vec![0x8f], now),
-        ]));
-        let Some(Input::BridgeResult {
-            event: Some(engine::Event::SendResult { to, data, ack }),
-            ..
-        }) = decode(
-            &config,
-            &format!("stat/{}/RESULT", config.bridge.topic),
-            br#"{"HdmiSend":{"Ack":false}}"#,
-            &mut outstanding,
-        )
-        else {
-            panic!("expected the non-expired send");
-        };
-        assert_eq!((to, data, ack), (8, vec![0x8f], false));
-    }
 
     fn start_broker() -> std::net::SocketAddr {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -736,7 +500,10 @@ mod tests {
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
         config.mqtt.host = "127.0.0.1".into();
         config.mqtt.port = address.port();
-        config.bridge.topic = "test_bridge".into();
+        config.bridge = BridgeConfig::Tasmota {
+            topic: "test_bridge".into(),
+            logical_address: 0,
+        };
         let (tx, mut rx) = mpsc::channel(32);
         let (mqtt, adapter_task) = Mqtt::start(&config, tx, &[]);
         let (observer, mut received, poll) = spawn_observer(address.port());
@@ -767,12 +534,17 @@ mod tests {
                 .await
                 .unwrap();
             let frame = next_input(&mut rx, |input| match input {
-                Input::Event(engine::Event::Frame(frame)) => Some(frame),
+                Input::Bridge { decoded, .. } => {
+                    decoded.events.into_iter().find_map(|event| match event {
+                        engine::Event::Frame(frame) => Some(frame),
+                        _ => None,
+                    })
+                }
                 _ => None,
             })
             .await;
             assert_eq!(frame.opcode, Some(4));
-            assert!(mqtt.send(4, &[0x36]));
+            assert!(mqtt.send(4, &[0x36]).is_some());
             let p =
                 next_publication(&mut received, |p| p.topic == "cmnd/test_bridge/HdmiSend").await;
             assert_eq!(
@@ -788,15 +560,22 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let (to, data, ack) = next_input(&mut rx, |input| match input {
-                Input::BridgeResult {
-                    event: Some(engine::Event::SendResult { to, data, ack }),
-                    ..
-                } => Some((to, data, ack)),
+            let (to, data, status) = next_input(&mut rx, |input| match input {
+                Input::Bridge { decoded, .. } => {
+                    decoded.events.into_iter().find_map(|event| match event {
+                        engine::Event::SendResult {
+                            to, data, status, ..
+                        } => Some((to, data, status)),
+                        _ => None,
+                    })
+                }
                 _ => None,
             })
             .await;
-            assert_eq!((to, data, ack), (4, vec![0x36], false));
+            assert_eq!(
+                (to, data, status),
+                (4, vec![0x36], engine::SendStatus::Nack)
+            );
             observer
                 .publish("choregos/cmd/mode", QoS::AtLeastOnce, false, "active")
                 .await
@@ -810,7 +589,7 @@ mod tests {
             .await;
             assert_eq!(mode, Mode::Active);
 
-            assert!(mqtt.send(8, &[0x8f]));
+            assert!(mqtt.send(8, &[0x8f]).is_some());
             // A second connection with the same client ID makes the broker drop the
             // adapter's socket, exercising its real disconnect/reconnect path.
             let (replacement, mut replacement_events) = AsyncClient::new(
@@ -846,15 +625,19 @@ mod tests {
                 .await
                 .unwrap();
             loop {
-                match rx.recv().await.unwrap() {
-                    Input::BridgeResult {
-                        event: Some(engine::Event::SendResult { .. }),
-                        ..
-                    } => {
-                        panic!("stale pre-reconnect send result was correlated");
+                if let Input::Bridge { decoded, .. } = rx.recv().await.unwrap() {
+                    assert!(
+                        !decoded
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, engine::Event::SendResult { .. })),
+                        "stale pre-reconnect send result was correlated"
+                    );
+                    if decoded.events.iter().any(
+                        |event| matches!(event, engine::Event::Frame(frame) if frame.from == 8),
+                    ) {
+                        break;
                     }
-                    Input::Event(engine::Event::Frame(frame)) if frame.from == 8 => break,
-                    _ => {}
                 }
             }
         };
@@ -869,33 +652,60 @@ mod tests {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+
+    #[test]
+    fn replacement_adapters_never_reuse_send_ids_or_accept_old_outcomes() {
+        let now = Instant::now();
+        let bridge = BridgeConfig::Aether {
+            node: "cec-bridge".into(),
+            logical_address: 0,
+        };
+        let (mut old, _old_events) = Mqtt::test_transport(true, 8);
+        old.bridge = bridge.clone();
+        let old_id = old.send(4, &[0x36]).unwrap().unwrap();
+        drop(old);
+        let (mut replacement, _new_events) = Mqtt::test_transport(true, 8);
+        replacement.bridge = bridge;
+        let new_id = replacement.send(8, &[0x8f]).unwrap().unwrap();
+        let next_id = replacement.clone().send(4, &[0x36]).unwrap().unwrap();
+        let number = |id: &str| id.strip_prefix("s-").unwrap().parse::<u64>().unwrap();
+        assert!(number(&old_id) < number(&new_id));
+        assert!(number(&new_id) < number(&next_id));
+        let mut correlation = replacement.ingress.lock().unwrap();
+        let outcome = |seq, id| super::super::trace::TraceEntry::AetherBus {
+            node: "cec-bridge".into(),
+            payload: json!({"ev":"tx","seq":seq,"id":id,"origin":"host","status":"nack","attempts":1}),
+        };
+        assert!(
+            correlation
+                .apply(&outcome(1, old_id), now)
+                .events
+                .is_empty()
+        );
+        assert!(
+            matches!(&correlation.apply(&outcome(2, new_id), now).events[..],
+            [engine::Event::SendResult { to: 8, data, status: engine::SendStatus::Nack, .. }] if data == &[0x8f])
+        );
+    }
     #[test]
     fn fast_lane_drops_disconnected_and_full_publishes_without_enqueuing_stale_work() {
         let (mqtt, mut eventloop) = Mqtt::test_transport(false, 1);
-        assert!(!mqtt.send(4, &[0x36]));
-        assert!(mqtt.ingress.lock().unwrap().0.is_empty());
+        assert!(mqtt.send(4, &[0x36]).is_none());
         eventloop.clean();
         assert!(eventloop.pending.is_empty());
         mqtt.connected.store(true, Ordering::Release);
-        assert!(mqtt.send(4, &[0x8f]));
-        assert!(!mqtt.send(4, &[0x36]));
-        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        config.bridge.topic.clone_from(&mqtt.topic);
-        let mut outstanding = mqtt.ingress.lock().unwrap();
-        let Some(Input::BridgeResult {
-            event: Some(engine::Event::SendResult { to, data, ack }),
-            ..
-        }) = decode(
-            &config,
-            &format!("stat/{}/RESULT", mqtt.topic),
-            br#"{"HdmiSend":{"Ack":false}}"#,
-            &mut outstanding,
-        )
-        else {
-            panic!("expected only the successful publish in the FIFO");
+        assert!(mqtt.send(4, &[0x8f]).is_some());
+        assert!(mqtt.send(4, &[0x36]).is_none());
+        let entry = super::super::trace::TraceEntry::Result {
+            bridge: "fake_bridge".into(),
+            payload: json!({"HdmiSend":{"Ack":false}}),
         };
-        assert_eq!((to, data, ack), (4, vec![0x8f], false));
-        assert!(outstanding.0.is_empty());
+        let mut correlation = mqtt.ingress.lock().unwrap();
+        let decoded = correlation.apply(&entry, Instant::now());
+        assert!(
+            matches!(&decoded.events[..], [engine::Event::SendResult { to: 4, data, status: engine::SendStatus::Nack, .. }] if data == &[0x8f])
+        );
+        assert!(correlation.apply(&entry, Instant::now()).events.is_empty());
         eventloop.clean();
         assert_eq!(eventloop.pending.len(), 1);
         assert!(
