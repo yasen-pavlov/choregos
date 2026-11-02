@@ -1,5 +1,5 @@
 use choregos::{
-    action::{Action, IdentifyQueries},
+    action::{Action, IdentifyQueries, TimerKind, Trigger},
     cec::Frame,
     config::{Config, Takeover},
     engine::{Engine, Event},
@@ -21,6 +21,7 @@ fn setup() -> (Engine, Instant) {
         Config::parse(include_str!("../choregos.example.toml")).unwrap(),
         now,
         vec![],
+        1,
     );
     engine.handle(Event::BridgeOnline, now, wall());
     (engine, now)
@@ -1597,7 +1598,7 @@ fn identification_requirements_follow_config_reload_without_optional_vendor_quer
     config
         .device
         .retain(|device| device.matches.vendor.is_none());
-    let mut engine = Engine::new(config.clone(), now, vec![]);
+    let mut engine = Engine::new(config.clone(), now, vec![], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     frame(&mut engine, now, 1, 15, "84220001");
     frame(&mut engine, now, 1, 0, "474B6F6469");
@@ -1716,7 +1717,7 @@ fn forgetting_a_restored_entry_removes_its_identification_retries_in_both_modes(
         let now = Instant::now();
         let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
         config.mode = mode;
-        let mut engine = Engine::new(config, now, vec![restored_identity(3, 0x2500)]);
+        let mut engine = Engine::new(config, now, vec![restored_identity(3, 0x2500)], 1);
         engine.handle(Event::BridgeOnline, now, wall());
         // Leave a full manual identify queued behind the resync send slot.
         assert!(
@@ -1836,7 +1837,7 @@ fn forgetting_a_conflicting_address_replays_the_new_bindings_latest_buffered_sig
 fn a_forgotten_address_is_learned_afresh_without_cached_keys_backoff_or_wake_signals() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     // Buffer a wake under the unverified identity and build up retry backoff.
     frame(&mut engine, now, 4, 0, "04");
@@ -1904,7 +1905,7 @@ fn forgetting_an_address_cancels_its_pending_standby_verification() {
 fn restored_identity_buffers_power_until_confirming_physical_report() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     assert!(!engine.identity.roles.contains_key("streamer"));
     assert!(!engine.bus.entries[&4].identified);
     assert!(!engine.bus.entries[&4].verified);
@@ -1933,7 +1934,7 @@ fn restored_identity_buffers_power_until_confirming_physical_report() {
 fn mismatching_active_source_replaces_restored_identity_and_old_signals() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     frame(&mut engine, now, 4, 15, "822300");
     assert_eq!(engine.bus.entries[&4].physical, Some(0x2300));
@@ -1955,6 +1956,7 @@ fn restored_conflicts_wait_for_verification_and_duplicate_physical_is_skipped() 
             restored_identity(8, 0x2500),
             restored_identity(11, 0x2100),
         ],
+        1,
     );
     assert_eq!(engine.bus.entries.len(), 2);
     assert!(engine.identity.conflicts.is_empty());
@@ -2071,7 +2073,7 @@ fn manual_identification_defers_automatic_retry_from_the_manual_query_instant() 
 fn restored_osd_replies_do_not_restart_backoff_or_request_known_keys() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     let pa_only = Action::Identify {
         la: 4,
         queries: IdentifyQueries {
@@ -2125,7 +2127,7 @@ fn matching_restored_vendor_and_osd_verify_in_either_order_without_new_confirmat
         let mut identity = restored_identity(4, 0x2100);
         identity.confirmed_at = wall() - chrono::Duration::days(1);
         let confirmed_at = identity.confirmed_at;
-        let mut engine = Engine::new(config, now, vec![identity]);
+        let mut engine = Engine::new(config, now, vec![identity], 1);
         engine.handle(Event::BridgeOnline, now, wall());
         frame(&mut engine, now, 4, 0, "04");
         for (index, (to, data)) in replies.into_iter().enumerate() {
@@ -2158,7 +2160,7 @@ fn matching_restored_vendor_and_osd_verify_in_either_order_without_new_confirmat
 fn restored_vendor_change_clears_reconfirmation_and_requires_physical_report() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     frame(&mut engine, now, 4, 0, "4753747265616D6572");
     frame(&mut engine, now, 4, 15, "87080046");
@@ -2279,7 +2281,7 @@ fn four_restored_addresses_due_together_wait_for_separate_ticks_after_resync() {
         .into_iter()
         .map(|(la, physical)| restored_identity(la, physical))
         .collect();
-    let mut engine = Engine::new(config, now, identities);
+    let mut engine = Engine::new(config, now, identities, 1);
     engine.handle(Event::BridgeOnline, now, wall());
     assert!(engine.handle(Event::Tick, now, wall()).is_empty());
     assert!(
@@ -2316,7 +2318,7 @@ fn incomplete_restore_queries_only_missing_required_keys_and_still_needs_physica
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
     let mut identity = restored_identity(4, 0x2100);
     identity.osd = None;
-    let mut engine = Engine::new(config, now, vec![identity]);
+    let mut engine = Engine::new(config, now, vec![identity], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     assert_eq!(
         engine.handle(Event::Tick, now + Duration::from_secs(10), wall()),
@@ -2393,7 +2395,7 @@ fn wake_frame_from_restored_identity_requeries_immediately() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
     let retry = Duration::from_secs(config.timing.identify_retry_s);
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     let pa_only = Action::Identify {
         la: 4,
         queries: IdentifyQueries {
@@ -2449,7 +2451,7 @@ fn wake_frame_within_base_interval_does_not_rearm() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
     let retry = Duration::from_secs(config.timing.identify_retry_s);
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     assert!(frame(&mut engine, now + Duration::from_secs(2), 4, 0, "04").is_empty());
     assert!(
@@ -2517,7 +2519,7 @@ fn wake_rearming_respects_opcode_destination_and_active_source_length() {
     ] {
         let now = Instant::now();
         let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-        let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+        let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
         engine.handle(Event::BridgeOnline, now, wall());
         for seconds in [10, 30] {
             engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
@@ -2537,7 +2539,7 @@ fn wake_rearming_respects_opcode_destination_and_active_source_length() {
 fn wake_rearming_after_physical_replacement_queries_missing_keys() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     for seconds in [10, 30] {
         engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
@@ -2561,7 +2563,7 @@ fn wake_rearming_after_physical_replacement_queries_missing_keys() {
 fn wake_rearming_waits_for_shared_identification_gate() {
     let now = Instant::now();
     let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
-    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)]);
+    let mut engine = Engine::new(config, now, vec![restored_identity(4, 0x2100)], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     for seconds in [10, 30] {
         engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
@@ -2835,6 +2837,19 @@ fn logical_address_move_retargets_pending_standby_without_replaying_wake() {
         now,
         wall(),
     );
+    let stopping_id = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "manual_standby")
+        .unwrap()
+        .id;
+    assert_eq!(engine.decisions.last().unwrap().parent, None);
+    assert_eq!(
+        engine.decisions.last().unwrap().trigger,
+        Trigger::Command {
+            command: Command::Standby("console_b".into()),
+        }
+    );
     assert_eq!(engine.roles["console_b"].power, RolePower::Off);
     frame(
         &mut engine,
@@ -2876,6 +2891,20 @@ fn logical_address_move_retargets_pending_standby_without_replaying_wake() {
             },
         ]
     );
+    let retry_row = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "standby_retry")
+        .unwrap();
+    assert_eq!(retry_row.parent, Some(stopping_id));
+    assert!(retry_row.id > stopping_id);
+    assert_eq!(
+        retry_row.trigger,
+        Trigger::Timer {
+            name: TimerKind::StandbyVerification
+        }
+    );
+    let retry_id = retry_row.id;
     frame(&mut engine, retry_at, 11, 0, "9000");
     assert_eq!(engine.roles["console_b"].power, RolePower::Off);
     frame(&mut engine, retry_at, 11, 0, "9001");
@@ -2887,6 +2916,7 @@ fn logical_address_move_retargets_pending_standby_without_replaying_wake() {
             .all(|action| !matches!(action, Action::CecSend { .. }))
     );
     assert_no_standby_decision(&engine, "console_b");
+    assert!(engine.next_decision_id > retry_id);
 }
 
 #[test]
@@ -3053,7 +3083,7 @@ fn console_address_hop_during_receiver_power_up_keeps_room_on() {
     let mut restored = restored_identity(11, 0x2300);
     restored.vendor = Some(0x0009bf);
     restored.osd = Some("Console A".into());
-    let mut engine = Engine::new(config, now, vec![restored]);
+    let mut engine = Engine::new(config, now, vec![restored], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     let mut reasons = Vec::new();
     for data in ["84240004", "87080046", "47436F6E736F6C652042"] {
@@ -3192,7 +3222,7 @@ fn console_before_physical_change(mode: Mode) -> (Engine, Instant) {
     let now = Instant::now();
     let mut config = console_physical_change_config();
     config.mode = mode;
-    let mut engine = Engine::new(config, now, vec![]);
+    let mut engine = Engine::new(config, now, vec![], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     for data in ["84230004", "870009BF", "47436F6E736F6C652041", "822300"] {
         frame(&mut engine, now, 8, 15, data);
@@ -3209,7 +3239,7 @@ fn physical_address_flap_during_receiver_power_up_keeps_role_on() {
     let mut identity = restored_identity(8, 0x2300);
     identity.vendor = Some(0x0009bf);
     identity.osd = Some("Console A".into());
-    let mut engine = Engine::new(console_physical_change_config(), now, vec![identity]);
+    let mut engine = Engine::new(console_physical_change_config(), now, vec![identity], 1);
     engine.handle(Event::BridgeOnline, now, wall());
     assert!(
         engine
@@ -3571,7 +3601,7 @@ fn raw_send_limit_is_specific_to_the_selected_bridge() {
         let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
         config.bridge = bridge;
         let now = Instant::now();
-        let mut engine = Engine::new(config, now, vec![]);
+        let mut engine = Engine::new(config, now, vec![], 1);
         for len in [14, 15, 16] {
             let data = vec![0x44; len];
             let actions = engine.handle(
@@ -3626,7 +3656,7 @@ fn real_native_identify_capture_replays_announced_devices_and_excludes_own_echoe
     let mut output = vec![];
     choregos::runtime::cli::replay(config.clone(), text, &mut output).unwrap();
     let start = Instant::now();
-    let mut engine = Engine::new(config, start, vec![]);
+    let mut engine = Engine::new(config, start, vec![], 1);
     let mut correlation = Correlation::default();
     let mut epoch = None;
     let mut outcomes = 0;
@@ -3703,4 +3733,247 @@ fn nack_cut_osd_reply_keeps_verified_identity_and_running_role() {
     assert_eq!(engine.roles["kodi"].power, RolePower::On);
     assert_eq!(engine.bus.entries[&1].last_seen, Some(now));
     assert!(!engine.decisions.iter().any(|d| d.reason == "identity_lost"));
+}
+
+#[test]
+fn decision_ids_are_monotonic_and_triggers_identify_inputs_and_due_timers() {
+    let (mut engine, now) = setup();
+    let mut ids = vec![];
+    identify_atv(&mut engine, now);
+    ids.extend(engine.decisions.iter().map(|decision| decision.id));
+    frame(&mut engine, now, 4, 0, "04");
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(
+        wake.trigger,
+        Trigger::Frame {
+            from: 4,
+            to: 0,
+            data: "04".into()
+        }
+    );
+    let wake_id = wake.id;
+    ids.extend(engine.decisions.iter().map(|decision| decision.id));
+    let settle = now + Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    // A timer due during an unrelated command must not inherit its command trigger.
+    engine.handle(
+        Event::Command(Command::SetMode(Mode::Active)),
+        settle,
+        wall(),
+    );
+    let command = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "command_set_mode")
+        .unwrap();
+    assert_eq!(
+        command.trigger,
+        Trigger::Command {
+            command: Command::SetMode(Mode::Active)
+        }
+    );
+    assert_eq!(command.parent, None);
+    let settled = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "takeover_settled")
+        .unwrap();
+    assert_eq!(
+        settled.trigger,
+        Trigger::Timer {
+            name: TimerKind::TakeoverSettle
+        }
+    );
+    assert_eq!(settled.parent, Some(wake_id));
+    ids.extend(engine.decisions.iter().map(|decision| decision.id));
+    frame(&mut engine, settle, 4, 0, "36");
+    ids.extend(engine.decisions.iter().map(|decision| decision.id));
+    engine.handle(
+        Event::Tick,
+        settle + Duration::from_secs(engine.config.timing.off_delay_s),
+        wall(),
+    );
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "off_timer_expired"
+                && decision.trigger
+                    == Trigger::Timer {
+                        name: TimerKind::RoomOff
+                    })
+    );
+    ids.extend(engine.decisions.iter().map(|decision| decision.id));
+    assert!(!ids.is_empty());
+    assert_eq!(ids[0], 1);
+    assert!(ids.windows(2).all(|pair| pair[1] == pair[0] + 1), "{ids:?}");
+}
+
+#[test]
+fn standby_followups_keep_the_wake_decision_parent_across_retries() {
+    let (mut engine, takeover, settle) = takeover_from_streamer();
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.to == Some(RolePower::On))
+        .unwrap();
+    let parent = wake.id;
+    assert!(
+        wake.actions
+            .iter()
+            .any(|action| matches!(action, Action::CecSend { to: 4, data } if data == &[0x36]))
+    );
+    for round in 1..=u32::from(engine.config.timing.standby_retries) + 1 {
+        engine.handle(Event::Tick, takeover + settle * round, wall());
+        for followup in &engine.decisions {
+            if followup.reason.starts_with("standby_") {
+                assert_eq!(followup.parent, Some(parent));
+                assert_eq!(
+                    followup.trigger,
+                    Trigger::Timer {
+                        name: TimerKind::StandbyVerification
+                    }
+                );
+            } else if followup.reason == "takeover_settled" {
+                assert_eq!(followup.parent, Some(parent));
+            }
+        }
+    }
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "standby_unconfirmed")
+    );
+}
+
+#[test]
+fn mixed_all_off_never_parents_an_off_roles_verification_to_another_role() {
+    let (mut engine, now) = console_before_address_move();
+    engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
+    engine.handle(
+        Event::Command(Command::Standby("console_b".into())),
+        now,
+        wall(),
+    );
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 4, 0, "04");
+    assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    engine.handle(Event::Command(Command::AllOff), now, wall());
+    let stop = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "all_off")
+        .unwrap();
+    assert_eq!(stop.role.as_deref(), Some("streamer"));
+    let stopping_id = stop.id;
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    engine.handle(Event::Tick, now + settle, wall());
+    let console = engine
+        .decisions
+        .iter()
+        .find(|decision| {
+            decision.reason == "standby_retry" && decision.role.as_deref() == Some("console_b")
+        })
+        .unwrap();
+    assert_eq!(console.parent, None);
+    let streamer = engine
+        .decisions
+        .iter()
+        .find(|decision| {
+            decision.reason == "standby_retry" && decision.role.as_deref() == Some("streamer")
+        })
+        .unwrap();
+    assert_eq!(streamer.parent, Some(stopping_id));
+}
+
+#[test]
+fn warmup_boundary_preserves_command_trigger_and_does_not_claim_buffered_role_rows() {
+    let (mut engine, start) = setup();
+    let now = start + Duration::from_secs(3);
+    let command = Command::SendRaw {
+        to: 4,
+        data: vec![0x36],
+    };
+    engine.handle(Event::Command(command.clone()), now, wall());
+    let row = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "command_send_raw")
+        .unwrap();
+    assert_eq!(row.trigger, Trigger::Command { command });
+    assert_eq!(row.parent, None);
+
+    // A bound but Off target is stopped during the same handle as another role's
+    // buffered wake. That resync row must not become the stopped target's parent.
+    let (mut engine, start) = setup();
+    engine.handle(
+        Event::Command(Command::SetMode(Mode::Active)),
+        start,
+        wall(),
+    );
+    identify_atv(&mut engine, start);
+    frame(&mut engine, start, 8, 15, "84240004");
+    frame(&mut engine, start, 8, 15, "87080046");
+    frame(&mut engine, start, 8, 0, "47436F6E736F6C652042");
+    engine.handle(Event::BridgeOnline, start, wall());
+    frame(&mut engine, start, 4, 0, "04");
+    let now = start + Duration::from_secs(3);
+    engine.handle(
+        Event::Command(Command::Standby("console_b".into())),
+        now,
+        wall(),
+    );
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "resync_complete"
+                && decision.role.as_deref() == Some("streamer")
+                && decision.trigger
+                    == Trigger::Timer {
+                        name: TimerKind::Warmup
+                    })
+    );
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    engine.handle(Event::Tick, now + settle, wall());
+    let retry = engine
+        .decisions
+        .iter()
+        .find(|decision| {
+            decision.reason == "standby_retry" && decision.role.as_deref() == Some("console_b")
+        })
+        .unwrap();
+    assert_eq!(retry.parent, None);
+
+    // Early completion by an unrelated device's reply is still warmup, not
+    // evidence that this reply itself woke the buffered role.
+    let (mut engine, start) = setup();
+    identify_atv(&mut engine, start);
+    engine.handle(Event::BridgeOnline, start, wall());
+    frame(&mut engine, start, 4, 0, "04");
+    frame(
+        &mut engine,
+        start + Duration::from_millis(300),
+        5,
+        0,
+        "9001",
+    );
+    let row = engine
+        .decisions
+        .iter()
+        .find(|decision| {
+            decision.reason == "resync_complete" && decision.role.as_deref() == Some("streamer")
+        })
+        .unwrap();
+    assert_eq!(
+        row.trigger,
+        Trigger::Timer {
+            name: TimerKind::Warmup
+        }
+    );
 }

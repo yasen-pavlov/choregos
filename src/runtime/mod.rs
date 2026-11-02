@@ -122,11 +122,23 @@ impl Adapters {
 
 const IDENTITY_LIFETIME_DAYS: i64 = 30;
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct PersistedState {
     version: u32,
+    next_decision_id: u64,
     identities: Vec<LearnedIdentity>,
     decisions: Vec<DecisionView>,
+}
+
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            next_decision_id: 1,
+            identities: vec![],
+            decisions: vec![],
+        }
+    }
 }
 
 impl PersistedState {
@@ -139,17 +151,64 @@ impl PersistedState {
                 return None;
             }
         };
-        match serde_json::from_slice::<Self>(&bytes) {
-            Ok(mut state) if state.version == 1 => {
+        let decoded = (|| -> anyhow::Result<(Self, bool)> {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let migrated = match value["version"].as_u64() {
+                Some(1) => true,
+                Some(2) => false,
+                _ => {
+                    tracing::warn!("unknown persisted state version; starting empty");
+                    return Ok((Self::default(), false));
+                }
+            };
+            if migrated {
+                let decisions = value["decisions"]
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow::anyhow!("missing decision ring"))?;
+                for (index, decision) in decisions.iter_mut().enumerate() {
+                    decision["id"] = serde_json::json!(index as u64 + 1);
+                    decision["parent"] = serde_json::Value::Null;
+                    decision["trigger"] = serde_json::json!({"kind":"service","name":"migrated"});
+                }
+                let next = decisions.len() as u64 + 1;
+                value["next_decision_id"] = serde_json::json!(next);
+                value["version"] = serde_json::json!(2);
+            }
+            let mut state: Self = serde_json::from_value(value)?;
+            let after_ring = state
+                .decisions
+                .iter()
+                .map(|row| row.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("decision ring exhausted"))?;
+            state.next_decision_id = state.next_decision_id.max(after_ring);
+            anyhow::ensure!(
+                state.next_decision_id < u64::MAX / 2,
+                "decision counter exhausted"
+            );
+            Ok((state, migrated))
+        })();
+        match decoded {
+            Ok((mut state, migrated)) => {
                 state.identities.retain(|identity| {
                     wall.signed_duration_since(identity.confirmed_at)
                         <= chrono::Duration::days(IDENTITY_LIFETIME_DAYS)
                 });
+                if migrated {
+                    match serde_json::to_vec(&state) {
+                        Ok(bytes) => {
+                            if let Err(error) = persist_bytes(path, &bytes).await {
+                                tracing::warn!(%error, "cannot persist migrated state; continuing");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot encode migrated state; continuing")
+                        }
+                    }
+                }
                 Some(state)
-            }
-            Ok(_) => {
-                tracing::warn!("unknown persisted state version; starting empty");
-                None
             }
             Err(error) => {
                 tracing::warn!(error = %error, "corrupt persisted state; starting empty");
@@ -178,7 +237,8 @@ impl PersistedState {
 
     fn capture(engine: &Engine, decisions: &VecDeque<DecisionView>) -> Self {
         Self {
-            version: 1,
+            version: 2,
+            next_decision_id: engine.next_decision_id,
             identities: engine
                 .bus
                 .entries
@@ -310,23 +370,12 @@ impl Runtime {
         let restored = PersistedState::load(&state_path, wall)
             .await
             .unwrap_or_default();
-        let engine = Engine::new(config, now, restored.identities);
+        let mut engine = Engine::new(config, now, restored.identities, restored.next_decision_id);
+        engine.handle(Event::ServiceStarted, now, wall);
         let mut snapshot = state.snapshot();
         snapshot.decisions = restored.decisions.into_iter().rev().take(2000).collect();
         snapshot.decisions.make_contiguous().reverse();
-        push_ring(
-            &mut snapshot.decisions,
-            DecisionView {
-                timestamp: wall,
-                role: None,
-                from: None,
-                to: None,
-                reason: "service_started".into(),
-                actions: vec![],
-                would: false,
-            },
-            2000,
-        );
+        // Startup uses the same engine id allocation and publication path as all decisions.
         let trace = trace::TraceWriter::start(
             state_directory(&state_path).to_path_buf(),
             engine.config.trace.keep_days,
@@ -347,6 +396,7 @@ impl Runtime {
             last_identities: None,
             decisions_dirty: true,
         };
+        runtime.record_decisions(wall, &mut vec![]);
         runtime.publish_snapshot(now, wall, vec![]).await;
         runtime
     }
@@ -565,8 +615,11 @@ impl Runtime {
 
     fn record_decisions(&mut self, wall: DateTime<Utc>, ui_events: &mut Vec<UiEvent>) {
         for decision in &self.engine.decisions {
-            tracing::info!(event = "decision", role = ?decision.role, from = ?decision.from, to = ?decision.to, reason = %decision.reason);
+            tracing::info!(event = "decision", id = decision.id, parent = ?decision.parent, role = ?decision.role, from = ?decision.from, to = ?decision.to, reason = %decision.reason);
             let view = DecisionView {
+                id: decision.id,
+                trigger: decision.trigger.clone(),
+                parent: decision.parent,
                 timestamp: wall,
                 role: decision.role.clone(),
                 from: decision.from,
@@ -587,8 +640,15 @@ impl Runtime {
                         )
                     })
                     .collect(),
-                would: self.engine.mode() == Mode::Shadow,
+                // A service-start boundary is an observed fact, not a shadow intent.
+                would: self.engine.mode() == Mode::Shadow && decision.reason != "service_started",
             };
+            if self.engine.config.trace.keep_days != 0 && self.trace.is_some() {
+                let mut payload = serde_json::to_value(decision).expect("serializable decision");
+                payload["timestamp"] = serde_json::json!(wall);
+                payload["would"] = serde_json::json!(view.would);
+                self.trace_entry(wall, trace::TraceEntry::Decision(payload));
+            }
             push_ring(&mut self.snapshot.decisions, view.clone(), 2000);
             self.decisions_dirty = true;
             ui_events.push(UiEvent::Decision(view));
@@ -634,6 +694,7 @@ impl Runtime {
             | Event::BridgeOffline
             | Event::ConfigReloaded(_)
             | Event::Tick
+            | Event::ServiceStarted
             | Event::SendResult { .. } => return,
         };
         self.trace_entry(wall, entry);
@@ -1084,7 +1145,7 @@ mod tests {
     #[test]
     fn rejects_unsafe_manual_commands_before_acknowledging() {
         let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let engine = Engine::new(config, Instant::now(), vec![]);
+        let engine = Engine::new(config, Instant::now(), vec![], 1);
         for command in [
             Command::Identify(15),
             Command::Identify(engine.bus.bridge),
@@ -1122,7 +1183,7 @@ mod tests {
     fn forget_rejects_invalid_bridge_and_unknown_addresses_but_allows_restored_entries() {
         let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
         let now = Instant::now();
-        let mut engine = Engine::new(config, now, vec![]);
+        let mut engine = Engine::new(config, now, vec![], 1);
         for (la, message) in [
             (15, "forget address must be 0–14"),
             (u8::MAX, "forget address must be 0–14"),
@@ -1172,7 +1233,7 @@ mod tests {
                 confirmed_at: wall,
             })
             .collect();
-        let mut engine = Engine::new(config, now, identities);
+        let mut engine = Engine::new(config, now, identities, 1);
         let decisions = VecDeque::new();
         let saved = PersistedState::capture(&engine, &decisions);
         assert_eq!(saved.identities.len(), 2);
@@ -1206,7 +1267,7 @@ mod tests {
         assert_eq!(snapshot.bridge_logical_address, 14);
 
         let now = Instant::now();
-        let mut engine = Engine::new(config.clone(), now, vec![]);
+        let mut engine = Engine::new(config.clone(), now, vec![], 1);
         config.bridge = crate::config::BridgeConfig::Tasmota {
             topic: config.bridge.name().into(),
             logical_address: 0,
@@ -1301,7 +1362,7 @@ mod review_tests {
             [Event::BridgeOffline]
         ));
         assert!(disconnected_events(true, true, &config).is_empty());
-        let mut engine = Engine::new(config.clone(), now, vec![]);
+        let mut engine = Engine::new(config.clone(), now, vec![], 1);
         engine.handle(
             Event::HaState {
                 entity: config.tv.entity.clone(),
@@ -1341,7 +1402,7 @@ mod review_tests {
         let mut config = config();
         config.mode = Mode::Active;
         let now = Instant::now();
-        let engine = Engine::new(config, now, vec![]);
+        let engine = Engine::new(config, now, vec![], 1);
         let (mqtt, mut eventloop) = mqtt::Mqtt::test_transport(true, 16);
         let (ha, _) = ha::Ha::fake();
         let executor = Arc::new(executor::Executor {
@@ -1511,6 +1572,7 @@ mod persistence_tests {
             .collect();
         let saved = PersistedState {
             version: 1,
+            next_decision_id: 1,
             identities,
             decisions: vec![],
         };
@@ -1520,6 +1582,134 @@ mod persistence_tests {
         let restored = PersistedState::load(&path, wall).await.unwrap();
         assert_eq!(restored.identities.len(), 1);
         assert_eq!(restored.identities[0].la, 4);
+    }
+
+    #[tokio::test]
+    async fn v1_migration_is_durable_and_restart_continues_the_counter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.state.json");
+        let wall = Utc::now();
+        let row = serde_json::json!({
+            "timestamp": wall, "role": null, "from": null, "to": null,
+            "reason": "command_set_mode", "actions": [], "would": false
+        });
+        tokio::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "identities": [], "decisions": [row.clone(), row]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let migrated = PersistedState::load(&path, wall).await.unwrap();
+        assert_eq!(migrated.version, 2);
+        assert_eq!(
+            migrated
+                .decisions
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(migrated.next_decision_id, 3);
+        assert!(migrated.decisions.iter().all(|row| row.parent.is_none()
+            && row.trigger
+                == crate::action::Trigger::Service {
+                    name: crate::action::ServiceKind::Migrated
+                }));
+        let disk: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(disk["version"], 2);
+        assert_eq!(disk["next_decision_id"], 3);
+        let rows = disk["decisions"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        for row in rows {
+            assert_eq!(
+                row["trigger"],
+                serde_json::json!({"kind":"service","name":"migrated"})
+            );
+            assert_eq!(row.get("parent"), Some(&serde_json::Value::Null));
+        }
+
+        // Read the actual replacement file, then restart using its persisted counter.
+        let restarted = PersistedState::load(&path, wall).await.unwrap();
+        assert_eq!(restarted.version, 2);
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let now = Instant::now();
+        let mut engine = Engine::new(
+            config.clone(),
+            now,
+            restarted.identities,
+            restarted.next_decision_id,
+        );
+        engine.handle(Event::ServiceStarted, now, wall);
+        assert_eq!(engine.decisions[0].id, 3);
+        let mut ring: VecDeque<_> = restarted.decisions.into();
+        ring.push_back(DecisionView {
+            id: engine.decisions[0].id,
+            parent: None,
+            trigger: engine.decisions[0].trigger.clone(),
+            timestamp: wall,
+            role: None,
+            from: None,
+            to: None,
+            reason: "service_started".into(),
+            actions: vec![],
+            would: false,
+        });
+        let saved = PersistedState::capture(&engine, &ring);
+        persist_bytes(&path, &serde_json::to_vec(&saved).unwrap())
+            .await
+            .unwrap();
+        let next_restart = PersistedState::load(&path, wall).await.unwrap();
+        let mut engine = Engine::new(
+            config,
+            now,
+            next_restart.identities,
+            next_restart.next_decision_id,
+        );
+        engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall);
+        assert_eq!(engine.decisions[0].id, 4);
+    }
+
+    #[tokio::test]
+    async fn state_counter_recovers_from_stale_values_and_rejects_exhaustion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.state.json");
+        let wall = Utc::now();
+        let row = serde_json::json!({
+            "id": 42, "timestamp": wall, "parent": null,
+            "trigger": {"kind":"service","name":"started"},
+            "role": null, "from": null, "to": null, "reason": "service_started",
+            "actions": [], "would": false
+        });
+        for (next, ring_id, expected) in [
+            (1, 42, Some(43)),
+            (50, 42, Some(50)),
+            (u64::MAX / 2 - 1, 42, Some(u64::MAX / 2 - 1)),
+            (u64::MAX / 2, 42, None),
+            (1, u64::MAX / 2 - 1, None),
+            (u64::MAX - 1, 42, None),
+            (u64::MAX, 42, None),
+            (1, u64::MAX, None),
+        ] {
+            let mut row = row.clone();
+            row["id"] = serde_json::json!(ring_id);
+            let state = serde_json::json!({
+                "version": 2, "next_decision_id": next, "identities": [], "decisions": [row]
+            });
+            tokio::fs::write(&path, serde_json::to_vec(&state).unwrap())
+                .await
+                .unwrap();
+            let loaded = PersistedState::load(&path, wall).await;
+            assert_eq!(loaded.map(|state| state.next_decision_id), expected);
+        }
     }
 }
 

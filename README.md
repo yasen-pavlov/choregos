@@ -292,6 +292,7 @@ cargo run -- replay fixtures/capture-streamer-wake.jsonl --config choregos.examp
 decision JSON object per line, with an `at` RFC3339 timestamp from the triggering
 trace line (or the timer deadline for timer-driven decisions). It never connects
 to anything and needs no secrets.
+Each replay row is ordered `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`, `reason`, `actions`, with ids starting at 1 per run; runtime traces additionally record full creation rows (structured actions and `would`) on `choregos/decision`, which extraction retains and replay ignores while recomputing decisions.
 Live traces are `cec-bus.<date>.jsonl` beside `choregos.state.json`
 (`/config` in Docker); a regression fixture is a slice of this file, retaining
 its `choregos/identities` header. Multiple files are consumed in argument order:
