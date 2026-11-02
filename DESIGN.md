@@ -140,6 +140,8 @@ src/runtime/bridge/aether.rs   status/bus/tx/telemetry/cfg codec + id map, boot 
 src/runtime/ha.rs      HA websocket client: auth, call_service, state subscriptions, reconnect [core]
 src/runtime/wol.rs     magic packet to directed broadcast                [core]
 src/runtime/webos.rs   native TLS SSAP TV power-off                       [core]
+src/runtime/observe.rs bounded direct TV and console observation windows  [core]
+src/runtime/probe.rs   read-only unicast console discovery over UDP       [core]
 src/runtime/executor.rs Action → side effect (respects mode)             [core]
 src/state.rs           AppState shared with the web layer (RwLock snapshot + broadcast channel of UI events) [core]
 src/web/mod.rs         axum router, OIDC + local login, session cookie   [ui]
@@ -216,6 +218,12 @@ standby_retries = 2               # bounded standby retries after each takeover_
 presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
+
+[verify]                         # optional; direct webOS read windows after active TV dispatch
+tv_poll_ms = 2000                 # 500–10000 ms
+tv_window_s = 45                  # 5–300 seconds
+probe_poll_ms = 2000              # 500–10000 ms
+probe_window_s = 45               # 5–300 seconds
 
 [fake_tv]
 power_status = "always_on"        # reply <Report Power Status: On> to <Give Device Power Status>
@@ -328,10 +336,10 @@ duplicates (same state) are ignored (replaces today's `rbe` nodes).
 
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
-1. `WakeTv` if `tv.entity` state is not `on` (HA state cache; if unknown, send anyway).
+1. `WakeTv` if room intent is Off **or** `tv.entity` state is not `on` (HA state cache; if unknown, send anyway).
 2. For every other role currently On: `takeover` action — `cec_standby` → directed `CecSend{to: la, data: "36"}` followed by `"8F"`; `cec_pause_standby` → directed `"41 25"` (Play: Still), `"36"` (Standby), then `"8F"` (Give Device Power Status), for sources that ignore Standby while playing: pause through deck control first; `ha_media_stop` → `HaCall{media_player.media_stop, entity}`; `none`.
 3. If Sonos state is `playing`: `HaCall{media_player.media_stop, sonos.entity}`.
-4. `HaCall{media_player.turn_on, receiver}` if receiver not `on`; then after `takeover_settle_ms`: `HaCall{media_player.select_source, receiver, {source}}` if `select_source` and current receiver source ≠ `source`; then `HaCall{script.turn_on, preset_for(now)}` — the preset only runs when the receiver transitioned off→on in this takeover or the active role changed.
+4. `HaCall{media_player.turn_on, receiver}` if room intent is Off **or** receiver not `on`; `receiver_was_off` uses that same rule. Then after `takeover_settle_ms`: `HaCall{media_player.select_source, receiver, {source}}` if `select_source` and current receiver source ≠ `source`; then `HaCall{script.turn_on, preset_for(now)}` — the preset only runs when `receiver_was_off` or the active role changed.
 Takeovers are idempotent: a repeated On for the same role with no state change does nothing.
 
 `cec_pause_standby` uses deck-control Play: Still rather than the user-control Pause key: keys sent by the TV can make the displaced source assert Active Source and briefly steal the input. Play: Still pauses without that activation side effect, allowing directed Standby to be honoured during playback.
@@ -347,6 +355,49 @@ and `Active Standby` succeed without `turnOff`, which can wake a standby TV.
 An unsupported-service/error response permits `turnOff` on older webOS.
 Pairing-required responses are permanent errors and are never retried.
 After an acknowledged power-off, websocket close is best-effort.
+
+Room intent is separate from observations: `RoomIntent { power: Unknown|On|Off,
+active_role: Option<String>, receiver_source: Option<String>,
+off_at: Option<DateTime<Utc>> }` starts Unknown with empty role/source/off time
+and is never persisted. Unknown uses HA alone for initial wake suppression,
+avoiding redundant power requests after a restart with the room already on.
+Wake transitions set On, the active role, and the configured receiver source
+when source selection is enabled. Reload clears the intended receiver source.
+Release clears the active role; all-off only releases roles and schedules the
+room-off timer. Only timer expiry sets Off, clears role/source, and records its
+wall time in `intent.off_at`. Keep that timestamp across subsequent wakes:
+cached On counts only when its HA `changed` time is strictly later than the
+last room-off; older/equal or missing timestamps cannot suppress repeated
+wakes during shutdown lag. Off requests never write optimistic HA state.
+
+Only for native webOS TV off, active TV wake/off dispatch starts read-only
+`getPowerState` polling through the shared TLS/SSAP session. Poll immediately,
+then every `[verify].tv_poll_ms` (default 2000, 500–10000) until target or
+`tv_window_s` (default 45, 5–300 seconds); a newer action replaces the window.
+`Active`, `Screen Off`, and `Screen Saver` map to On; `Active Standby`,
+`Suspend`, and `Power Off` map to Off. Failed queries map to Unreachable, not Off. Pairing-required stops
+polling and warns once until adapters restart. Shadow mode does not poll.
+The last `Event::TvPower { state: On|Off|Unreachable, at }` is kept separately
+as `tv_direct: Option<(TvState, DateTime<Utc>)>` in engine and snapshot, never
+persisted. Observation windows do not create expectations/verdicts or actions.
+
+Optional per-device `probe = { kind = "ps5", host = "console.lan", port = 9302 }`
+adds Sony console observations. Send one unicast datagram
+`SRCH * HTTP/1.1\ndevice-discovery-protocol-version:00030010\n`; wait at most
+one second. First reply line `HTTP/1.1 200 …` maps to Awake, `620 …` to Standby;
+silence, transport errors or unsupported replies map to Unreachable.
+Active wake transitions start an Awake window; dispatched CEC stop sequences
+for that role start a Standby window. Poll immediately then every
+`verify.probe_poll_ms` (default 2000, 500–10000), until target or
+`probe_window_s` (default 45, 5–300 seconds). A new target cancels the previous
+role window; duplicate stop retries do not extend a pending window. Shutdown
+and adapter reload cancel all windows, including in-flight queries.
+`Event::ConsolePower { role, state: Awake|Standby|Unreachable, at }` updates
+the role's separate, non-persisted `direct` observation; `RoleView` exposes
+`direct: Option<(ConsoleState, DateTime<Utc>)>` and `probe_configured: bool`.
+Remote Play must be enabled and UDP reachability provided by the operator.
+
+
 
 ### 5.6 Startup / resync
 On start and on bridge online (Tasmota LWT `Online`; aether `status.online:true` or a `boot` change): send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
@@ -394,6 +445,9 @@ empty; corrupt or unknown versions warn and start empty without failing startup.
   The runtime also captures `choregos/decision` creation rows with the full view,
   `would`, and structured actions (not ring display strings); extraction retains
   them and replay ignores them, recomputing from inputs with ids starting at 1.
+  Direct observations are `tv/state` with `{state, at}` and `probe/state`
+  with `{role, state, at}`; replay consumes these known topics and extraction
+  retains them. Older versions ignore them.
 
 `Engine::new(config, now, restored, next_decision_id)` receives the seed and
 persisted id counter without I/O. `record` allocates ids; the startup service
@@ -442,6 +496,10 @@ Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT
 
 ### 5.12 Events into the engine
 `Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`TvPower{state: On|Off|Unreachable, at: DateTime<Utc>}` is a direct observation
+only, independent of the HA cache and room intent.
+`ConsolePower{role, state: Awake|Standby|Unreachable, at: DateTime<Utc>}`
+updates only the role's direct observation, never its CEC-derived logical power.
 `Frame.ack` (observed ACK bit) and `Frame.t_us` (bridge-monotonic µs) are
 `None` on Tasmota; the engine never reads them — the aether adapter already reduced a NACK-cut directed `rx` to header-only before the engine sees it (§1).
 `SendResult.status: SendStatus = Ack | Nack | ArbLost | LineError | Busy`,
@@ -460,8 +518,8 @@ The raw-send byte limit is a `BridgeConfig` property (14 Tasmota, 15 aether),
 enforced by the engine's `SendRaw` validation and the UI form.
 HA's parsed `last_changed` takes precedence; absent/invalid timestamps use injected
 wall time on state-string changes, otherwise retain the cached timestamp.
-Optimistic state writes preserve the last HA-observed timestamp; sending a
-command does not establish when the device actually changed state.
+The HA cache contains observed state only: sending a command never changes
+its value or establishes when the device actually changed state.
 
 ## 6. Web UI (axum + askama + htmx + SSE; no JS build step)
 
@@ -497,7 +555,7 @@ impl AppState {
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }
-pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
+pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub intent: RoomIntent, pub tv_direct: Option<(TvState, DateTime<Utc>)>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
 pub enum UiEvent { Frame(FrameView), Decision(DecisionView) }   // snapshots are pulled via snapshot(), never broadcast
 pub enum Command { AllOff, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
 

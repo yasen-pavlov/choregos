@@ -130,6 +130,19 @@ service still receive `turnOff`. Pairing-required errors are never retried.
 For containers, also pass the configured key environment variable (for example
 `-e CHOREGOS_TV_KEY`). Omit `tv.off` or select `kind = "ha"` for HA power-off.
 
+With native webOS configured, each active TV wake/off dispatch starts a bounded
+direct `getPowerState` polling window. The dashboard shows `direct: on`, `off`
+or `unreachable` and its age alongside the unchanged HA state. Polling stops at
+the requested state or `[verify].tv_window_s`; it never sends corrective actions.
+Room intent is separate from observations: an Off intent always sends the next
+TV/receiver wake even if HA still reports On from before the off request.
+Intent and direct observations are not persisted.
+An optional per-device `probe = { kind = "ps5", host = "console.lan", port = 9302 }`
+adds a read-only Sony console power source. Remote Play must be enabled and UDP
+9302 reachable from the Choregos host. After its wake or dispatched CEC stop,
+the runtime polls until Awake/Standby or the configured window expires.
+Unreachable is not proof of standby. Role cards retain the last direct reading.
+
 Start in `shadow` mode (the default in the example), watch the **Decisions**
 page through a few evenings, then switch to `active` from the UI or over MQTT.
 See the [operations guide](docs/operations.md) for volume files, incident replay, upgrades and bridge changes.
@@ -162,8 +175,9 @@ accepted **only through environment variables**, never as TOML keys:
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries (`from`, `to` as `HH:MM`, HA `script`). Slots must cover exactly 24 hours; `24:00` is valid only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` role IDs whose volume keys are forwarded while Sonos is `playing` |
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
+| `verify` | Optional `tv_poll_ms` / `probe_poll_ms` (each default 2000, 500–10000 ms) and `tv_window_s` / `probe_window_s` (each default 45, 5–300 seconds). Active-mode, action-scoped direct observation windows; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
-| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player` |
+| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302}` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
 
 `web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` changes require a restart and are
@@ -319,6 +333,29 @@ The shared JSONL codec accepts existing bus/LWT fixtures and captures HA state, 
 commands (`kind` plus `data` for tuple/struct variants), and send acknowledgements.
 Recorded `cmnd` lines correlate subsequent bridge results; replay never executes
 the engine's actions.
+
+Direct TV samples use the known topic `tv/state`, with the observation's own
+timestamp in `payload.at`:
+
+```json
+{"ts":"2026-11-02T12:00:00.000Z","topic":"tv/state","payload":{"state":"on","at":"2026-11-02T12:00:00Z"}}
+```
+
+`state` is `on`, `off`, or `unreachable`. Replay updates the engine's separate
+`tv_direct` value without changing HA state or room intent; extraction keeps
+these lines. Older versions do not know `tv/state` and ignore it.
+
+Console samples use the known topic `probe/state`:
+
+```json
+{"ts":"2026-11-02T12:00:00.000Z","topic":"probe/state","payload":{"role":"console_b","state":"standby","at":"2026-11-02T12:00:00Z"}}
+```
+
+Console `state` is `awake`, `standby`, or `unreachable`; replay updates that
+role's `direct` observation, not its CEC-derived logical power. Extraction
+retains both direct-source topics; older versions ignore them as unknown.
+
+
 
 `extract` builds a portable fixture using exactly the same inclusive window,
 identity and availability seeds. Initial in-window headers are retained without

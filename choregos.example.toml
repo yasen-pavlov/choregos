@@ -61,6 +61,12 @@ presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
 
+[verify]
+tv_poll_ms = 2000                 # direct webOS observation cadence, 500–10000 ms
+tv_window_s = 45                  # stop at target or this deadline, 5–300 seconds
+probe_poll_ms = 2000              # configured console probes, 500–10000 ms
+probe_window_s = 45               # stop at target or deadline, 5–300 seconds
+
 [fake_tv]
 replies = true                  # false if bridge firmware owns directed TV replies; never answers Request Active Source
 power_status = "always_on"        # reply <Report Power Status: On> to <Give Device Power Status>
@@ -100,6 +106,8 @@ on = ["image_view_on", "text_view_on", "active_source", "power_on"]
 off = ["standby", "inactive_source", "power_standby"]
 takeover = "cec_standby"
 presence = "events"
+# Optional Sony console truth source; Remote Play and UDP reachability required:
+# probe = { kind = "ps5", host = "console.lan", port = 9302 }
 
 [[device]]
 role = "console_a"

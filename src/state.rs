@@ -74,6 +74,8 @@ impl AppState {
                     last_event: None,
                     last_seen: None,
                     conflicted: false,
+                    direct: None,
+                    probe_configured: device.probe.is_some(),
                 })
                 .collect(),
             bus: Vec::new(),
@@ -89,6 +91,8 @@ impl AppState {
                     .collect(),
             },
             active_role: None,
+            intent: RoomIntent::default(),
+            tv_direct: None,
             conflicts: Vec::new(),
             recent_frames: VecDeque::new(),
             decisions: VecDeque::new(),
@@ -238,6 +242,8 @@ pub struct Snapshot {
     pub bus: Vec<BusEntryView>,
     pub ha: HaView,
     pub active_role: Option<String>,
+    pub intent: RoomIntent,
+    pub tv_direct: Option<(TvState, DateTime<Utc>)>,
     pub conflicts: Vec<Conflict>,
     pub recent_frames: VecDeque<FrameView>,
     pub decisions: VecDeque<DecisionView>,
@@ -320,6 +326,90 @@ pub enum RolePower {
     On,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomPower {
+    Unknown,
+    On,
+    Off,
+}
+
+impl std::fmt::Display for RoomPower {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unknown => "unknown",
+            Self::On => "on",
+            Self::Off => "off",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RoomIntent {
+    pub power: RoomPower,
+    pub active_role: Option<String>,
+    pub receiver_source: Option<String>,
+    pub off_at: Option<DateTime<Utc>>,
+}
+
+impl Default for RoomIntent {
+    fn default() -> Self {
+        Self {
+            power: RoomPower::Unknown,
+            active_role: None,
+            receiver_source: None,
+            off_at: None,
+        }
+    }
+}
+
+impl RoomIntent {
+    pub fn off(at: DateTime<Utc>) -> Self {
+        Self {
+            power: RoomPower::Off,
+            active_role: None,
+            receiver_source: None,
+            off_at: Some(at),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TvState {
+    On,
+    Off,
+    Unreachable,
+}
+
+impl std::fmt::Display for TvState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Unreachable => "unreachable",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleState {
+    Awake,
+    Standby,
+    Unreachable,
+}
+
+impl std::fmt::Display for ConsoleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Awake => "awake",
+            Self::Standby => "standby",
+            Self::Unreachable => "unreachable",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BusPower {
@@ -342,6 +432,8 @@ pub struct RoleView {
     pub last_event: Option<String>,
     pub last_seen: Option<DateTime<Utc>>,
     pub conflicted: bool,
+    pub direct: Option<(ConsoleState, DateTime<Utc>)>,
+    pub probe_configured: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

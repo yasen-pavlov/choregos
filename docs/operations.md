@@ -74,6 +74,51 @@ HA may retain operator-renamed entity IDs. The dashboard additionally shows
 telemetry age, weak/stale telemetry warnings and native bridge line faults;
 old telemetry is not proof of a current connection.
 
+## Direct TV observations
+
+When `tv.off.kind = "webos"`, an active TV wake/off dispatch starts a direct
+`getPowerState` window using the configured pairing key. `[verify].tv_poll_ms`
+is the cadence (default 2000 ms, range 500–10000); `tv_window_s` is the total
+window (default 45 seconds, range 5–300). It ends at the requested state or
+deadline, and a newer TV action replaces the previous window. Shadow mode
+does not start direct polling. HA-only TV power-off has no direct source.
+
+The dashboard TV row keeps HA state and shows the last direct state and its age.
+`unreachable` means the direct query failed (for example, connection failure,
+timeout, unsupported power-state service or an unrecognized response); it
+does **not** prove the TV is off. A pairing-required warning stops direct polling
+until adapter restart; fix the environment pairing key and restart the service.
+No direct observation triggers corrective actions. Old direct data remains
+visible with its age after the window closes.
+
+Room intent starts Unknown after restart and is not restored from disk. Until
+a wake/off decision establishes intent, only the HA cache governs wake
+suppression, so a room already On does not receive redundant power requests.
+An Off intent always causes the next TV/receiver wake request, even when HA
+still reports On; room-off requests never overwrite HA's observed state or timestamps.
+The last room-off timestamp remains across wakes: HA On suppresses another
+wake only if HA's change timestamp is newer than that off request. All-off
+itself schedules the cancellable release delay; intent becomes Off only at expiry.
+
+## Direct console observations
+
+Configure a Sony console role with
+`probe = { kind = "ps5", host = "console.lan", port = 9302 }`.
+**Remote Play must be enabled; the console must be reachable from the Choregos
+host on UDP 9302 (same subnet, or a routed/NAT path).** There is no pairing or
+account credential. The probe is a plain unicast datagram from the container.
+
+Wake transitions start an Awake window; dispatched CEC stop sequences start a
+Standby window. `[verify].probe_poll_ms` defaults to 2000 (500–10000 ms),
+`probe_window_s` to 45 (5–300 seconds). Polling stops at target or deadline;
+opposite targets replace the window, and reload/shutdown cancel in-flight work.
+Role cards show the last direct reading and its age. `unreachable` means no
+usable discovery reply, not proof of standby: check Remote Play and the UDP
+path before drawing a power-state conclusion. These observations never send
+corrective actions or overwrite CEC-derived logical role power.
+
+
+
 ## Reading the decision ring
 
 Read the host-side state file (use `sudo` for its mode-0600 permissions):

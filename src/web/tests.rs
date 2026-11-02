@@ -916,6 +916,9 @@ async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
     snapshot.warming = false;
     snapshot.connections.mode = crate::state::Mode::Active;
     snapshot.connections.mqtt_connected = true;
+    snapshot.intent.power = crate::state::RoomPower::On;
+    snapshot.intent.active_role = Some("streamer".into());
+    snapshot.tv_direct = Some((crate::state::TvState::On, chrono::Utc::now()));
     h.state.publish(snapshot, []);
     let html = body(h.get("/", Some(&cookie)).await).await;
     // The poll swaps `#dashboard` and, out of band, `#status` from the same response.
@@ -924,6 +927,8 @@ async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
     assert!(status.contains("mode-active"));
     assert!(!status.contains("warming"));
     assert!(status.contains("conn up\" title=\"MQTT connected"));
+    assert!(html.contains("intent on / streamer"));
+    assert!(html.contains("tv direct on"));
     for id in [
         "mode-shadow",
         "mode-active",

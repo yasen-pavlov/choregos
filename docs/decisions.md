@@ -2,6 +2,55 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-02 — Direct observations and room intent
+
+- Remove the optimistic TV/receiver HA-cache writes at room-off: a command is
+  not evidence that either device changed. The HA cache now contains only
+  observations, including their original timestamps.
+- Keep a separate, non-persisted `RoomIntent { power, active_role,
+  receiver_source, off_at }`, initially Unknown with empty fields. Wake
+  decisions set On, the role, and the configured receiver source if selection
+  is enabled; reload clears that source. Intent is the engine's single
+  active-role source. Role release clears the active role; all-off only
+  releases roles and schedules the room-off timer. Expiry sets Off, clears
+  role/source, and records its wall time. Preserve this `off_at` across wakes:
+  cached On suppresses wake only if HA's `changed` is strictly later than
+  the last room-off. This preserves repeated quick re-wake through HA lag,
+  not just the first wake after an off request.
+  Unknown startup intent uses only the HA cache, preserving wake suppression
+  after restart with the room already On. The first golden run exposed three
+  redundant first-wake power requests when startup was Off; Unknown fixes that
+  regression without re-blessing any golden output.
+- Add direct TV observation through the existing webOS TLS/SSAP registration
+  and `getPowerState` exchange, independently of HA reconnect timing. Only
+  active-mode TV wake/off dispatches start polling; HA-only off configuration
+  has no direct source. `Active`, `Screen Off`, and `Screen Saver` mean On;
+  `Active Standby`, `Suspend`, and `Power Off` mean Off. Failed reads are Unreachable,
+  not an assertion of power-off. Pairing-required stops polling and warns once
+  until the adapters restart.
+- `[verify].tv_poll_ms` defaults to 2000 (500–10000 ms); `tv_window_s` defaults
+  to 45 (5–300 seconds). Poll immediately after dispatch, then at the interval,
+  stopping at target or deadline; a newer TV action replaces the older window.
+  These observations are reporting-only: no expectations, verdicts or remediation.
+- Trace direct observations as `tv/state` with `{state, at}`; replay consumes
+  them and extraction retains them. Snapshot keeps the last direct TV state
+  and timestamp separately from HA; neither intent nor direct state is persisted.
+- Add optional per-role `probe = { kind = "ps5", host, port = 9302 }` for
+  read-only Sony console discovery. One unicast UDP request, one-second reply
+  deadline: status 200 is Awake, 620 is Standby, failed reads are Unreachable.
+  Wake transitions and dispatched CEC stops open target-scoped windows with
+  `verify.probe_poll_ms` (default 2000, 500–10000) and `probe_window_s`
+  (default 45, 5–300 seconds). Opposite targets replace windows; duplicate
+  retries do not extend a pending window. Reload/shutdown abort in-flight work.
+  Any queued Standby to the configured role's logical address starts its stop
+  window, even if that role was already Off and another role supplies the
+  all-off transition decision. Reload also clears all cached direct TV and
+  role observations so old endpoints cannot lend truth to a new configuration.
+  Trace as `probe/state` `{role, state, at}`; replay/extract handle both sources.
+  Role snapshots keep direct observations separate from logical role power.
+  Remote Play and a reachable UDP path are operator prerequisites; there is
+  no pairing, remediation, or new network attachment in Choregos.
+
 ## 2026-11-02 — Decision identity
 
 - Assign each engine decision a monotonic `u64` id, an input/timer `trigger`,

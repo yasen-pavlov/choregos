@@ -11,6 +11,15 @@ timing, presets and speaker settings; generic web settings satisfy the current
 configuration schema but are unused by replay. No test contacts real devices.
 Expected lines are ordered `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`, `reason`, `actions`; ids restart at 1 for each replay, and the decision-identity re-bless adds only `id`/`parent`/`trigger` without changing the existing fields.
 
+## 2026-11-02 room-intent regression check
+
+An initial run with intent starting Off added redundant power-on actions to
+the first wake in three windows whose HA cache already said On. Startup
+intent now starts Unknown: until the first decision establishes intent,
+only HA's observed cache governs wake suppression, preserving restart
+behavior. Known Off intent still forces power-on through post-off HA lag.
+The corpus must remain byte-identical; no re-bless is needed.
+
 ## Cases
 
 **`aether-console-wake-and-streamer-takeover` — 11 decisions.**

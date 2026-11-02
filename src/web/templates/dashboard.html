@@ -47,6 +47,10 @@
     <div class="group">
       <span class="label">active source</span>
       <strong>{% if let Some(name) = active_name %}{{ name }}{% else %}<span class="dim">none</span>{% endif %}</strong>
+      <span class="bridge-detail" title="What Choregos intends the room to be; observations are compared against it">· intent {{ snapshot.intent.power }}{% if let Some(role) = snapshot.intent.active_role %} / {{ role }}{% endif %}</span>
+      {% if let Some((state, at)) = snapshot.tv_direct %}
+      <span class="bridge-detail" title="TV power as reported directly by the TV, independent of Home Assistant">· tv direct {{ state }} {{ view::since(at) }}</span>
+      {% endif %}
     </div>
     <div class="group end">
       <button id="all-off" class="danger" hx-post="/actions/all-off" hx-target="#flash" hx-confirm="Turn everything off?">all off</button>
@@ -67,6 +71,9 @@
         <dt>OSD</dt><dd>{{ view::opt(role.osd) }}</dd>
         <dt>source</dt><dd>{{ role.source }}</dd>
         <dt>last</dt><dd><span class="mono">{{ view::opt(role.last_event) }}</span> <span class="dim">{{ view::ago(role.last_seen) }}</span></dd>
+        {% if role.probe_configured %}
+        <dt>direct</dt><dd title="Console power as reported by its own discovery service, independent of CEC">{% if let Some((state, at)) = role.direct %}{{ state }} <span class="dim">{{ view::since(at) }}</span>{% else %}<span class="dim">not probed yet</span>{% endif %}</dd>
+        {% endif %}
       </dl>
       <footer>
         <button id="takeover-{{ role.role }}" hx-post="/actions/takeover/{{ role.role|urlencode_strict }}" hx-target="#flash">takeover</button>

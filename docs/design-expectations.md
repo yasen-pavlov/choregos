@@ -91,27 +91,20 @@ media players), `Event::Frame` power replies `90 xx`, `Event::SendResult`.
 New:
 
 - **`Event::TvPower { state, at }`** from a direct webOS `getPowerState`
-  (the SSAP session already used by `tv.off`). The runtime polls every 2 s from
-  a `tv.power` expectation's creation until it settles; never otherwise. Traced
-  as topic `tv/state` so replay sees it. This is the observation that makes the
-  TV number honest and bypasses HA's reconnect blind spot.
-- **`Event::ConsolePower { role, state, at }`** from a direct Sony-console
-  discovery probe: one UDP datagram to port 9302 (`SRCH * HTTP/1.1`,
-  `device-discovery-protocol-version:00030010`); reply `200` = awake, `620` =
-  rest mode, no reply = off/unreachable. No pairing or account. Configured per
-  role as `probe = { kind = "ps5", host = "…" }`; polled like `tv_direct`
-  only while an expectation on that role is pending. Traced as `probe/state`.
-  Requires Remote Play enabled on the console. Other consoles have no local
-  equivalent on retail firmware and stay `cec_only`.
-- **Optimistic HA cache writes removed.** `off_timer_expired` currently writes
-  `tv`/`receiver = off` into the HA cache before anything happened
-  (`engine.rs:913-934`). The verifier needs the cache to be observed truth
-  only. The reason that write existed — a re-wake inside HA's lag must still
-  send `wake_tv` — is kept by consulting the room intent (below) instead.
+  (the SSAP session already used by `tv.off`). Step 2 polls every 2 s after an
+  active TV wake/off dispatch until target or a 45 s window ends. Traced as
+  `tv/state`, this bypasses HA's reconnect blind spot.
+- **Optimistic HA cache writes removed (step 2).** Off requests no longer write
+  TV/receiver power into HA's observation cache. A separate room intent starts
+  Unknown and follows wake/off decisions; a wake sends TV and receiver power-on
+  whenever intent is Off or the corresponding HA cache is not On.
+  Cached On is current only if its HA change timestamp is newer than the last
+  room-off request; the timestamp remains across repeated wakes during HA lag.
+  All-off changes power intent only when its room-off timer expires.
 
 ## Room intent and drift
 
-The engine gets an explicit `RoomIntent { power: on|off, active_role,
+The engine gets an explicit `RoomIntent { power: unknown|on|off, active_role,
 receiver_source }`, derived from the same transitions that create decisions.
 It is what the verifier compares against once all decisions have settled:
 
@@ -122,6 +115,12 @@ It is what the verifier compares against once all decisions have settled:
   off by hand while the room is on; TV turned on by its remote while the room
   is off.
 - Drift rows carry no actions. Remediation is out of scope for this phase.
+
+Intent and direct TV/console observations are delivered in step 2; drift and
+verdict comparison remain later steps. A per-device `ps5` discovery probe
+provides Awake/Standby/Unreachable over unicast UDP; it requires Remote Play
+and a reachable UDP path from the Choregos host. Its trace topic is `probe/state`.
+
 
 ## Persistence, trace, replay
 
@@ -174,9 +173,8 @@ can ship as one release, 4 after a few days of verdicts.
 
 ## Decisions taken in review (2026-11-02)
 
-1. `cec_only` counts as met; the Sony console gets a native discovery probe as an
-   independent truth source if the console answers it (Remote Play must be
-   enabled); other consoles stay `cec_only`.
+1. `cec_only` counts as met. A configured Sony console gets an independent
+   discovery truth source; other devices retain CEC-only observation.
 2. Drift grace 30 s, direct polls every 2 s while an expectation is pending.
 3. Home Assistant exposure as described.
 4. Standby verification rows are folded into the parent's expectation.

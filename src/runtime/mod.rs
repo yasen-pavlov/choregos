@@ -3,6 +3,8 @@ pub mod cli;
 pub mod executor;
 pub mod ha;
 pub mod mqtt;
+pub mod observe;
+pub mod probe;
 pub mod trace;
 pub mod webos;
 pub mod wol;
@@ -13,8 +15,9 @@ use crate::{
     config::{Config, ConfigError},
     engine::{Engine, Event},
     state::{
-        AppState, BridgeTelemetry, BusEntryView, Command, CommandError, DecisionView,
-        FrameDirection, FrameView, HaEntityView, HaView, Mode, RoleView, Snapshot, UiEvent,
+        AppState, BridgeTelemetry, BusEntryView, Command, CommandError, ConsoleState, DecisionView,
+        FrameDirection, FrameView, HaEntityView, HaView, Mode, RolePower, RoleView, Snapshot,
+        TvState, UiEvent,
     },
 };
 use chrono::{DateTime, Utc};
@@ -53,33 +56,28 @@ struct Adapters {
     ha_task: tokio::task::JoinHandle<()>,
     effects: mpsc::Sender<(Arc<Config>, Vec<Action>)>,
     worker: tokio::task::JoinHandle<()>,
+    observer: Arc<observe::Observer>,
 }
 impl Adapters {
     fn start(config: &Config, tx: mpsc::Sender<Input>, removed_roles: &[String]) -> Self {
         let (mqtt, mqtt_task) = mqtt::Mqtt::start(config, tx.clone(), removed_roles);
-        let (ha, ha_task) = ha::Ha::start(config, tx);
+        let (ha, ha_task) = ha::Ha::start(config, tx.clone());
         let executor = Arc::new(executor::Executor {
             mqtt,
             ha,
             active: Arc::new(AtomicBool::new(config.mode == Mode::Active)),
         });
-        let worker_executor = executor.clone();
-        let (effects, mut rx) = mpsc::channel::<(Arc<Config>, Vec<Action>)>(64);
-        let worker = tokio::spawn(async move {
-            while let Some((config, actions)) = rx.recv().await {
-                for action in actions {
-                    if let Err(error) = worker_executor.execute(&action, &config).await {
-                        tracing::error!(error = %error, "action failed");
-                    }
-                }
-            }
-        });
+        let observer = Arc::new(observe::Observer::new(tx, executor.active.clone()));
+        let worker_observer = observer.clone();
+        let (effects, rx) = mpsc::channel::<(Arc<Config>, Vec<Action>)>(64);
+        let worker = tokio::spawn(ordered_effects(executor.clone(), worker_observer, rx));
         Self {
             executor,
             mqtt_task,
             ha_task,
             effects,
             worker,
+            observer,
         }
     }
     fn dispatch(&self, actions: Vec<Action>, engine: &Engine) -> Vec<(Frame, Option<String>)> {
@@ -91,6 +89,31 @@ impl Adapters {
                 sent.extend(frames);
             } else {
                 ordered.push(action);
+            }
+        }
+        for device in engine
+            .config
+            .device
+            .iter()
+            .filter(|device| device.probe.is_some())
+        {
+            let wake = engine.decisions.iter().any(|decision| {
+                decision.role.as_deref() == Some(&device.role) && decision.to == Some(RolePower::On)
+            });
+            let stopped = engine.identity.roles.get(&device.role).is_some_and(|la| {
+                sent.iter()
+                    .any(|(frame, _)| frame.to == *la && frame.opcode == Some(opcode::STANDBY))
+            });
+            if wake || stopped {
+                self.observer.console(
+                    engine.config.clone(),
+                    &device.role,
+                    if wake {
+                        ConsoleState::Awake
+                    } else {
+                        ConsoleState::Standby
+                    },
+                );
             }
         }
         if !ordered.is_empty()
@@ -113,10 +136,30 @@ impl Adapters {
             tracing::warn!("ordered worker drain timed out; cancelling remaining effects");
             worker.abort();
         }
+        self.observer.stop();
         self.executor.mqtt.shutdown();
         tokio::time::sleep(Duration::from_millis(100)).await;
         self.ha_task.abort();
         self.mqtt_task.abort();
+    }
+}
+
+async fn ordered_effects(
+    executor: Arc<executor::Executor>,
+    observer: Arc<observe::Observer>,
+    mut rx: mpsc::Receiver<(Arc<Config>, Vec<Action>)>,
+) {
+    while let Some((config, actions)) = rx.recv().await {
+        for action in actions {
+            if let Err(error) = executor.execute(&action, &config).await {
+                tracing::error!(error = %error, "action failed");
+            }
+            match action {
+                Action::WakeTv => observer.tv(config.clone(), TvState::On),
+                Action::TvOff => observer.tv(config.clone(), TvState::Off),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -688,6 +731,15 @@ impl Runtime {
                 attrs: trace_ha_attrs(attrs),
                 changed: *changed,
             },
+            Event::TvPower { state, at } => TraceEntry::TvPower {
+                state: *state,
+                at: *at,
+            },
+            Event::ConsolePower { role, state, at } => TraceEntry::ConsolePower {
+                role: role.clone(),
+                state: *state,
+                at: *at,
+            },
             Event::Command(command) => TraceEntry::Command(command.clone()),
             Event::Frame(_)
             | Event::BridgeOnline
@@ -997,7 +1049,9 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     snapshot.bridge_online = engine.bridge_online;
     snapshot.bridge_logical_address = engine.bus.bridge;
     snapshot.bridge_max_raw_bytes = engine.config.bridge.max_raw_bytes();
-    snapshot.active_role = engine.active_role.clone();
+    snapshot.active_role = engine.intent.active_role.clone();
+    snapshot.intent = engine.intent.clone();
+    snapshot.tv_direct = engine.tv_direct;
     snapshot.conflicts = engine.identity.conflicts.clone();
     snapshot.connections.bridge_online = engine.bridge_online;
     snapshot.connections.mode = engine.mode();
@@ -1023,6 +1077,8 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
                 last_event: engine.roles[&device.role].last_event.clone(),
                 last_seen: entry.and_then(|e| e.last_seen).map(timestamp),
                 conflicted: engine.identity.blocked.contains(&device.role),
+                direct: engine.roles[&device.role].direct,
+                probe_configured: device.probe.is_some(),
             }
         })
         .collect();
@@ -1415,6 +1471,10 @@ mod review_tests {
             .try_send((engine.config.clone(), vec![Action::WakeTv]))
             .unwrap();
         let adapters = Adapters {
+            observer: Arc::new(observe::Observer::new(
+                mpsc::channel(1).0,
+                executor.active.clone(),
+            )),
             executor,
             effects,
             worker: tokio::spawn(std::future::pending()),
@@ -1458,6 +1518,10 @@ mod review_tests {
             }
         });
         let adapters = Adapters {
+            observer: Arc::new(observe::Observer::new(
+                mpsc::channel(1).0,
+                executor.active.clone(),
+            )),
             executor,
             effects,
             worker,

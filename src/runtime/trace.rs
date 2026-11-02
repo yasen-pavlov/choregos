@@ -1,7 +1,7 @@
 //! Shared replay codec and best-effort, append-only runtime capture.
 use crate::{
     cec::{Frame, bus::LearnedIdentity},
-    state::Command,
+    state::{Command, ConsoleState, TvState},
 };
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -52,6 +52,15 @@ pub enum TraceEntry {
         state: String,
         attrs: Value,
         changed: Option<DateTime<Utc>>,
+    },
+    TvPower {
+        state: TvState,
+        at: DateTime<Utc>,
+    },
+    ConsolePower {
+        role: String,
+        state: ConsoleState,
+        at: DateTime<Utc>,
     },
     Command(Command),
     /// Full decision row with structured actions (not UI display strings).
@@ -110,6 +119,11 @@ pub fn line(ts: DateTime<Utc>, entry: &TraceEntry) -> String {
             "ha/state".into(),
             json!({"entity":entity,"state":state,"attrs":attrs,"changed":changed}),
         ),
+        TraceEntry::TvPower { state, at } => ("tv/state".into(), json!({"state":state,"at":at})),
+        TraceEntry::ConsolePower { role, state, at } => (
+            "probe/state".into(),
+            json!({"role":role,"state":state,"at":at}),
+        ),
         TraceEntry::Command(command) => ("choregos/command".into(), json!(command)),
         TraceEntry::Decision(payload) => ("choregos/decision".into(), payload.clone()),
         TraceEntry::Identities(identities) => ("choregos/identities".into(), json!(identities)),
@@ -147,6 +161,8 @@ fn known_topic(topic: &str) -> bool {
             | "choregos/connection"
             | "choregos/decision"
             | "ha/state"
+            | "tv/state"
+            | "probe/state"
     ) {
         return true;
     }
@@ -173,6 +189,15 @@ fn parse_entry(topic: &str, payload: Value) -> Option<TraceEntry> {
             state: payload.get("state")?.as_str()?.into(),
             attrs: payload.get("attrs")?.clone(),
             changed: serde_json::from_value(payload.get("changed")?.clone()).ok()?,
+        },
+        "tv/state" => TraceEntry::TvPower {
+            state: serde_json::from_value(payload.get("state")?.clone()).ok()?,
+            at: serde_json::from_value(payload.get("at")?.clone()).ok()?,
+        },
+        "probe/state" => TraceEntry::ConsolePower {
+            role: payload.get("role")?.as_str()?.into(),
+            state: serde_json::from_value(payload.get("state")?.clone()).ok()?,
+            at: serde_json::from_value(payload.get("at")?.clone()).ok()?,
         },
         _ => parse_mqtt(topic, payload)?,
     })

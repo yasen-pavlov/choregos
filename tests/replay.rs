@@ -3,7 +3,7 @@ use choregos::{
     cec::Frame,
     config::{Config, Takeover},
     engine::{Engine, Event},
-    state::{BusPower, Command, Mode, RolePower},
+    state::{BusPower, Command, Mode, RolePower, RoomIntent, RoomPower, TvState},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -649,7 +649,7 @@ fn pause_standby_observed_standby_confirms_despite_nacked_trailing_query() {
             assert_no_standby_decision(&engine, "streamer");
             assert_eq!(engine.roles["streamer"].power, RolePower::Off);
             assert_eq!(engine.roles["console_a"].power, RolePower::On);
-            assert_eq!(engine.active_role.as_deref(), Some("console_a"));
+            assert_eq!(engine.intent.active_role.as_deref(), Some("console_a"));
         }
     }
 }
@@ -668,7 +668,7 @@ fn pause_standby_rewake_signals_cancel_verification() {
         );
         assert_eq!(engine.bus.entries[&4].power, BusPower::On);
         assert_eq!(engine.roles["streamer"].power, RolePower::On);
-        assert_eq!(engine.active_role.as_deref(), Some("streamer"));
+        assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
         for interval in 1..=4 {
             let actions = engine.handle(Event::Tick, takeover + settle * interval, wall());
             assert!(
@@ -938,7 +938,7 @@ fn verification_power_on_reply_never_takes_back_the_room_or_buffers_a_wake() {
         assert_eq!(engine.bus.entries[&4].power, BusPower::On);
         assert_eq!(engine.roles["streamer"].power, RolePower::Off);
         assert_eq!(engine.roles["console_a"].power, RolePower::On);
-        assert_eq!(engine.active_role.as_deref(), Some("console_a"));
+        assert_eq!(engine.intent.active_role.as_deref(), Some("console_a"));
         assert!(!actions.contains(&Action::CecSend {
             to: 8,
             data: vec![0x36],
@@ -1434,9 +1434,29 @@ fn quick_rewake_ignores_ha_on_values_stale_from_before_our_off_actions() {
     frame(&mut engine, now, 4, 0, "04");
     frame(&mut engine, now + Duration::from_secs(1), 4, 0, "36");
     engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert_eq!(engine.intent.power, RoomPower::Off);
+    assert_eq!(engine.ha[&engine.config.tv.entity].state, "on");
+    assert_eq!(engine.ha[&engine.config.receiver.entity].state, "on");
     let wake = frame(&mut engine, now + Duration::from_millis(4001), 4, 0, "04");
     assert!(wake.contains(&Action::WakeTv));
     assert!(wake.iter().any(|a| service(a, "turn_on")));
+}
+
+#[test]
+fn restart_with_room_on_uses_ha_cache_until_intent_is_known() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    for entity in [
+        engine.config.tv.entity.clone(),
+        engine.config.receiver.entity.clone(),
+    ] {
+        ha(&mut engine, now, entity, "on", None);
+    }
+    assert_eq!(engine.intent.power, RoomPower::Unknown);
+    let actions = frame(&mut engine, now, 4, 0, "04");
+    assert!(!actions.contains(&Action::WakeTv));
+    assert!(!actions.iter().any(|action| service(action, "turn_on")));
+    assert_eq!(engine.intent.power, RoomPower::On);
 }
 
 #[test]
@@ -1468,7 +1488,7 @@ fn fake_tv_never_answers_request_active_source_even_with_known_source() {
         );
         assert_eq!(engine.bus.active_source, Some(0x2100));
         assert_eq!(engine.roles["streamer"].power, RolePower::On);
-        assert_eq!(engine.active_role.as_deref(), Some("streamer"));
+        assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
     }
 }
 
@@ -1527,7 +1547,7 @@ fn ha_changed_prefers_ha_then_stamps_transitions_but_not_attribute_updates() {
 }
 
 #[test]
-fn optimistic_off_preserves_observed_ha_timestamps() {
+fn room_off_preserves_observed_ha_states_and_timestamps() {
     let (mut engine, now) = setup();
     frame(&mut engine, now, 8, 15, "84230004");
     let observed = wall() - chrono::Duration::minutes(5);
@@ -1541,8 +1561,11 @@ fn optimistic_off_preserves_observed_ha_timestamps() {
     let delay = Duration::from_secs(engine.config.timing.off_delay_s);
     let expired = wall() + chrono::Duration::from_std(delay).unwrap();
     engine.handle(Event::Tick, now + delay, expired);
-    for entity in [&engine.config.tv.entity, &engine.config.receiver.entity] {
-        assert_eq!(engine.ha[entity].state, "off");
+    for (entity, state) in [
+        (&engine.config.tv.entity, "on"),
+        (&engine.config.receiver.entity, "off"),
+    ] {
+        assert_eq!(engine.ha[entity].state, state);
         assert_eq!(engine.ha[entity].changed, Some(observed));
     }
 }
@@ -1753,7 +1776,7 @@ fn forgetting_an_on_role_unbinds_it_and_uses_identity_lost_release_semantics() {
     frame(&mut engine, now, 8, 15, "84230004");
     assert_eq!(engine.roles["console_a"].power, RolePower::On);
     assert_eq!(engine.identity.roles["console_a"], 8);
-    assert_eq!(engine.active_role.as_deref(), Some("console_a"));
+    assert_eq!(engine.intent.active_role.as_deref(), Some("console_a"));
     let forgotten = now + Duration::from_secs(1);
     let actions = engine.handle(Event::Command(Command::Forget(8)), forgotten, wall());
     assert!(actions.is_empty());
@@ -1764,7 +1787,7 @@ fn forgetting_an_on_role_unbinds_it_and_uses_identity_lost_release_semantics() {
         engine.roles["console_a"].last_event.as_deref(),
         Some("identity_lost")
     );
-    assert_eq!(engine.active_role, None);
+    assert_eq!(engine.intent.active_role, None);
     assert_eq!(
         engine
             .decisions
@@ -3632,7 +3655,7 @@ fn promiscuous_bridge_address_frames_never_learn_or_signal_a_role() {
         assert!(engine.bus.entries.is_empty());
         assert!(engine.decisions.is_empty());
         assert!(engine.identity.roles.is_empty());
-        assert!(engine.active_role.is_none());
+        assert!(engine.intent.active_role.is_none());
         assert!(engine.bus.active_source.is_none());
     }
     // Also exercise BusModel directly: callers other than the engine must not insert own-LA entries.
@@ -3976,4 +3999,243 @@ fn warmup_boundary_preserves_command_trigger_and_does_not_claim_buffered_role_ro
             name: TimerKind::Warmup
         }
     );
+}
+
+#[test]
+fn external_tv_on_does_not_override_off_intent_or_suppress_wake() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    engine.handle(Event::Command(Command::AllOff), now, wall());
+    let now = now + Duration::from_secs(engine.config.timing.off_delay_s);
+    engine.handle(Event::Tick, now, wall());
+    let tv = engine.config.tv.entity.clone();
+    ha(&mut engine, now, tv, "on", None);
+    assert_eq!(engine.intent.power, RoomPower::Off);
+    assert!(frame(&mut engine, now, 4, 0, "04").contains(&Action::WakeTv));
+}
+
+#[test]
+fn room_intent_tracks_wake_settle_release_and_all_off() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 4, 0, "04");
+    assert_eq!(engine.intent.power, RoomPower::On);
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+    assert_eq!(engine.intent.receiver_source.as_deref(), Some("Streamer"));
+    engine.handle(Event::Tick, now + Duration::from_secs(2), wall());
+    assert_eq!(engine.intent.receiver_source.as_deref(), Some("Streamer"));
+    frame(&mut engine, now + Duration::from_secs(3), 4, 0, "36");
+    assert_eq!(engine.intent.power, RoomPower::On);
+    assert_eq!(engine.intent.active_role, None);
+    engine.handle(Event::Tick, now + Duration::from_secs(6), wall());
+    assert_eq!(engine.intent, RoomIntent::off(wall()));
+    frame(&mut engine, now + Duration::from_secs(7), 4, 0, "04");
+    engine.handle(
+        Event::Command(Command::AllOff),
+        now + Duration::from_secs(8),
+        wall(),
+    );
+    assert_eq!(engine.intent.power, RoomPower::On);
+    assert_eq!(engine.intent.active_role, None);
+    engine.handle(Event::Tick, now + Duration::from_secs(11), wall());
+    assert_eq!(engine.intent, RoomIntent::off(wall()));
+}
+
+#[test]
+fn direct_observations_update_only_their_truth_source() {
+    let (mut engine, now) = setup();
+    assert!(
+        engine
+            .handle(
+                Event::TvPower {
+                    state: TvState::On,
+                    at: wall()
+                },
+                now,
+                wall()
+            )
+            .is_empty()
+    );
+    assert!(engine.decisions.is_empty());
+    assert_eq!(engine.tv_direct, Some((TvState::On, wall())));
+    assert_eq!(engine.intent, RoomIntent::default());
+    assert!(engine.ha.is_empty());
+    let roles_before = engine.roles.len();
+    for role in ["console_b", "unknown_role"] {
+        assert!(
+            engine
+                .handle(
+                    Event::ConsolePower {
+                        role: role.into(),
+                        state: choregos::state::ConsoleState::Awake,
+                        at: wall(),
+                    },
+                    now,
+                    wall()
+                )
+                .is_empty()
+        );
+        assert!(engine.decisions.is_empty());
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert_eq!(
+            engine.roles["console_b"].direct,
+            Some((choregos::state::ConsoleState::Awake, wall()))
+        );
+        assert_eq!(engine.roles.len(), roles_before);
+        assert!(!engine.roles.contains_key("unknown_role"));
+        assert_eq!(engine.intent, RoomIntent::default());
+        assert_eq!(engine.tv_direct, Some((TvState::On, wall())));
+        assert!(engine.ha.is_empty());
+    }
+}
+
+#[test]
+fn repeated_rewake_requires_ha_on_observed_after_the_last_room_off() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    for entity in [
+        engine.config.tv.entity.clone(),
+        engine.config.receiver.entity.clone(),
+    ] {
+        ha(&mut engine, now, entity, "on", Some(wall()));
+    }
+    frame(&mut engine, now, 4, 0, "04");
+    frame(&mut engine, now + Duration::from_secs(1), 4, 0, "36");
+    let off_wall = wall() + chrono::Duration::seconds(4);
+    engine.handle(Event::Tick, now + Duration::from_secs(4), off_wall);
+    assert_eq!(engine.intent.off_at, Some(off_wall));
+    let first_wake = frame(&mut engine, now + Duration::from_millis(4001), 4, 0, "04");
+    assert!(first_wake.contains(&Action::WakeTv));
+    frame(&mut engine, now + Duration::from_millis(4500), 4, 0, "36");
+    let second_wake = frame(&mut engine, now + Duration::from_millis(5000), 4, 0, "04");
+    assert!(second_wake.contains(&Action::WakeTv));
+    assert!(second_wake.contains(&Action::ha(
+        "media_player",
+        "turn_on",
+        &engine.config.receiver.entity
+    )));
+    assert_eq!(engine.intent.off_at, Some(off_wall));
+    for (step, changed, redundant) in [
+        (6, off_wall, true),
+        (7, off_wall + chrono::Duration::milliseconds(1), false),
+    ] {
+        for entity in [
+            engine.config.tv.entity.clone(),
+            engine.config.receiver.entity.clone(),
+        ] {
+            ha(
+                &mut engine,
+                now + Duration::from_secs(step),
+                entity,
+                "on",
+                Some(changed),
+            );
+        }
+        frame(&mut engine, now + Duration::from_secs(step), 4, 0, "36");
+        let actions = frame(
+            &mut engine,
+            now + Duration::from_secs(step) + Duration::from_millis(1),
+            4,
+            0,
+            "04",
+        );
+        assert_eq!(actions.contains(&Action::WakeTv), redundant);
+        assert_eq!(
+            actions.contains(&Action::ha(
+                "media_player",
+                "turn_on",
+                &engine.config.receiver.entity
+            )),
+            redundant
+        );
+    }
+}
+
+#[test]
+fn all_off_cancelled_before_expiry_does_not_force_redundant_power_requests() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    for entity in [
+        engine.config.tv.entity.clone(),
+        engine.config.receiver.entity.clone(),
+    ] {
+        ha(&mut engine, now, entity, "on", None);
+    }
+    frame(&mut engine, now, 4, 0, "04");
+    engine.handle(
+        Event::Command(Command::AllOff),
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    assert_eq!(engine.intent.power, RoomPower::On);
+    assert_eq!(engine.intent.off_at, None);
+    let wake = frame(&mut engine, now + Duration::from_secs(2), 4, 0, "04");
+    assert!(!wake.contains(&Action::WakeTv));
+    assert!(!wake.contains(&Action::ha(
+        "media_player",
+        "turn_on",
+        &engine.config.receiver.entity
+    )));
+    assert!(
+        !engine
+            .handle(Event::Tick, now + Duration::from_secs(5), wall())
+            .contains(&Action::TvOff)
+    );
+}
+
+#[test]
+fn takeover_intent_uses_the_new_source_immediately_and_reload_clears_it() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    frame(&mut engine, now, 4, 0, "04");
+    frame(&mut engine, now, 8, 15, "84230004");
+    assert_eq!(engine.intent.active_role.as_deref(), Some("console_a"));
+    assert_eq!(engine.intent.receiver_source.as_deref(), Some("Console A"));
+    let mut config = (*engine.config).clone();
+    config.receiver.select_source = false;
+    engine.handle(
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+        now,
+        wall(),
+    );
+    assert_eq!(engine.intent.receiver_source, None);
+    let mut config = (*engine.config).clone();
+    config.bridge = choregos::config::BridgeConfig::Aether {
+        node: "cec-bridge".into(),
+        logical_address: 0,
+    };
+    engine.handle(
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+        now,
+        wall(),
+    );
+    assert_eq!(engine.intent.active_role, None);
+}
+
+#[test]
+fn config_reload_discards_all_direct_observations_without_a_bridge_change() {
+    let (mut engine, now) = setup();
+    engine.handle(
+        Event::TvPower {
+            state: TvState::On,
+            at: wall(),
+        },
+        now,
+        wall(),
+    );
+    for role in engine.roles.keys().cloned().collect::<Vec<_>>() {
+        engine.handle(
+            Event::ConsolePower {
+                role,
+                state: choregos::state::ConsoleState::Awake,
+                at: wall(),
+            },
+            now,
+            wall(),
+        );
+    }
+    assert!(engine.roles.values().all(|role| role.direct.is_some()));
+    engine.handle(Event::ConfigReloaded(engine.config.clone()), now, wall());
+    assert_eq!(engine.tv_direct, None);
+    assert!(engine.roles.values().all(|role| role.direct.is_none()));
 }

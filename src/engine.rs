@@ -12,7 +12,7 @@ use crate::{
     },
     config::{Config, PowerEvent, Presence, Takeover},
     identity::{self, Resolution},
-    state::{BusPower, Command, Mode, RolePower},
+    state::{BusPower, Command, ConsoleState, Mode, RolePower, RoomIntent, RoomPower, TvState},
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::{Value, json};
@@ -51,6 +51,15 @@ pub enum Event {
         attrs: BTreeMap<String, Value>,
         changed: Option<DateTime<Utc>>,
     },
+    TvPower {
+        state: TvState,
+        at: DateTime<Utc>,
+    },
+    ConsolePower {
+        role: String,
+        state: ConsoleState,
+        at: DateTime<Utc>,
+    },
     Tick,
     Command(Command),
     ConfigReloaded(Arc<Config>),
@@ -60,6 +69,7 @@ pub enum Event {
 pub struct RoleState {
     pub power: RolePower,
     pub last_event: Option<String>,
+    pub direct: Option<(ConsoleState, DateTime<Utc>)>,
     poll_at: Option<Instant>,
     awaiting: bool,
     misses: u32,
@@ -69,6 +79,7 @@ impl Default for RoleState {
         Self {
             power: RolePower::Off,
             last_event: None,
+            direct: None,
             poll_at: None,
             awaiting: false,
             misses: 0,
@@ -140,6 +151,8 @@ impl DecisionTrigger {
             Event::ServiceStarted => Some(Self::Service(ServiceKind::Started)),
             Event::Tick
             | Event::HaState { .. }
+            | Event::TvPower { .. }
+            | Event::ConsolePower { .. }
             | Event::SendResult { .. }
             | Event::BridgeOnline
             | Event::ConfigReloaded(_)
@@ -174,7 +187,8 @@ pub struct Engine {
     pub identity: Resolution,
     pub roles: BTreeMap<String, RoleState>,
     pub ha: BTreeMap<String, HaState>,
-    pub active_role: Option<String>,
+    pub intent: RoomIntent,
+    pub tv_direct: Option<(TvState, DateTime<Utc>)>,
     pub bridge_online: bool,
     pub warming: bool,
     pub decisions: Vec<Decision>,
@@ -211,7 +225,8 @@ impl Engine {
             identity,
             roles,
             ha: BTreeMap::new(),
-            active_role: None,
+            intent: RoomIntent::default(),
+            tv_direct: None,
             bridge_online: false,
             warming: true,
             decisions: vec![],
@@ -282,6 +297,16 @@ impl Engine {
                     vec![]
                 }
                 Event::BridgeOffline => self.handle_bridge_offline(),
+                Event::TvPower { state, at } => {
+                    self.tv_direct = Some((state, at));
+                    vec![]
+                }
+                Event::ConsolePower { role, state, at } => {
+                    if let Some(role) = self.roles.get_mut(&role) {
+                        role.direct = Some((state, at));
+                    }
+                    vec![]
+                }
                 Event::HaState {
                     entity,
                     state,
@@ -383,11 +408,14 @@ impl Engine {
     fn handle_config_reloaded(&mut self, config: Arc<Config>, now: Instant) -> Vec<Action> {
         let bridge_changed = self.config.bridge != config.bridge;
         self.config = config;
+        self.intent.receiver_source = None;
+        self.tv_direct = None;
         self.standby_verifications.clear();
         self.roles
             .retain(|role, _| self.config.device.iter().any(|d| &d.role == role));
         for device in &self.config.device {
             let role = self.roles.entry(device.role.clone()).or_default();
+            role.direct = None;
             role.poll_at = (role.power == RolePower::On && device.presence == Presence::Poll)
                 .then_some(now + Duration::from_secs(self.config.timing.presence_poll_s));
             role.awaiting = false;
@@ -400,7 +428,7 @@ impl Engine {
                 Self::required_queries(&self.config),
             );
             self.signals.clear();
-            self.active_role = None;
+            self.intent.active_role = None;
             for role in self.roles.values_mut() {
                 *role = RoleState::default();
             }
@@ -835,7 +863,7 @@ impl Engine {
         let mut scheduled_settle = None;
         if target == RolePower::On {
             self.off_at = None;
-            if !self.is_state(&self.config.tv.entity, "on") {
+            if self.intent.power == RoomPower::Off || !self.power_is_on(&self.config.tv.entity) {
                 actions.push(Action::WakeTv);
             }
             self.stop_displaced_roles(role, now, &mut actions);
@@ -846,7 +874,8 @@ impl Engine {
                     &self.config.sonos.entity,
                 ));
             }
-            let receiver_was_off = !self.is_state(&self.config.receiver.entity, "on");
+            let receiver_was_off = self.intent.power == RoomPower::Off
+                || !self.power_is_on(&self.config.receiver.entity);
             if receiver_was_off {
                 actions.push(Action::ha(
                     "media_player",
@@ -854,8 +883,18 @@ impl Engine {
                     &self.config.receiver.entity,
                 ));
             }
-            let preset = receiver_was_off || self.active_role.as_deref() != Some(role);
-            self.active_role = Some(role.into());
+            let preset = receiver_was_off || self.intent.active_role.as_deref() != Some(role);
+            self.intent.power = RoomPower::On;
+            self.intent.active_role = Some(role.into());
+            self.intent.receiver_source = self.config.receiver.select_source.then(|| {
+                self.config
+                    .device
+                    .iter()
+                    .find(|device| device.role == role)
+                    .expect("configured role")
+                    .source
+                    .clone()
+            });
             scheduled_settle = Some((
                 now + Duration::from_millis(self.config.timing.takeover_settle_ms),
                 role.into(),
@@ -913,8 +952,8 @@ impl Engine {
     }
 
     fn schedule_room_off(&mut self, role: &str, now: Instant) {
-        if self.active_role.as_deref() == Some(role) {
-            self.active_role = None;
+        if self.intent.active_role.as_deref() == Some(role) {
+            self.intent.active_role = None;
             self.settle = None;
         }
         self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
@@ -998,7 +1037,7 @@ impl Engine {
             return vec![];
         }
         self.trigger = Some(DecisionTrigger::Timer(TimerKind::RoomOff));
-        let mut actions = self.expire_off_timer(now);
+        let mut actions = self.expire_off_timer(now, wall);
         self.trigger = Some(DecisionTrigger::Timer(TimerKind::TakeoverSettle));
         actions.extend(self.expire_settle_timer(now, wall));
         self.trigger = Some(DecisionTrigger::Timer(TimerKind::Presence));
@@ -1058,7 +1097,7 @@ impl Engine {
         }
     }
 
-    fn expire_off_timer(&mut self, now: Instant) -> Vec<Action> {
+    fn expire_off_timer(&mut self, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
         if !self.off_at.is_some_and(|deadline| deadline <= now) {
             return vec![];
         }
@@ -1072,12 +1111,7 @@ impl Engine {
             Action::TvOff,
             Action::ha("media_player", "turn_off", &self.config.receiver.entity),
         ];
-        for entity in [&self.config.tv.entity, &self.config.receiver.entity] {
-            let cached = self.ha.entry(entity.clone()).or_default();
-            if cached.state != "off" {
-                cached.state = "off".into();
-            }
-        }
+        self.intent = RoomIntent::off(wall);
         self.record(None, None, None, "off_timer_expired", actions.clone(), None);
         actions
     }
@@ -1183,6 +1217,15 @@ impl Engine {
     }
     fn is_state(&self, entity: &str, state: &str) -> bool {
         self.ha.get(entity).is_some_and(|s| s.state == state)
+    }
+    fn power_is_on(&self, entity: &str) -> bool {
+        self.ha.get(entity).is_some_and(|cached| {
+            cached.state == "on"
+                && self
+                    .intent
+                    .off_at
+                    .is_none_or(|off_at| cached.changed.is_some_and(|changed| changed > off_at))
+        })
     }
     fn fake_tv(&self, frame: &Frame) -> Vec<Action> {
         if frame.from == self.bus.bridge || frame.from >= 15 {
