@@ -120,6 +120,33 @@ enum DecisionTrigger {
 }
 
 impl DecisionTrigger {
+    fn from_event(event: &Event) -> Option<Self> {
+        match event {
+            Event::Frame(frame) => {
+                let mut data = [0; 15];
+                let mut len = 0;
+                for byte in frame.opcode.iter().chain(&frame.params) {
+                    data[len] = *byte;
+                    len += 1;
+                }
+                Some(Self::Frame {
+                    from: frame.from,
+                    to: frame.to,
+                    data,
+                    len,
+                })
+            }
+            Event::Command(command) => Some(Self::Command(command.clone())),
+            Event::ServiceStarted => Some(Self::Service(ServiceKind::Started)),
+            Event::Tick
+            | Event::HaState { .. }
+            | Event::SendResult { .. }
+            | Event::BridgeOnline
+            | Event::ConfigReloaded(_)
+            | Event::BridgeOffline => None,
+        }
+    }
+
     fn recorded(&self) -> Trigger {
         match self {
             Self::Frame {
@@ -238,30 +265,7 @@ impl Engine {
     }
     pub fn handle(&mut self, event: Event, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
         self.decisions.clear();
-        self.trigger = match &event {
-            Event::Frame(frame) => {
-                let mut data = [0; 15];
-                let mut len = 0;
-                for byte in frame.opcode.iter().chain(&frame.params) {
-                    data[len] = *byte;
-                    len += 1;
-                }
-                Some(DecisionTrigger::Frame {
-                    from: frame.from,
-                    to: frame.to,
-                    data,
-                    len,
-                })
-            }
-            Event::Command(command) => Some(DecisionTrigger::Command(command.clone())),
-            Event::ServiceStarted => Some(DecisionTrigger::Service(ServiceKind::Started)),
-            Event::Tick
-            | Event::HaState { .. }
-            | Event::SendResult { .. }
-            | Event::BridgeOnline
-            | Event::ConfigReloaded(_)
-            | Event::BridgeOffline => None,
-        };
+        self.trigger = DecisionTrigger::from_event(&event);
         let was_warming = self.warming;
         if self.warming && now >= self.warm_until {
             self.warming = false;
@@ -834,37 +838,7 @@ impl Engine {
             if !self.is_state(&self.config.tv.entity, "on") {
                 actions.push(Action::WakeTv);
             }
-            for other in self
-                .roles
-                .keys()
-                .filter(|r| r.as_str() != role)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                if self.roles[&other].power == RolePower::On {
-                    let stop = self.stop_role(&other, now);
-                    if !stop.is_empty() {
-                        let state = self.roles.get_mut(&other).expect("configured role");
-                        state.power = RolePower::Off;
-                        state.last_event = Some("taken_over".into());
-                        state.poll_at = None;
-                        state.awaiting = false;
-                        state.misses = 0;
-                        if let Some(la) = self.identity.roles.get(&other) {
-                            self.signals.remove(la);
-                        }
-                        self.record(
-                            Some(other.clone()),
-                            Some(RolePower::On),
-                            Some(RolePower::Off),
-                            "taken_over",
-                            vec![],
-                            None,
-                        );
-                        actions.extend(stop);
-                    }
-                }
-            }
+            self.stop_displaced_roles(role, now, &mut actions);
             if self.is_state(&self.config.sonos.entity, "playing") {
                 actions.push(Action::ha(
                     "media_player",
@@ -888,11 +862,7 @@ impl Engine {
                 preset,
             ));
         } else {
-            if self.active_role.as_deref() == Some(role) {
-                self.active_role = None;
-                self.settle = None;
-            }
-            self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
+            self.schedule_room_off(role, now);
         }
         let id = self.record(
             Some(role.into()),
@@ -905,6 +875,59 @@ impl Engine {
         if let Some((deadline, role, preset)) = scheduled_settle {
             self.settle = Some((deadline, role, preset, id));
         }
+        self.parent_transition_verifications(role, target, reason, first_decision, id);
+        actions
+    }
+    fn stop_displaced_roles(&mut self, role: &str, now: Instant, actions: &mut Vec<Action>) {
+        for other in self
+            .roles
+            .keys()
+            .filter(|r| r.as_str() != role)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if self.roles[&other].power == RolePower::On {
+                let stop = self.stop_role(&other, now);
+                if !stop.is_empty() {
+                    let state = self.roles.get_mut(&other).expect("configured role");
+                    state.power = RolePower::Off;
+                    state.last_event = Some("taken_over".into());
+                    state.poll_at = None;
+                    state.awaiting = false;
+                    state.misses = 0;
+                    if let Some(la) = self.identity.roles.get(&other) {
+                        self.signals.remove(la);
+                    }
+                    self.record(
+                        Some(other.clone()),
+                        Some(RolePower::On),
+                        Some(RolePower::Off),
+                        "taken_over",
+                        vec![],
+                        None,
+                    );
+                    actions.extend(stop);
+                }
+            }
+        }
+    }
+
+    fn schedule_room_off(&mut self, role: &str, now: Instant) {
+        if self.active_role.as_deref() == Some(role) {
+            self.active_role = None;
+            self.settle = None;
+        }
+        self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
+    }
+
+    fn parent_transition_verifications(
+        &mut self,
+        role: &str,
+        target: RolePower,
+        reason: &str,
+        first_decision: usize,
+        id: u64,
+    ) {
         for pending in &mut self.standby_verifications {
             let stopped_here = if target == RolePower::On {
                 self.decisions[first_decision..self.decisions.len() - 1]
@@ -920,8 +943,8 @@ impl Engine {
                 pending.parent = Some(id);
             }
         }
-        actions
     }
+
     fn stop_role(&mut self, role: &str, now: Instant) -> Vec<Action> {
         if self.identity.blocked.contains(role) {
             return vec![];
