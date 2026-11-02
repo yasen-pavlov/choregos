@@ -28,6 +28,20 @@ enum CliCommand {
         #[arg(long)]
         until: Option<chrono::DateTime<chrono::Utc>>,
     },
+    Extract {
+        #[arg(required = true, num_args = 1..)]
+        trace: Vec<PathBuf>,
+        #[arg(long)]
+        since: chrono::DateTime<chrono::Utc>,
+        #[arg(long)]
+        until: chrono::DateTime<chrono::Utc>,
+        #[arg(long = "rename", value_parser = cli::parse_rename)]
+        renames: Vec<(String, String)>,
+        #[arg(long, value_parser = cli::parse_node)]
+        node: Option<String>,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     Healthz {
         #[arg(long, default_value = "http://127.0.0.1:8095/healthz")]
         url: String,
@@ -35,14 +49,21 @@ enum CliCommand {
 }
 #[tokio::main]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let writer = if matches!(&cli.command, CliCommand::Run { .. }) {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    };
     tracing_subscriber::fmt()
         .json()
+        .with_writer(writer)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "choregos=info".into()),
         )
         .init();
-    match execute(Cli::parse().command).await {
+    match execute(cli.command).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
@@ -60,6 +81,14 @@ async fn execute(command: CliCommand) -> anyhow::Result<()> {
             since,
             until,
         } => cli::replay_files(&config, &fixture, since, until, &mut std::io::stdout())?,
+        CliCommand::Extract {
+            trace,
+            since,
+            until,
+            renames,
+            node,
+            output,
+        } => cli::extract_to_path(&trace, since, until, &renames, node.as_deref(), &output)?,
         CliCommand::Healthz { url } => cli::healthz(&url).await?,
     }
     Ok(())

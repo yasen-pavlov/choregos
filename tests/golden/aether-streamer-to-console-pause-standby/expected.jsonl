@@ -1,0 +1,11 @@
+{"at":"2026-11-01T22:08:33.254Z","role":"streamer","from":"off","to":"on","reason":"ActiveSource","actions":[{"kind":"wake_tv"}]}
+{"at":"2026-11-01T22:08:35.254Z","role":"streamer","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_quiet","data":{}}]}
+{"at":"2026-11-01T22:08:57.104Z","role":"streamer","from":"on","to":"off","reason":"Standby","actions":[]}
+{"at":"2026-11-01T22:09:00.104Z","role":null,"from":null,"to":null,"reason":"off_timer_expired","actions":[{"kind":"tv_off"},{"kind":"ha_call","domain":"media_player","service":"turn_off","entity":"media_player.receiver","data":{}}]}
+{"at":"2026-11-01T22:09:49.473Z","role":"streamer","from":"off","to":"on","reason":"PowerOn","actions":[{"kind":"wake_tv"},{"kind":"ha_call","domain":"media_player","service":"turn_on","entity":"media_player.receiver","data":{}}]}
+{"at":"2026-11-01T22:09:51.473Z","role":"streamer","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"media_player","service":"select_source","entity":"media_player.receiver","data":{"source":"Streamer"}},{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_quiet","data":{}}]}
+{"at":"2026-11-01T23:23:36.591Z","role":"streamer","from":"on","to":"off","reason":"taken_over","actions":[]}
+{"at":"2026-11-01T23:23:36.591Z","role":"console_b","from":"off","to":"on","reason":"TextViewOn","actions":[{"kind":"cec_send","to":4,"data":[65,37]},{"kind":"cec_send","to":4,"data":[54]},{"kind":"cec_send","to":4,"data":[143]}]}
+{"at":"2026-11-01T23:23:38.591Z","role":"console_b","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"media_player","service":"select_source","entity":"media_player.receiver","data":{"source":"Console B"}},{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_night","data":{}}]}
+{"at":"2026-11-01T23:46:14.723Z","role":"console_b","from":"on","to":"off","reason":"InactiveSource","actions":[]}
+{"at":"2026-11-01T23:46:17.723Z","role":null,"from":null,"to":null,"reason":"off_timer_expired","actions":[{"kind":"tv_off"},{"kind":"ha_call","domain":"media_player","service":"turn_off","entity":"media_player.receiver","data":{}}]}

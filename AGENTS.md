@@ -11,6 +11,7 @@ review in `docs/decisions.md` (date, what, why).
 - No JavaScript build step: htmx + askama templates + one CSS file. Vendored htmx lives in `src/web/static/` with its version in the filename.
 - Version in `Cargo.toml` stays `0.0.0`; releases are tags.
 - Tests: behaviour, boundaries, transitions, error paths. No tests of wiring, copies, or defaults. Fixture replays live in `tests/replay.rs`.
+- Engine changes that alter golden output must re-bless `tests/golden/` and explain the behaviour change in the same PR.
 - Public repo from day one: nothing lab-specific that is secret; lab-specific *values* (entity ids, MACs, topics) belong in the example config, not in code.
 
 ## Commands

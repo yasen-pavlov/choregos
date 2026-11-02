@@ -1,0 +1,8 @@
+{"at":"2026-11-02T10:17:49.557Z","role":"streamer","from":"off","to":"on","reason":"ActiveSource","actions":[{"kind":"wake_tv"}]}
+{"at":"2026-11-02T10:17:51.557Z","role":"streamer","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_normal","data":{}}]}
+{"at":"2026-11-02T11:43:46.960Z","role":"streamer","from":"on","to":"off","reason":"taken_over","actions":[]}
+{"at":"2026-11-02T11:43:46.960Z","role":"console_b","from":"off","to":"on","reason":"TextViewOn","actions":[{"kind":"cec_send","to":4,"data":[65,37]},{"kind":"cec_send","to":4,"data":[54]},{"kind":"cec_send","to":4,"data":[143]}]}
+{"at":"2026-11-02T11:43:48.960Z","role":"console_b","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_normal","data":{}}]}
+{"at":"2026-11-02T11:43:48.960Z","role":"streamer","from":null,"to":null,"reason":"standby_retry","actions":[{"kind":"cec_send","to":4,"data":[65,37]},{"kind":"cec_send","to":4,"data":[54]},{"kind":"cec_send","to":4,"data":[143]}]}
+{"at":"2026-11-02T12:36:49.671Z","role":"console_b","from":"on","to":"off","reason":"InactiveSource","actions":[]}
+{"at":"2026-11-02T12:36:52.671Z","role":null,"from":null,"to":null,"reason":"off_timer_expired","actions":[{"kind":"tv_off"},{"kind":"ha_call","domain":"media_player","service":"turn_off","entity":"media_player.receiver","data":{}}]}
