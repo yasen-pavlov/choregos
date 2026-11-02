@@ -132,6 +132,7 @@ For containers, also pass the configured key environment variable (for example
 
 Start in `shadow` mode (the default in the example), watch the **Decisions**
 page through a few evenings, then switch to `active` from the UI or over MQTT.
+See the [operations guide](docs/operations.md) for volume files, incident replay, upgrades and bridge changes.
 
 ## Configuration
 
@@ -279,8 +280,8 @@ from signed `v*` tags with [git-cliff](cliff.toml) notes (the crate version stay
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 cargo run -- check-config --config choregos.toml
 cargo run -- replay fixtures/capture-streamer-wake.jsonl --config choregos.example.toml
 ```
@@ -288,7 +289,9 @@ cargo run -- replay fixtures/capture-streamer-wake.jsonl --config choregos.examp
 ### Replay
 
 `replay` feeds captures through the engine, advances timers, and prints one
-decision JSON object per line. It never connects to anything and needs no secrets.
+decision JSON object per line, with an `at` RFC3339 timestamp from the triggering
+trace line (or the timer deadline for timer-driven decisions). It never connects
+to anything and needs no secrets.
 Live traces are `cec-bus.<date>.jsonl` beside `choregos.state.json`
 (`/config` in Docker); a regression fixture is a slice of this file, retaining
 its `choregos/identities` header. Multiple files are consumed in argument order:
@@ -300,15 +303,72 @@ choregos replay /config/cec-bus.2026-10-29.jsonl /config/cec-bus.2026-10-30.json
 
 `--since`/`--until` are inclusive RFC3339 bounds; identity headers bypass those
 bounds. The last header before the first in-window event supplies its seed;
-if none precedes it, the first header found is the fallback. Later headers do
-not reset replay state. Files must be supplied in chronological order. Unknown
-topics are ignored. File replay warns with `file:line` and skips torn invalid-JSON
-lines; valid JSON with malformed envelopes or known-topic payloads still fails.
-Text fixture replay remains strict.
+if none precedes it, the first header found is the fallback. The last bridge
+availability line before `--since` (Tasmota LWT or aether status), when present,
+is also replayed at its original timestamp before the first in-window event.
+This gives full-trace windows and extracted fixtures identical warm-up clocks
+and presence-polling availability. Later headers do not reset replay state.
+After the last in-window input, timers drain for five seconds, even beyond
+`--until`; the bound selects inputs, not the final timer horizon.
+Files must be supplied in chronological order. Unknown topics are ignored.
+File replay warns with `file:line` and skips torn invalid-JSON lines; valid JSON
+with malformed envelopes or known-topic payloads still fails. Text fixture replay
+remains strict.
 The shared JSONL codec accepts existing bus/LWT fixtures and captures HA state, accepted
 commands (`kind` plus `data` for tuple/struct variants), and send acknowledgements.
 Recorded `cmnd` lines correlate subsequent bridge results; replay never executes
 the engine's actions.
+
+`extract` builds a portable fixture using exactly the same inclusive window,
+identity and availability seeds. Initial in-window headers are retained without
+duplicating the seed; otherwise the selected seed header is prepended. The
+pre-window availability line follows, retaining its original timestamp.
+Remaining in-window lines follow in original order, including later headers and
+unknown topics. Torn JSON lines warn and are skipped just as in file replay:
+
+```sh
+choregos extract /config/cec-bus.2026-11-01.jsonl \
+  --since 2026-11-01T11:40:00Z --until 2026-11-01T12:40:00Z \
+  --rename 'Streaming box=Streamer' --rename 'media_player.screen=media_player.tv' \
+  --node cec-bridge -o trace.jsonl
+```
+
+Repeated `--rename OLD=NEW` arguments apply in argument order to every JSON string
+value, including nested/serialized payloads and hex-encoded Set OSD Name operands.
+Only changed OSD names must remain ASCII and fit a 15-byte frame (opcode plus
+up to 14 operand bytes); undecodable or non-ASCII original values are untouched.
+`--node` replaces the bridge segment of native aether and Tasmota topics and
+must be non-empty without `/`, `+` or `#`.
+Without transformations, selected lines retain their original JSON text.
+Review anonymized fixtures before publishing; extraction is not a secret scrubber.
+Extraction validates the window and rejects input/output aliases before writing.
+It atomically replaces `-o` only after successful extraction; failures leave
+an existing output untouched and remove the temporary file. `-o` must be a
+regular file in an existing directory (the temporary file is created beside it).
+Offline CLI diagnostics go to stderr, keeping replay stdout pure decision JSONL;
+the running service retains its structured stdout logging.
+
+#### Golden regression corpus
+
+[`tests/golden/`](tests/golden/README.md) contains curated real-use windows with public
+device names and entities, documented coverage and known replay/live differences.
+One offline integration test discovers case directories
+in name order, replays each `trace.jsonl` with its `config.toml`, requires at least
+one decision, and compares the timestamped output byte-for-byte to `expected.jsonl`.
+Failures name the case and show the first differing line with context and counts.
+
+To add a case, extract a representative window into a new `tests/golden/<case>/`
+directory and add its anonymized behavioural configuration as `config.toml`.
+Preserve the capture's actual timing, takeover and standby-verification settings.
+Bless and review the output, then run the corpus normally:
+
+```sh
+UPDATE_GOLDEN=1 cargo test --locked --test golden
+cargo test --locked --test golden
+```
+
+An intentional engine behaviour change must re-bless the corpus **in the same PR**
+and explain the resulting decision differences. Do not bless unexplained drift.
 
 Engine behaviour tests in [`tests/replay.rs`](tests/replay.rs) use the same injected time. The
 production loop is tested against an in-process `rumqttd` broker and a fake HA

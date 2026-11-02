@@ -1,0 +1,13 @@
+{"at":"2026-11-01T09:15:40.768Z","role":"console_a","from":"off","to":"on","reason":"ReportPhysicalAddress","actions":[]}
+{"at":"2026-11-01T09:15:42.768Z","role":"console_a","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_normal","data":{}}]}
+{"at":"2026-11-01T09:20:15.473Z","role":"console_a","from":"on","to":"off","reason":"taken_over","actions":[]}
+{"at":"2026-11-01T09:20:15.473Z","role":"console_b","from":"off","to":"on","reason":"ActiveSource","actions":[{"kind":"cec_send","to":8,"data":[54]},{"kind":"cec_send","to":8,"data":[143]}]}
+{"at":"2026-11-01T09:20:17.473Z","role":"console_b","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_normal","data":{}}]}
+{"at":"2026-11-01T09:20:46.218Z","role":"console_b","from":"on","to":"off","reason":"InactiveSource","actions":[]}
+{"at":"2026-11-01T09:20:49.218Z","role":null,"from":null,"to":null,"reason":"off_timer_expired","actions":[{"kind":"tv_off"},{"kind":"ha_call","domain":"media_player","service":"turn_off","entity":"media_player.receiver","data":{}}]}
+{"at":"2026-11-01T09:21:42.142Z","role":"console_a","from":"off","to":"on","reason":"ReportPhysicalAddress","actions":[{"kind":"wake_tv"},{"kind":"ha_call","domain":"media_player","service":"turn_on","entity":"media_player.receiver","data":{}}]}
+{"at":"2026-11-01T09:21:44.142Z","role":"console_a","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"media_player","service":"select_source","entity":"media_player.receiver","data":{"source":"Console A"}},{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_normal","data":{}}]}
+{"at":"2026-11-01T09:39:42.142Z","role":"console_a","from":"on","to":"off","reason":"presence_timeout","actions":[]}
+{"at":"2026-11-01T09:39:45.142Z","role":null,"from":null,"to":null,"reason":"off_timer_expired","actions":[{"kind":"tv_off"},{"kind":"ha_call","domain":"media_player","service":"turn_off","entity":"media_player.receiver","data":{}}]}
+{"at":"2026-11-01T09:40:04.595Z","role":"console_a","from":"off","to":"on","reason":"ActiveSource","actions":[{"kind":"wake_tv"},{"kind":"ha_call","domain":"media_player","service":"turn_on","entity":"media_player.receiver","data":{}}]}
+{"at":"2026-11-01T09:40:06.595Z","role":"console_a","from":null,"to":null,"reason":"takeover_settled","actions":[{"kind":"ha_call","domain":"media_player","service":"select_source","entity":"media_player.receiver","data":{"source":"Console A"}},{"kind":"ha_call","domain":"script","service":"turn_on","entity":"script.listening_normal","data":{}}]}

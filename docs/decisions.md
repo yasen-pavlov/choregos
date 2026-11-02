@@ -2,6 +2,35 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-02 — Golden replay corpus and trace extraction
+
+- Curate five real-use replay windows covering native bridge wake/takeover,
+  restart continuity and standby retries, plus the Tasmota adapter. Keep public
+  names, entities and bridge topics in fixtures; private captures stay ignored.
+- Share inclusive window selection, identity seeding, chronological-order checks
+  and torn-line warnings between `extract` and `replay`. Extraction preserves
+  later headers without treating them as runtime restarts.
+- Share the last pre-window bridge availability record between replay and
+  extraction, preserving its original timestamp and the same warm-up clock.
+  Preserve initial in-window headers without duplicating the selected seed.
+- Apply ordered substring renames recursively, including serialized JSON and
+  ASCII Set OSD Name operands. Validate only changed names against the 15-byte
+  frame limit; preserve undecodable/non-ASCII originals. Validate node segments.
+- Atomically replace extraction output after success; validate bounds and resolve
+  aliases before touching it so failures cannot truncate captures or old output.
+- Add `at` only to replay's output wrapper, not the engine's `Decision` contract.
+  Drain final timers at their actual deadlines through last input plus five
+  seconds, independent of `--until`, so full-window and fixture replays agree.
+- Send offline CLI diagnostics to stderr so sequence-gap warnings cannot pollute
+  deterministic replay JSONL; retain structured stdout logs for the live service.
+- Compare offline replay output byte-for-byte in one sorted, nonempty corpus
+  test. `UPDATE_GOLDEN=1` is an explicit review action, committed with and explained
+  alongside intentional behaviour changes rather than hiding unexplained drift.
+- Follow-up, not implemented: identity headers contain no role power,
+  verification state or pending timers, so they cannot faithfully restore a
+  window that starts mid-session. A richer trace snapshot carrying those fields
+  is a phase-1 candidate; the corpus documents today's known differences.
+
 ## 2026-11-01 — Aether bridge adapter
 
 - Require `[bridge].kind` explicitly: Tasmota and native aether use different

@@ -68,21 +68,29 @@ fn replay_files_with_warnings(
 ) -> anyhow::Result<()> {
     let config = Config::parse(&std::fs::read_to_string(config)?)?;
     let mut replay = Replay::new(config, since, until)?;
-    // Pre-scan only supplies a fallback; headers encountered before the first
-    // in-window event override it with the most recent restored seed.
-    'seed: for fixture in fixtures {
+    replay.window.fallback_header = first_header(fixtures)?;
+    visit_files(fixtures, warnings, |line| replay.line(line, output))?;
+    replay.finish(output)
+}
+
+fn first_header(fixtures: &[PathBuf]) -> anyhow::Result<Option<String>> {
+    for fixture in fixtures {
         use std::io::BufRead;
-        for (index, line) in std::io::BufReader::new(std::fs::File::open(fixture)?)
-            .lines()
-            .enumerate()
-        {
-            let line = line.with_context(|| format!("{}:{}", fixture.display(), index + 1))?;
-            if let Some(identities) = identity_header(&line) {
-                replay.fallback_identities = Some(identities);
-                break 'seed;
+        for line in std::io::BufReader::new(std::fs::File::open(fixture)?).lines() {
+            let line = line?;
+            if identity_header(&line).is_some() {
+                return Ok(Some(line));
             }
         }
     }
+    Ok(None)
+}
+
+fn visit_files(
+    fixtures: &[PathBuf],
+    warnings: &mut impl Write,
+    mut visit: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     for fixture in fixtures {
         use std::io::BufRead;
         for (index, line) in std::io::BufReader::new(std::fs::File::open(fixture)?)
@@ -91,7 +99,7 @@ fn replay_files_with_warnings(
         {
             let location = || format!("{}:{}", fixture.display(), index + 1);
             let line = line.with_context(location)?;
-            match replay.line(&line, output) {
+            match visit(&line) {
                 Ok(()) => {}
                 Err(error) if serde_json::from_str::<serde::de::IgnoredAny>(&line).is_err() => {
                     writeln!(
@@ -110,12 +118,253 @@ fn replay_files_with_warnings(
             }
         }
     }
-    replay.finish(output)
+    Ok(())
+}
+
+/// Extract an offline replay window, optionally anonymizing its string values.
+pub fn extract_files(
+    fixtures: &[PathBuf],
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+    renames: &[(String, String)],
+    node: Option<&str>,
+    output: &mut impl Write,
+) -> anyhow::Result<()> {
+    extract_with_warnings(
+        fixtures,
+        (since, until),
+        renames,
+        node,
+        output,
+        &mut std::io::stderr(),
+    )
+}
+
+/// Atomically replace an extraction output only after the whole trace succeeds.
+pub fn extract_to_path(
+    fixtures: &[PathBuf],
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+    renames: &[(String, String)],
+    node: Option<&str>,
+    output: &Path,
+) -> anyhow::Result<()> {
+    TraceWindow::new(Some(since), Some(until))?;
+    if let Some(node) = node {
+        parse_node(node).map_err(anyhow::Error::msg)?;
+    }
+    let existing_output = match output.canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("resolving extraction output"),
+    };
+    for fixture in fixtures {
+        let input = fixture
+            .canonicalize()
+            .with_context(|| format!("resolving {}", fixture.display()))?;
+        anyhow::ensure!(
+            existing_output.as_ref() != Some(&input),
+            "output must not overwrite an input trace"
+        );
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".choregos-extract-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("creating temporary output in {}", parent.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        extract_files(fixtures, since, until, renames, node, &mut writer)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        std::fs::rename(&temporary, output)
+            .with_context(|| format!("writing {}", output.display()))?;
+        if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            tracing::warn!(error = %error, "extraction renamed but directory sync failed; crash durability is not guaranteed");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn extract_with_warnings(
+    fixtures: &[PathBuf],
+    bounds: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    renames: &[(String, String)],
+    node: Option<&str>,
+    output: &mut impl Write,
+    warnings: &mut impl Write,
+) -> anyhow::Result<()> {
+    let mut window = TraceWindow::new(Some(bounds.0), Some(bounds.1))?;
+    window.fallback_header = first_header(fixtures)?;
+    let mut pending_headers = Vec::new();
+    let mut seeded = false;
+    visit_files(fixtures, warnings, |line| {
+        let Some(selected) = window.select(line)? else {
+            return Ok(());
+        };
+        if !seeded {
+            if matches!(selected.entry, Some(TraceEntry::Identities(_))) {
+                pending_headers.push(line.to_owned());
+                return Ok(());
+            }
+            write_extraction_seed(&window, &mut pending_headers, renames, node, output)?;
+            seeded = true;
+        }
+        write_extracted(line, renames, node, output)
+    })?;
+    if !seeded {
+        write_extraction_seed(&window, &mut pending_headers, renames, node, output)?;
+    }
+    Ok(())
+}
+
+fn write_extraction_seed(
+    window: &TraceWindow,
+    pending_headers: &mut Vec<String>,
+    renames: &[(String, String)],
+    node: Option<&str>,
+    output: &mut impl Write,
+) -> anyhow::Result<()> {
+    if pending_headers.is_empty() {
+        if let Some(header) = window.seed() {
+            write_extracted(header, renames, node, output)?;
+        }
+    } else {
+        for header in pending_headers.drain(..) {
+            write_extracted(&header, renames, node, output)?;
+        }
+    }
+    if let Some(availability) = &window.availability {
+        write_extracted(availability, renames, node, output)?;
+    }
+    Ok(())
+}
+
+pub fn parse_rename(value: &str) -> Result<(String, String), String> {
+    let (old, new) = value.split_once('=').ok_or("--rename requires OLD=NEW")?;
+    if old.is_empty() {
+        return Err("--rename OLD must not be empty".into());
+    }
+    Ok((old.into(), new.into()))
+}
+
+pub fn parse_node(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.contains(['/', '+', '#']) {
+        return Err("--node must be non-empty and contain no '/', '+' or '#'".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn write_extracted(
+    line: &str,
+    renames: &[(String, String)],
+    node: Option<&str>,
+    output: &mut impl Write,
+) -> anyhow::Result<()> {
+    if renames.is_empty() && node.is_none() {
+        writeln!(output, "{line}")?;
+        return Ok(());
+    }
+    let mut value: serde_json::Value = serde_json::from_str(line)?;
+    rename_strings(&mut value, renames)?;
+    if let Some(node) = node
+        && let Some(topic) = value
+            .get_mut("topic")
+            .and_then(|topic| topic.as_str().map(str::to_owned))
+    {
+        let mut parts = topic.splitn(3, '/');
+        if let (Some(prefix @ ("aether" | "tele" | "stat" | "cmnd")), Some(_), Some(suffix)) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            value["topic"] = format!("{prefix}/{node}/{suffix}").into();
+        }
+    }
+    serde_json::to_writer(&mut *output, &value)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn rename_strings(
+    value: &mut serde_json::Value,
+    renames: &[(String, String)],
+) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            // Some captures store an entire JSON payload inside a JSON string.
+            if let Ok(mut nested @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+                serde_json::from_str(text)
+            {
+                let before = nested.clone();
+                rename_strings(&mut nested, renames)?;
+                if nested != before {
+                    *text = serde_json::to_string(&nested)?;
+                }
+            } else {
+                for (old, new) in renames {
+                    *text = text.replace(old, new);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rename_strings(value, renames)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "data" | "Data")
+                    && let Some(data) = value.as_str()
+                    && data.starts_with("47")
+                {
+                    let Ok(bytes) = hex::decode(&data[2..]) else {
+                        continue;
+                    };
+                    if !bytes.is_ascii() {
+                        continue;
+                    }
+                    let original = std::str::from_utf8(&bytes)?;
+                    let mut name = original.to_owned();
+                    for (old, new) in renames {
+                        if name.contains(old) {
+                            name = name.replace(old, new);
+                        }
+                    }
+                    if name != original {
+                        anyhow::ensure!(name.is_ascii(), "renamed Set OSD Name must be ASCII");
+                        anyhow::ensure!(
+                            name.len() < 15,
+                            "renamed Set OSD Name exceeds 15-byte frame limit"
+                        );
+                        *value = format!("47{}", hex::encode_upper(name)).into();
+                    }
+                } else if key != "ts" {
+                    rename_strings(value, renames)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn replay(config: Config, text: &str, output: &mut impl Write) -> anyhow::Result<()> {
     let mut replay = Replay::new(config, None, None)?;
-    replay.fallback_identities = text.lines().find_map(identity_header);
+    replay.window.fallback_header = text
+        .lines()
+        .find(|line| identity_header(line).is_some())
+        .map(str::to_owned);
     for line in text.lines() {
         replay.line(line, output)?;
     }
@@ -133,23 +382,19 @@ fn identity_header(line: &str) -> Option<Vec<crate::cec::bus::LearnedIdentity>> 
 #[error("trace files must be given in chronological order")]
 struct TraceOrderError;
 
-struct Replay {
-    config: Option<Config>,
-    engine: Option<Engine>,
-    start: Instant,
-    epoch: Option<chrono::DateTime<chrono::Utc>>,
-    last: Option<(Instant, chrono::DateTime<chrono::Utc>)>,
-    previous_ts: Option<chrono::DateTime<chrono::Utc>>,
-    identities: Option<Vec<crate::cec::bus::LearnedIdentity>>,
-    fallback_identities: Option<Vec<crate::cec::bus::LearnedIdentity>>,
-    correlation: Correlation,
+/// Shared inclusive window and identity-seed selection for replay and extraction.
+struct TraceWindow {
     since: Option<chrono::DateTime<chrono::Utc>>,
     until: Option<chrono::DateTime<chrono::Utc>>,
+    previous_ts: Option<chrono::DateTime<chrono::Utc>>,
+    header: Option<String>,
+    fallback_header: Option<String>,
+    availability: Option<String>,
+    started: bool,
 }
 
-impl Replay {
+impl TraceWindow {
     fn new(
-        config: Config,
         since: Option<chrono::DateTime<chrono::Utc>>,
         until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<Self> {
@@ -158,51 +403,137 @@ impl Replay {
             "--since must not be after --until"
         );
         Ok(Self {
+            since,
+            until,
+            previous_ts: None,
+            header: None,
+            fallback_header: None,
+            availability: None,
+            started: false,
+        })
+    }
+
+    fn select(&mut self, line: &str) -> anyhow::Result<Option<WindowEntry>> {
+        if line.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = trace::parse_checked(line)?;
+        // Unknown topics still belong to an extracted window.
+        #[derive(serde::Deserialize)]
+        struct Timestamp {
+            ts: chrono::DateTime<chrono::Utc>,
+        }
+        let timestamp = match &parsed {
+            Some((timestamp, _)) => *timestamp,
+            None => serde_json::from_str::<Timestamp>(line)?.ts,
+        };
+        let entry = parsed.map(|(_, entry)| entry);
+        let header = matches!(entry, Some(TraceEntry::Identities(_)));
+        if header {
+            if !self.started {
+                self.header = Some(line.to_owned());
+            }
+        } else {
+            if self
+                .previous_ts
+                .is_some_and(|previous| timestamp < previous)
+            {
+                return Err(TraceOrderError.into());
+            }
+            self.previous_ts = Some(timestamp);
+        }
+        if self.since.is_some_and(|since| timestamp < since)
+            && matches!(
+                entry,
+                Some(TraceEntry::Lwt { .. } | TraceEntry::AetherStatus { .. })
+            )
+        {
+            self.availability = Some(line.to_owned());
+        }
+        if self.since.is_some_and(|since| timestamp < since)
+            || self.until.is_some_and(|until| timestamp > until)
+        {
+            return Ok(None);
+        }
+        if !header {
+            self.started = true;
+        }
+        Ok(Some(WindowEntry { timestamp, entry }))
+    }
+
+    fn seed(&self) -> Option<&str> {
+        self.header.as_deref().or(self.fallback_header.as_deref())
+    }
+}
+
+struct WindowEntry {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    entry: Option<TraceEntry>,
+}
+
+struct Replay {
+    config: Option<Config>,
+    engine: Option<Engine>,
+    start: Instant,
+    epoch: Option<chrono::DateTime<chrono::Utc>>,
+    last: Option<(Instant, chrono::DateTime<chrono::Utc>)>,
+    window: TraceWindow,
+    correlation: Correlation,
+}
+
+impl Replay {
+    fn new(
+        config: Config,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<Self> {
+        let window = TraceWindow::new(since, until)?;
+        Ok(Self {
             config: Some(config),
             engine: None,
             start: Instant::now(),
             epoch: None,
             last: None,
-            previous_ts: None,
-            identities: None,
-            fallback_identities: None,
+            window,
             correlation: Correlation::default(),
-            since,
-            until,
         })
     }
 
     fn line(&mut self, line: &str, output: &mut impl Write) -> anyhow::Result<()> {
-        let Some((timestamp, entry)) = trace::parse_checked(line)? else {
+        let Some(WindowEntry { timestamp, entry }) = self.window.select(line)? else {
             return Ok(());
         };
-        if let TraceEntry::Identities(identities) = entry {
-            if self.engine.is_none() {
-                self.identities = Some(identities);
-            }
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if matches!(entry, TraceEntry::Identities(_)) {
             return Ok(());
         }
-        if self
-            .previous_ts
-            .is_some_and(|previous| timestamp < previous)
+        if self.engine.is_none()
+            && let Some(availability) = self.window.availability.take()
         {
-            return Err(TraceOrderError.into());
+            let (timestamp, entry) =
+                trace::parse_checked(&availability)?.expect("validated availability");
+            self.apply_entry(timestamp, entry, output)?;
         }
-        self.previous_ts = Some(timestamp);
-        if self.since.is_some_and(|since| timestamp < since)
-            || self.until.is_some_and(|until| timestamp > until)
-        {
-            return Ok(());
-        }
+        self.apply_entry(timestamp, entry, output)
+    }
+
+    fn apply_entry(
+        &mut self,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        entry: TraceEntry,
+        output: &mut impl Write,
+    ) -> anyhow::Result<()> {
         let epoch = *self.epoch.get_or_insert(timestamp);
         let now = self.start + (timestamp - epoch).to_std()?;
         if self.engine.is_none() {
             self.engine = Some(Engine::new(
                 self.config.take().expect("replay config available"),
                 self.start,
-                self.identities
-                    .take()
-                    .or_else(|| self.fallback_identities.take())
+                self.window
+                    .seed()
+                    .and_then(identity_header)
                     .unwrap_or_default(),
             ));
         }
@@ -252,19 +583,12 @@ impl Replay {
 
     fn finish(&mut self, output: &mut impl Write) -> anyhow::Result<()> {
         if let Some((now, wall)) = self.last {
-            let end = self
-                .until
-                .map_or(wall + chrono::Duration::seconds(5), |until| {
-                    until.min(wall + chrono::Duration::seconds(5))
-                });
-            let duration = (end - wall).to_std()?;
-            emit(
-                self.engine.as_mut().expect("replay initialized"),
-                Event::Tick,
-                now + duration,
-                end,
-                output,
-            )?;
+            let duration = Duration::from_secs(5);
+            let engine = self.engine.as_mut().expect("replay initialized");
+            while let Some(deadline) = engine.next_deadline().filter(|d| *d <= now + duration) {
+                let timestamp = wall + chrono::Duration::from_std(deadline.duration_since(now))?;
+                emit(engine, Event::Tick, deadline, timestamp, output)?;
+            }
         }
         Ok(())
     }
@@ -279,7 +603,14 @@ fn emit(
 ) -> anyhow::Result<()> {
     engine.handle(event, now, wall);
     for decision in &engine.decisions {
-        writeln!(output, "{}", serde_json::to_string(decision)?)?;
+        #[derive(serde::Serialize)]
+        struct TimedDecision<'a> {
+            at: chrono::DateTime<chrono::Utc>,
+            #[serde(flatten)]
+            decision: &'a crate::action::Decision,
+        }
+        serde_json::to_writer(&mut *output, &TimedDecision { at: wall, decision })?;
+        writeln!(output)?;
     }
     Ok(())
 }
@@ -958,14 +1289,13 @@ mod native_tests {
                 }
             }
         }
-        emit(
-            &mut engine,
-            Event::Tick,
-            start + Duration::from_millis(6004),
-            epoch + chrono::Duration::milliseconds(6004),
-            &mut live,
-        )
-        .unwrap();
+        while let Some(deadline) = engine
+            .next_deadline()
+            .filter(|d| *d <= start + Duration::from_millis(6004))
+        {
+            let wall = epoch + chrono::Duration::from_std(deadline.duration_since(start)).unwrap();
+            emit(&mut engine, Event::Tick, deadline, wall, &mut live).unwrap();
+        }
         let mut replayed = vec![];
         replay(config, &lines, &mut replayed).unwrap();
         assert_eq!(replayed, live);
@@ -1009,7 +1339,7 @@ mod native_tests {
             let engine = replay.engine.as_ref().unwrap();
             assert_eq!(engine.bus.entries[&4].physical, Some(0x2100));
             assert_eq!(engine.roles["streamer"].power, crate::state::RolePower::On);
-            assert_eq!(engine.bridge_online, include_status && since.is_none());
+            assert_eq!(engine.bridge_online, include_status);
             let decisions: Vec<Value> = String::from_utf8(output)
                 .unwrap()
                 .lines()
@@ -1042,5 +1372,388 @@ mod native_tests {
             assert!(matches!((&with_events[..], &without_events[..]),
                 ([Event::Frame(a)], [Event::Frame(b)]) if a == b));
         }
+    }
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn timestamp(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        "2026-11-01T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+            + chrono::Duration::seconds(seconds)
+    }
+
+    fn row(seconds: i64, topic: &str, payload: Value) -> String {
+        format!(
+            "{}\n",
+            json!({"ts":timestamp(seconds),"topic":topic,"payload":payload})
+        )
+    }
+
+    #[test]
+    fn extraction_preserves_inclusive_window_order_unknown_topics_and_restart_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.jsonl");
+        let second = directory.path().join("second.jsonl");
+        let old = row(-20, "choregos/identities", json!([]));
+        let seed = row(-10, "choregos/identities", json!([]));
+        let initial = row(0, "future/input", json!({"unchanged":true}));
+        let restart = row(1, "choregos/identities", json!([]));
+        let last = row(2, "choregos/connection", json!({"mqtt":false}));
+        std::fs::write(&first, old + &seed + &initial + "{\"ts\":\"torn\n").unwrap();
+        std::fs::write(
+            &second,
+            restart.clone() + &last + &row(3, "future/input", Value::Null),
+        )
+        .unwrap();
+        let mut output = vec![];
+        let mut warnings = vec![];
+        extract_with_warnings(
+            &[first.clone(), second],
+            (timestamp(0), timestamp(2)),
+            &[],
+            None,
+            &mut output,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            seed + &initial + &restart + &last
+        );
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert!(
+            warnings.contains(&format!("{}:4", first.display())),
+            "{warnings}"
+        );
+    }
+
+    #[test]
+    fn extraction_seeds_last_pre_window_availability_with_its_original_timestamp() {
+        for (topic, old, latest) in [
+            ("tele/bridge/LWT", json!("Offline"), json!("Online")),
+            (
+                "aether/bridge/status",
+                json!({"online":false}),
+                json!({"online":true,"v":1,"boot":1}),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let fixture = directory.path().join("trace.jsonl");
+            let header = row(-10, "choregos/identities", json!([]));
+            let availability = row(-1, topic, latest.clone());
+            let in_window = row(0, topic, latest);
+            std::fs::write(
+                &fixture,
+                header.clone() + &row(-5, topic, old) + &availability + &in_window,
+            )
+            .unwrap();
+            let mut output = vec![];
+            extract_files(
+                &[fixture],
+                timestamp(0),
+                timestamp(2),
+                &[],
+                None,
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                header + &availability + &in_window
+            );
+        }
+    }
+
+    #[test]
+    fn extraction_falls_back_to_first_later_header_without_dropping_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("trace.jsonl");
+        let event = row(0, "choregos/connection", json!({"mqtt":true}));
+        let header = row(1, "choregos/identities", json!([]));
+        std::fs::write(&fixture, event.clone() + &header).unwrap();
+        let mut output = vec![];
+        extract_files(
+            &[fixture],
+            timestamp(0),
+            timestamp(2),
+            &[],
+            None,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            header.clone() + &event + &header
+        );
+    }
+
+    #[test]
+    fn extraction_renames_nested_payloads_identities_osd_and_both_topic_kinds_in_order() {
+        let renames = vec![
+            ("Original".into(), "Middle".into()),
+            ("Middle".into(), "Public".into()),
+        ];
+        for (topic, key) in [("aether/old/bus", "data"), ("tele/old/SENSOR", "Data")] {
+            let original = json!({
+                "ts":timestamp(0),
+                "topic":topic,
+                "payload":{"frame":{key:format!("47{}", hex::encode("Original"))},
+                    "attrs":{"source":"Original","list":["Original"]},
+                    "identities":[{"osd":"Original"}],
+                    "serialized":json!({"osd":"Original","Data":format!("47{}",hex::encode("Original"))}).to_string()}
+            });
+            let mut output = vec![];
+            write_extracted(&original.to_string(), &renames, Some("public"), &mut output).unwrap();
+            let value: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["ts"], original["ts"]);
+            assert_eq!(value["topic"], topic.replace("/old/", "/public/"));
+            assert_eq!(
+                value["payload"]["frame"][key],
+                format!("47{}", hex::encode_upper("Public"))
+            );
+            assert_eq!(value["payload"]["attrs"]["source"], "Public");
+            assert_eq!(value["payload"]["attrs"]["list"][0], "Public");
+            assert_eq!(value["payload"]["identities"][0]["osd"], "Public");
+            let serialized: Value =
+                serde_json::from_str(value["payload"]["serialized"].as_str().unwrap()).unwrap();
+            assert_eq!(serialized["osd"], "Public");
+            assert_eq!(
+                serialized["Data"],
+                format!("47{}", hex::encode_upper("Public"))
+            );
+        }
+    }
+
+    #[test]
+    fn osd_renames_validate_only_changed_names_with_fifteen_byte_frame_limit() {
+        let original = json!({"data":"4741"}).to_string();
+        let mut output = vec![];
+        write_extracted(
+            &original,
+            &[("A".into(), "12345678901234".into())],
+            None,
+            &mut output,
+        )
+        .unwrap();
+        for replacement in ["123456789012345", "é"] {
+            let error = write_extracted(
+                &original,
+                &[("A".into(), replacement.into())],
+                None,
+                &mut vec![],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(if replacement.is_ascii() {
+                "15-byte"
+            } else {
+                "ASCII"
+            }));
+        }
+        for data in ["474", "47FF", "47nothex", "47536869656c4420416e64726f6964"] {
+            let original = json!({"data":data});
+            let mut output = vec![];
+            write_extracted(
+                &original.to_string(),
+                &[("Unrelated".into(), "X".into())],
+                None,
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), original);
+        }
+        assert!(parse_rename("missing").is_err());
+        assert!(parse_rename("=empty").is_err());
+        assert_eq!(
+            parse_rename("old=new=tail").unwrap(),
+            ("old".into(), "new=tail".into())
+        );
+    }
+
+    #[test]
+    fn extraction_avoids_duplicate_headers_and_replays_the_same_seed_clock_and_final_timers() {
+        for native in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+            if native {
+                config.bridge = crate::config::BridgeConfig::Aether {
+                    node: "bridge".into(),
+                    logical_address: 0,
+                };
+            }
+            let availability_topic = if native {
+                "aether/bridge/status"
+            } else {
+                "tele/tasmota_cec/LWT"
+            };
+            let availability_payload = if native {
+                json!({"online":true,"v":1,"boot":1})
+            } else {
+                json!("Online")
+            };
+            let header = row(0, "choregos/identities", json!([]));
+            let availability = row(-5, availability_topic, availability_payload);
+            let mut text = row(-10, "choregos/identities", json!([])) + &availability + &header;
+            for (index, data) in ["84210004", "870010FA", "4753747265616D6572", "04", "36"]
+                .into_iter()
+                .enumerate()
+            {
+                let to = if index < 2 { 15 } else { 0 };
+                let payload = if native {
+                    json!({"ev":"rx","seq":index+1,"from":4,"to":to,"data":data,"ack":true})
+                } else {
+                    json!({"HdmiReceived":{"From":4,"To":to,"Data":data}})
+                };
+                text.push_str(&row(
+                    index as i64 + 1,
+                    if native {
+                        "aether/bridge/bus"
+                    } else {
+                        "tele/tasmota_cec/SENSOR"
+                    },
+                    payload,
+                ));
+            }
+            let fixture = directory.path().join("full.jsonl");
+            let config_path = directory.path().join("config.toml");
+            std::fs::write(&fixture, text).unwrap();
+            std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+            let mut extracted = vec![];
+            extract_files(
+                std::slice::from_ref(&fixture),
+                timestamp(0),
+                timestamp(6),
+                &[],
+                None,
+                &mut extracted,
+            )
+            .unwrap();
+            let extracted = String::from_utf8(extracted).unwrap();
+            assert!(extracted.starts_with(&(header + &availability)));
+            assert_eq!(
+                extracted
+                    .lines()
+                    .filter(|line| line.contains("choregos/identities"))
+                    .count(),
+                1
+            );
+            let mut window_output = vec![];
+            replay_files(
+                &config_path,
+                &[fixture],
+                Some(timestamp(0)),
+                Some(timestamp(6)),
+                &mut window_output,
+            )
+            .unwrap();
+            let mut extracted_output = vec![];
+            replay(config, &extracted, &mut extracted_output).unwrap();
+            assert_eq!(window_output, extracted_output);
+            assert!(
+                String::from_utf8(window_output)
+                    .unwrap()
+                    .contains("off_timer_expired")
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_extraction_preserves_existing_files_on_validation_and_midstream_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.jsonl");
+        let output = directory.path().join("output.jsonl");
+        let valid = row(0, "choregos/connection", json!({"mqtt":true}));
+        std::fs::write(&input, &valid).unwrap();
+        std::fs::write(&output, "keep me").unwrap();
+        let inputs = std::slice::from_ref(&input);
+        assert!(extract_to_path(inputs, timestamp(2), timestamp(1), &[], None, &output).is_err());
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "keep me");
+        assert!(
+            extract_to_path(
+                inputs,
+                timestamp(0),
+                timestamp(2),
+                &[],
+                None,
+                &directory.path().join(".").join("input.jsonl")
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), valid);
+        let alias = directory.path().join("alias.jsonl");
+        std::os::unix::fs::symlink(&input, &alias).unwrap();
+        assert!(extract_to_path(inputs, timestamp(0), timestamp(2), &[], None, &alias).is_err());
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), valid);
+        std::fs::write(
+            &input,
+            valid.clone() + &row(1, "choregos/command", json!({"kind":"not_a_command"})),
+        )
+        .unwrap();
+        assert!(extract_to_path(inputs, timestamp(0), timestamp(2), &[], None, &output).is_err());
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "keep me");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+        std::fs::write(&input, &valid).unwrap();
+        extract_to_path(inputs, timestamp(0), timestamp(2), &[], None, &output).unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), valid);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn node_parser_rejects_empty_segments_and_topic_wildcards() {
+        for node in ["", "a/b", "a+", "#"] {
+            assert!(parse_node(node).is_err());
+        }
+        assert_eq!(parse_node("cec-bridge").unwrap(), "cec-bridge");
+    }
+
+    #[test]
+    fn replay_timestamps_input_decisions_and_final_timer_deadlines() {
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.mode = crate::state::Mode::Active;
+        let text: String = ["84210004", "870010FA", "4753747265616D6572", "04", "36"]
+            .into_iter().enumerate().map(|(seconds, data)| {
+                row(seconds as i64, "tele/tasmota_cec/SENSOR",
+                    json!({"HdmiReceived":{"From":4,"To":if seconds < 2 {15} else {0},"Data":data}}))
+            }).collect();
+        let mut output = vec![];
+        replay(config, &text, &mut output).unwrap();
+        let decisions: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!decisions.is_empty());
+        for decision in &decisions {
+            assert!(
+                decision["at"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .is_ok()
+            );
+        }
+        // The final input starts a three-second release timer.
+        let release = decisions
+            .iter()
+            .find(|decision| decision["reason"] == "off_timer_expired")
+            .unwrap();
+        let standby = decisions
+            .iter()
+            .find(|decision| decision["reason"] == "Standby")
+            .unwrap();
+        let at = |value: &Value| {
+            value["at"]
+                .as_str()
+                .unwrap()
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        };
+        assert_eq!(at(release) - at(standby), chrono::Duration::seconds(3));
+        assert_eq!(at(standby), timestamp(4));
+        assert_eq!(at(release), timestamp(7));
     }
 }
