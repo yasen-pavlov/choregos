@@ -210,6 +210,7 @@ impl Mqtt {
             (
                 "active_source".to_owned(),
                 snapshot
+                    .intent
                     .active_role
                     .clone()
                     .unwrap_or_else(|| "none".into()),

@@ -1,6 +1,6 @@
 //! One-shot LG webOS SSAP power-off, independent of HA's reconnect state.
 
-use crate::config::Secret;
+use crate::{config::Secret, state::TvState};
 use futures_util::{SinkExt, StreamExt};
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
@@ -52,7 +52,33 @@ pub async fn turn_off(host: &str, port: u16, key: &Secret) -> anyhow::Result<()>
     within_timeout(async { session(connect(host, port).await?, key).await }).await
 }
 
-async fn within_timeout(operation: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+/// Direct power read using the same registration and SSAP exchange as power-off.
+pub async fn power_state(host: &str, port: u16, key: &Secret) -> anyhow::Result<TvState> {
+    within_timeout(async {
+        let mut ws = connect(host, port).await?;
+        register(&mut ws, key).await?;
+        let reply = query_power(&mut ws).await?;
+        let state = parse_power(&reply)?;
+        let _ = ws.close(None).await;
+        Ok(state)
+    })
+    .await
+}
+
+fn parse_power(reply: &Value) -> anyhow::Result<TvState> {
+    anyhow::ensure!(
+        reply["type"] == "response" && reply["payload"]["returnValue"] != false,
+        "webOS power-state query failed"
+    );
+    match reply["payload"]["state"].as_str() {
+        Some("Active" | "Screen Off" | "Screen Saver") => Ok(TvState::On),
+        Some("Active Standby" | "Suspend" | "Power Off") => Ok(TvState::Off),
+        _ => anyhow::bail!("webOS returned an unknown power state"),
+    }
+}
+async fn within_timeout<T>(
+    operation: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     tokio::time::timeout(Duration::from_secs(5), operation)
         .await
         .map_err(|_| anyhow::anyhow!("webOS power-off timed out after 5 seconds"))?
@@ -164,30 +190,14 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     mut ws: WebSocketStream<S>,
     key: &Secret,
 ) -> anyhow::Result<()> {
-    send(&mut ws, registration(key)).await?;
-    let reply = receive(&mut ws).await?;
-    if reply["type"] == "response" && reply["payload"]["pairingType"] == "PROMPT" {
-        return Err(PairingRequired.into());
-    }
-    anyhow::ensure!(reply["type"] == "registered", "webOS registration failed");
+    register(&mut ws, key).await?;
     // turnOff can wake a TV in Active Standby. Check every attempt, including retries.
-    send(
-        &mut ws,
-        json!({"type":"request", "id":"power_state_0", "uri":"ssap://com.webos.service.tvpower/power/getPowerState"}),
-    )
-    .await?;
-    let power = receive(&mut ws).await?;
+    let power = query_power(&mut ws).await?;
     anyhow::ensure!(
         power["id"] == "power_state_0" && (power["type"] == "response" || power["type"] == "error"),
         "webOS returned an unexpected power-state response"
     );
-    if power["type"] == "response"
-        && power["payload"]["returnValue"] != false
-        && matches!(
-            power["payload"]["state"].as_str(),
-            Some("Power Off" | "Suspend" | "Active Standby")
-        )
-    {
+    if matches!(parse_power(&power), Ok(TvState::Off)) {
         let _ = ws.close(None).await;
         return Ok(());
     }
@@ -207,6 +217,31 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     // The TV may reset TCP after acknowledging power-off; close must not cause a retry.
     let _ = ws.close(None).await;
     Ok(())
+}
+
+async fn register<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    key: &Secret,
+) -> anyhow::Result<()> {
+    send(ws, registration(key)).await?;
+    let reply = receive(ws).await?;
+    if reply["type"] == "response" && reply["payload"]["pairingType"] == "PROMPT" {
+        return Err(PairingRequired.into());
+    }
+    anyhow::ensure!(reply["type"] == "registered", "webOS registration failed");
+    Ok(())
+}
+
+async fn query_power<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+) -> anyhow::Result<Value> {
+    send(ws, json!({"type":"request", "id":"power_state_0", "uri":"ssap://com.webos.service.tvpower/power/getPowerState"})).await?;
+    let reply = receive(ws).await?;
+    anyhow::ensure!(
+        reply["id"] == "power_state_0",
+        "webOS returned an unexpected power-state response"
+    );
+    Ok(reply)
 }
 
 async fn send<S: AsyncRead + AsyncWrite + Unpin>(
@@ -244,6 +279,25 @@ mod tests {
     use crate::config::Config;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, connect_async};
+
+    #[test]
+    fn direct_power_mapping_distinguishes_screen_off_and_unknown_states() {
+        for (state, expected) in [
+            ("Active", TvState::On),
+            ("Active Standby", TvState::Off),
+            ("Suspend", TvState::Off),
+            ("Power Off", TvState::Off),
+            ("Screen Off", TvState::On),
+            ("Screen Saver", TvState::On),
+        ] {
+            assert_eq!(
+                parse_power(&json!({"type":"response","payload":{"state":state}})).unwrap(),
+                expected
+            );
+        }
+        assert!(parse_power(&json!({"type":"response","payload":{"state":"Unknown"}})).is_err());
+        assert!(parse_power(&json!({"type":"error","payload":{"state":"Active"}})).is_err());
+    }
 
     fn key() -> Secret {
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
@@ -300,13 +354,15 @@ mod tests {
 
     #[tokio::test]
     async fn registers_with_key_and_turns_off() {
-        fake(
-            json!({"type":"registered"}),
-            Some(json!({"type":"response", "id":"power_state_0", "payload":{"state":"Active"}})),
-            Some(json!({"type":"response", "id":"turn_off_0", "payload":{"returnValue":true}})),
-        )
-        .await
-        .unwrap();
+        for state in ["Active", "Screen Off", "Screen Saver"] {
+            fake(
+                json!({"type":"registered"}),
+                Some(json!({"type":"response", "id":"power_state_0", "payload":{"state":state}})),
+                Some(json!({"type":"response", "id":"turn_off_0", "payload":{"returnValue":true}})),
+            )
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]

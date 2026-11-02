@@ -63,6 +63,8 @@ pub struct Config {
     pub presets: PresetsConfig,
     pub sonos: SonosConfig,
     pub timing: TimingConfig,
+    #[serde(default)]
+    pub verify: VerifyConfig,
     pub fake_tv: FakeTvConfig,
     pub device: Vec<DeviceConfig>,
     pub web: WebConfig,
@@ -249,6 +251,40 @@ fn default_standby_retries() -> u8 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifyConfig {
+    pub tv_poll_ms: u64,
+    pub tv_window_s: u64,
+    pub probe_poll_ms: u64,
+    pub probe_window_s: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            tv_poll_ms: 2000,
+            tv_window_s: 45,
+            probe_poll_ms: 2000,
+            probe_window_s: 45,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProbeConfig {
+    Ps5 {
+        host: String,
+        #[serde(default = "default_probe_port")]
+        port: u16,
+    },
+}
+
+fn default_probe_port() -> u16 {
+    9302
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FakeTvConfig {
     #[serde(default = "default_true")]
@@ -278,6 +314,7 @@ pub struct DeviceConfig {
     pub verify_standby: bool,
     pub media_player: Option<String>,
     pub presence: Presence,
+    pub probe: Option<ProbeConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -418,6 +455,18 @@ impl Config {
         self.validate_devices()?;
         self.validate_timing()?;
         self.validate_fake_tv()?;
+        if !(500..=10000).contains(&self.verify.tv_poll_ms) {
+            return invalid("verify tv_poll_ms must be in 500..=10000 ms");
+        }
+        if !(5..=300).contains(&self.verify.tv_window_s) {
+            return invalid("verify tv_window_s must be in 5..=300 seconds");
+        }
+        if !(500..=10000).contains(&self.verify.probe_poll_ms) {
+            return invalid("verify probe_poll_ms must be in 500..=10000 ms");
+        }
+        if !(5..=300).contains(&self.verify.probe_window_s) {
+            return invalid("verify probe_window_s must be in 5..=300 seconds");
+        }
         if self.trace.keep_days > 365 {
             return invalid("trace keep_days must be in 0..=365");
         }
@@ -486,6 +535,17 @@ impl Config {
                 return invalid("device sources must be nonempty and unique");
             }
             device.validate_matching_and_policy()?;
+            if let Some(ProbeConfig::Ps5 { host, port }) = &device.probe
+                && (host.trim().is_empty()
+                    || host.contains('/')
+                    || host.chars().any(char::is_whitespace)
+                    || host.parse::<std::net::IpAddr>().is_err() && host.contains([':', '[', ']'])
+                    || *port == 0)
+            {
+                return invalid(
+                    "probe host must be a hostname or IP without a path or port, and port must be nonzero",
+                );
+            }
         }
         Ok(())
     }
@@ -679,6 +739,70 @@ mod tests {
                 assert!(result.is_ok());
             }
         }
+    }
+
+    #[test]
+    fn probe_configuration_checks_bounds_host_and_port() {
+        for (poll, window, valid) in [
+            (499, 45, false),
+            (500, 5, true),
+            (10000, 300, true),
+            (10001, 45, false),
+            (2000, 4, false),
+            (2000, 301, false),
+        ] {
+            let mut config = example();
+            config.verify.probe_poll_ms = poll;
+            config.verify.probe_window_s = window;
+            assert_eq!(config.validate().is_ok(), valid);
+        }
+        for (host, port, valid) in [
+            ("console.lan", 9302, true),
+            ("127.0.0.1", 9302, true),
+            ("::1", 9302, true),
+            ("", 9302, false),
+            ("bad host", 9302, false),
+            ("console.lan/path", 9302, false),
+            ("console.lan:9302", 9302, false),
+            ("console.lan", 0, false),
+        ] {
+            let mut config = example();
+            config.device[0].probe = Some(ProbeConfig::Ps5 {
+                host: host.into(),
+                port,
+            });
+            assert_eq!(config.validate().is_ok(), valid);
+        }
+        let probe: ProbeConfig = toml::from_str("kind = \"ps5\"\nhost = \"console.lan\"").unwrap();
+        assert!(matches!(probe, ProbeConfig::Ps5 { port: 9302, .. }));
+    }
+
+    #[test]
+    fn direct_tv_polling_bounds_and_optional_settings_are_validated() {
+        for (poll, window, valid) in [
+            (499, 45, false),
+            (500, 5, true),
+            (10000, 300, true),
+            (10001, 45, false),
+            (2000, 4, false),
+            (2000, 301, false),
+        ] {
+            let mut config = example();
+            config.verify.tv_poll_ms = poll;
+            config.verify.tv_window_s = window;
+            assert_eq!(
+                Config::parse(&toml::to_string(&config).unwrap()).is_ok(),
+                valid
+            );
+        }
+        // Omitted settings use defaults, not zero.
+        let text = toml::to_string(&example())
+            .unwrap()
+            .replace("tv_window_s = 45\n", "");
+        let mut config = Config::parse(&text).unwrap();
+        config.verify.tv_poll_ms = 500;
+        assert_eq!(config.verify.tv_window_s, 45);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

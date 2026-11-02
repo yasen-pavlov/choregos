@@ -573,6 +573,10 @@ impl Replay {
                 attrs: serde_json::from_value(attrs)?,
                 changed,
             }],
+            TraceEntry::TvPower { state, at } => vec![Event::TvPower { state, at }],
+            TraceEntry::ConsolePower { role, state, at } => {
+                vec![Event::ConsolePower { role, state, at }]
+            }
             TraceEntry::Command(command) => vec![Event::Command(command)],
             TraceEntry::Connection { mqtt } => {
                 self.correlation.clear();
@@ -884,7 +888,7 @@ mod tests {
         assert!(text.contains("takeover_settled"), "{text}");
         assert!(!text.contains("command_standby"), "{text}");
         let engine = runner.engine.unwrap();
-        assert_eq!(engine.active_role.as_deref(), Some("streamer"));
+        assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
         assert_eq!(engine.bus.entries[&4].vendor, Some(0x0010fa));
     }
 
@@ -1499,6 +1503,81 @@ mod extraction_tests {
             "{}\n",
             json!({"ts":timestamp(seconds),"topic":topic,"payload":payload})
         )
+    }
+
+    #[test]
+    fn direct_tv_state_survives_extraction_and_replay_with_its_observed_time() {
+        use crate::state::TvState;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("direct.jsonl");
+        let observed = timestamp(-1);
+        let text = row(0, "tv/state", json!({"state":"unreachable","at":observed}));
+        std::fs::write(&path, &text).unwrap();
+        let mut extracted = vec![];
+        extract_with_warnings(
+            &[path],
+            (timestamp(0), timestamp(1)),
+            &[],
+            None,
+            &mut extracted,
+            &mut vec![],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(extracted).unwrap(), text);
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let mut replay = Replay::new(config, None, None).unwrap();
+        let mut output = vec![];
+        replay.line(&text, &mut output).unwrap();
+        let engine = replay.engine.as_ref().unwrap();
+        assert_eq!(engine.tv_direct, Some((TvState::Unreachable, observed)));
+        assert!(engine.ha.is_empty());
+        assert_eq!(engine.intent, crate::state::RoomIntent::default());
+        assert_eq!(engine.roles["streamer"].power, crate::state::RolePower::Off);
+        for (index, (name, state)) in [("on", TvState::On), ("off", TvState::Off)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = timestamp(index as i64 + 1);
+            replay
+                .line(
+                    &row(index as i64 + 1, "tv/state", json!({"state":name,"at":at})),
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(replay.engine.as_ref().unwrap().tv_direct, Some((state, at)));
+        }
+        let probe = row(
+            3,
+            "probe/state",
+            json!({"role":"console_b","state":"standby","at":observed}),
+        );
+        replay.line(&probe, &mut output).unwrap();
+        assert_eq!(
+            replay.engine.as_ref().unwrap().roles["console_b"].direct,
+            Some((crate::state::ConsoleState::Standby, observed))
+        );
+        let probe_path = directory.path().join("probe.jsonl");
+        std::fs::write(&probe_path, &probe).unwrap();
+        let mut extracted_probe = vec![];
+        extract_with_warnings(
+            &[probe_path],
+            (timestamp(3), timestamp(3)),
+            &[],
+            None,
+            &mut extracted_probe,
+            &mut vec![],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(extracted_probe).unwrap(), probe);
+        assert!(output.is_empty());
+        assert!(
+            trace::parse_checked(&row(
+                1,
+                "tv/state",
+                json!({"state":"unknown","at":observed})
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -1480,3 +1480,207 @@ async fn saved_bridge_kind_switch_subscribes_to_native_status_and_bus_and_resync
     assert!(offline.bridge_bus.is_none());
     harness.shutdown().await;
 }
+
+#[tokio::test]
+async fn direct_tv_poll_starts_only_after_wake_dispatch_finishes() {
+    use super::{
+        Input, executor::Executor, ha::Ha, mqtt::Mqtt, observe::Observer, ordered_effects,
+    };
+    use crate::{action::Action, config::TvOffConfig, engine::Event, state::TvState};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let wake = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+    config.mode = Mode::Active;
+    config.tv.wake = WakeConfig::Http {
+        url: format!("http://{}/wake", wake.local_addr().unwrap()),
+        header: "Authorization".into(),
+        token_env: "CHOREGOS_TEST_WAKE".into(),
+    };
+    config.tv.off = TvOffConfig::Webos {
+        host: "127.0.0.1".into(),
+        port: tv.local_addr().unwrap().port(),
+        key_env: "CHOREGOS_TEST_TV".into(),
+    };
+    config
+        .resolve_secrets(|_| Some(DUMMY_SECRET.into()))
+        .unwrap();
+    let (mqtt, _eventloop) = Mqtt::test_transport(true, 16);
+    let (ha, _) = Ha::fake();
+    let active = Arc::new(AtomicBool::new(true));
+    let executor = Arc::new(Executor {
+        mqtt,
+        ha,
+        active: active.clone(),
+    });
+    let (tx, mut observations) = mpsc::channel(8);
+    let observer = Arc::new(Observer::new(tx, active));
+    let (effects, rx) = mpsc::channel(8);
+    let worker = tokio::spawn(ordered_effects(executor, observer.clone(), rx));
+    effects
+        .send((Arc::new(config), vec![Action::WakeTv]))
+        .await
+        .unwrap();
+    let (mut request, _) = tokio::time::timeout(WAIT, wake.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = [0; 2048];
+    assert!(request.read(&mut bytes).await.unwrap() > 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), tv.accept())
+            .await
+            .is_err()
+    );
+    assert!(observations.try_recv().is_err());
+    request
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let (socket, _) = tokio::time::timeout(WAIT, tv.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    // Closing this loopback fake during TLS models an unavailable direct source.
+    drop(socket);
+    let event = tokio::time::timeout(WAIT, observations.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        event,
+        Input::Event(Event::TvPower {
+            state: TvState::Unreachable,
+            ..
+        })
+    ));
+    drop(effects);
+    worker.await.unwrap();
+    drop(observer);
+}
+
+#[tokio::test]
+async fn console_observation_windows_follow_wake_and_dispatched_stop() {
+    use super::{Input, executor::Executor, ha::Ha, mqtt::Mqtt, observe::Observer};
+    use crate::{
+        config::ProbeConfig,
+        engine::{Engine, Event},
+        state::ConsoleState,
+    };
+    use std::{
+        sync::{Arc, atomic::AtomicBool},
+        time::Instant,
+    };
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+    config.mode = Mode::Active;
+    config.device[0].probe = Some(ProbeConfig::Ps5 {
+        host: "127.0.0.1".into(),
+        port: server.local_addr().unwrap().port(),
+    });
+    let now = Instant::now();
+    let wall = chrono::Utc::now();
+    let mut engine = Engine::new(config, now, vec![], 1);
+    let now = now + Duration::from_secs(4);
+    for data in ["84210004", "870010FA"] {
+        engine.handle(
+            Event::Frame(Frame::from_hex(4, 15, data).unwrap()),
+            now,
+            wall,
+        );
+    }
+    let (mqtt, _eventloop) = Mqtt::test_transport(true, 32);
+    let (ha, _) = Ha::fake();
+    let active = Arc::new(AtomicBool::new(true));
+    let executor = Arc::new(Executor {
+        mqtt,
+        ha,
+        active: active.clone(),
+    });
+    let (tx, mut observations) = mpsc::channel(8);
+    let observer = Arc::new(Observer::new(tx, active));
+    let (effects, _rx) = mpsc::channel(8);
+    let adapters = Adapters {
+        executor,
+        observer,
+        effects,
+        worker: tokio::spawn(std::future::pending()),
+        mqtt_task: tokio::spawn(std::future::pending()),
+        ha_task: tokio::spawn(std::future::pending()),
+    };
+    for (event, reply, expected) in [
+        (
+            Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+            b"HTTP/1.1 200 Ok\n".as_slice(),
+            ConsoleState::Awake,
+        ),
+        (
+            Event::Command(Command::Standby("streamer".into())),
+            b"HTTP/1.1 620 Server Standby\n".as_slice(),
+            ConsoleState::Standby,
+        ),
+    ] {
+        let actions = engine.handle(event, now, wall);
+        adapters.dispatch(actions, &engine);
+        let mut bytes = [0; 128];
+        let (_, sender) = tokio::time::timeout(WAIT, server.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        server.send_to(reply, sender).await.unwrap();
+        let Input::Event(event) = tokio::time::timeout(WAIT, observations.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("direct observation event")
+        };
+        engine.handle(event, now, wall);
+        assert_eq!(engine.roles["streamer"].direct.unwrap().0, expected);
+    }
+    adapters.observer.stop();
+    // All-off sends Standby even to an already-Off role. A different On role
+    // creates the only transition decision; it must not suppress this window.
+    engine.handle(
+        Event::Frame(Frame::from_hex(8, 15, "84230004").unwrap()),
+        now,
+        wall,
+    );
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    let actions = engine.handle(Event::Command(Command::AllOff), now, wall);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .all(|decision| decision.role.as_deref() == Some("console_a"))
+    );
+    let frames = adapters.dispatch(actions, &engine);
+    assert!(
+        frames
+            .iter()
+            .any(|(frame, _)| frame.to == 4 && frame.opcode == Some(0x36))
+    );
+    let mut bytes = [0; 128];
+    let (_, sender) = tokio::time::timeout(WAIT, server.recv_from(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    server
+        .send_to(b"HTTP/1.1 620 Server Standby\n", sender)
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(WAIT, observations.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, Input::Event(Event::ConsolePower { ref role, state: ConsoleState::Standby, .. }) if role == "streamer")
+    );
+    adapters.observer.stop();
+    adapters.worker.abort();
+    adapters.mqtt_task.abort();
+    adapters.ha_task.abort();
+}
