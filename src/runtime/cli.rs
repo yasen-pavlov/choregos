@@ -464,7 +464,7 @@ impl TraceWindow {
         {
             return Ok(None);
         }
-        if !header {
+        if !header && !matches!(entry, Some(TraceEntry::Decision(_))) {
             self.started = true;
         }
         Ok(Some(WindowEntry { timestamp, entry }))
@@ -515,7 +515,7 @@ impl Replay {
         let Some(entry) = entry else {
             return Ok(());
         };
-        if matches!(entry, TraceEntry::Identities(_)) {
+        if matches!(entry, TraceEntry::Identities(_) | TraceEntry::Decision(_)) {
             return Ok(());
         }
         if self.engine.is_none()
@@ -544,6 +544,7 @@ impl Replay {
                     .seed()
                     .and_then(identity_header)
                     .unwrap_or_default(),
+                1,
             ));
         }
         let engine = self.engine.as_mut().expect("replay initialized");
@@ -581,7 +582,7 @@ impl Replay {
                     vec![Event::BridgeOffline]
                 }
             }
-            TraceEntry::Identities(_) => unreachable!(),
+            TraceEntry::Identities(_) | TraceEntry::Decision(_) => unreachable!(),
         };
         for event in events {
             emit(engine, event, now, timestamp, output)?;
@@ -735,6 +736,103 @@ mod tests {
                 .map(|(ms, entry)| trace::line(epoch + chrono::Duration::milliseconds(ms), &entry))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn decision_trace_rows_are_preserved_by_extraction_but_never_drive_replay() {
+        let (config, mut lines) = capture();
+        let mut baseline = vec![];
+        replay(config.clone(), &lines.concat(), &mut baseline).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(baseline.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(first["id"], 1);
+        assert!(
+            std::str::from_utf8(&baseline)
+                .unwrap()
+                .starts_with("{\"at\":")
+        );
+        let ts = "2026-10-30T12:00:03Z".parse().unwrap();
+        let row = trace::line(
+            ts,
+            &TraceEntry::Decision(serde_json::json!({
+                "id": 900, "timestamp": ts, "parent": null,
+                "trigger": {"kind":"service","name":"started"},
+                "role": null, "from": null, "to": null, "reason": "never_replayed",
+                "actions": [{"kind":"wake_tv"}], "would": true
+            })),
+        );
+        lines.push(row);
+        let mut output = vec![];
+        replay(config.clone(), &lines.concat(), &mut output).unwrap();
+        assert_eq!(output, baseline);
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("trace.jsonl");
+        std::fs::write(&fixture, lines.concat()).unwrap();
+        let mut extracted = vec![];
+        extract_files(
+            &[fixture],
+            "2026-10-30T12:00:00Z".parse().unwrap(),
+            ts,
+            &[],
+            None,
+            &mut extracted,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(extracted)
+                .unwrap()
+                .contains("\"never_replayed\"")
+        );
+        // A decision before the first actual input must not lock in a stale seed.
+        let epoch: chrono::DateTime<chrono::Utc> = "2026-10-30T12:00:00Z".parse().unwrap();
+        let since = epoch + chrono::Duration::seconds(2);
+        let until = epoch + chrono::Duration::seconds(10);
+        let mut window_lines = vec![
+            trace::line(epoch, &TraceEntry::Identities(vec![])),
+            trace::line(
+                epoch + chrono::Duration::seconds(5),
+                &TraceEntry::Identities(identity_header(&lines[0]).unwrap()),
+            ),
+            trace::line(
+                epoch + chrono::Duration::seconds(6),
+                &TraceEntry::Received {
+                    bridge: config.bridge.name().into(),
+                    frame: crate::cec::Frame::from_hex(4, 0, "04").unwrap(),
+                },
+            ),
+            trace::line(
+                epoch + chrono::Duration::seconds(7),
+                &TraceEntry::Received {
+                    bridge: config.bridge.name().into(),
+                    frame: crate::cec::Frame::from_hex(4, 15, "84210004").unwrap(),
+                },
+            ),
+        ];
+        let run_window = |lines: &[String]| {
+            let mut runner = Replay::new(config.clone(), Some(since), Some(until)).unwrap();
+            let mut result = vec![];
+            for line in lines {
+                runner.line(line, &mut result).unwrap();
+            }
+            runner.finish(&mut result).unwrap();
+            result
+        };
+        let expected = run_window(&window_lines);
+        assert!(String::from_utf8_lossy(&expected).contains("ImageViewOn"));
+        window_lines.insert(1, lines.last().unwrap().clone());
+        assert_eq!(run_window(&window_lines), expected);
+        let fixture = directory.path().join("seed-after-decision.jsonl");
+        std::fs::write(&fixture, window_lines.concat()).unwrap();
+        let mut extracted = vec![];
+        extract_files(&[fixture], since, until, &[], None, &mut extracted).unwrap();
+        let mut actual = vec![];
+        replay(
+            config,
+            std::str::from_utf8(&extracted).unwrap(),
+            &mut actual,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1250,7 +1348,7 @@ mod native_tests {
         ];
         let epoch: chrono::DateTime<chrono::Utc> = "2026-11-01T00:00:00Z".parse().unwrap();
         let start = Instant::now();
-        let mut engine = Engine::new(config.clone(), start, vec![]);
+        let mut engine = Engine::new(config.clone(), start, vec![], 1);
         let mut correlation = Correlation::default();
         let mut live = vec![];
         let mut lines = String::new();

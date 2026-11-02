@@ -1,5 +1,5 @@
-use crate::state::RolePower;
-use serde::Serialize;
+use crate::state::{Command, RolePower};
+use serde::{Deserialize, Serialize};
 
 /// Read-only identity queries, selected independently for each missing key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -63,8 +63,38 @@ impl Action {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerKind {
+    RoomOff,
+    TakeoverSettle,
+    Presence,
+    StandbyVerification,
+    Warmup,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceKind {
+    Started,
+    Migrated,
+}
+
+/// The input or timer responsible for a decision, independent of its outcome.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Trigger {
+    Frame { from: u8, to: u8, data: String },
+    Command { command: Command },
+    Timer { name: TimerKind },
+    Service { name: ServiceKind },
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Decision {
+    pub id: u64,
+    pub parent: Option<u64>,
+    pub trigger: Trigger,
     pub role: Option<String>,
     pub from: Option<RolePower>,
     pub to: Option<RolePower>,

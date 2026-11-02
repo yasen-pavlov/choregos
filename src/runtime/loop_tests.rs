@@ -945,7 +945,7 @@ async fn corrupt_or_unknown_state_starts_empty_without_failing_runtime() {
     harness.publish_wake().await;
     for invalid in [
         b"not JSON".as_slice(),
-        br#"{"version":2,"identities":[],"decisions":[]}"#.as_slice(),
+        br#"{"version":999,"identities":[],"decisions":[]}"#.as_slice(),
     ] {
         harness.stop_runtime().await;
         tokio::fs::write(harness.path.with_file_name("choregos.state.json"), invalid)
@@ -1032,6 +1032,7 @@ async fn restored_decision_ring_keeps_newest_entries_and_restart_boundary() {
         .collect();
     let saved = super::PersistedState {
         version: 1,
+        next_decision_id: 1,
         identities: vec![],
         decisions,
     };
@@ -1047,6 +1048,22 @@ async fn restored_decision_ring_keeps_newest_entries_and_restart_boundary() {
     assert_eq!(snapshot.decisions.front().unwrap().reason, "decision_6");
     assert_eq!(snapshot.decisions[1998].reason, "decision_2004");
     assert_eq!(snapshot.decisions.back().unwrap().reason, "service_started");
+    assert_eq!(snapshot.decisions.back().unwrap().id, 2006);
+    let path = harness.path.with_file_name("choregos.state.json");
+    wait_persisted(&path, |saved| saved.next_decision_id == 2007).await;
+    harness.stop_runtime().await;
+    let disk: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+    assert_eq!(disk["version"], 2);
+    assert_eq!(disk["next_decision_id"], 2007);
+    let rows = disk["decisions"].as_array().unwrap();
+    assert_eq!(rows.first().unwrap()["id"], 7);
+    for row in &rows[..rows.len() - 1] {
+        assert_eq!(row["trigger"], json!({"kind":"service","name":"migrated"}));
+        assert_eq!(row.get("parent"), Some(&Value::Null));
+    }
+    assert_eq!(rows.last().unwrap()["id"], 2006);
+    harness.restart_runtime().await;
+    assert_eq!(harness.state.snapshot().decisions.back().unwrap().id, 2007);
     harness.shutdown().await;
 }
 
@@ -1183,6 +1200,12 @@ async fn runtime_captures_replay_inputs_and_publishes_retained_bridge_telemetry(
             .iter()
             .any(|entry| matches!(entry, TraceEntry::Command(Command::Identify(4))))
     );
+    assert!(entries.iter().any(|entry| matches!(entry, TraceEntry::Decision(payload)
+        if payload["reason"] == "command_identify"
+        && payload["id"].as_u64().is_some()
+        && payload["trigger"]["kind"] == "command"
+        && payload["would"] == true
+        && payload["actions"].as_array().is_some_and(|actions| actions.iter().all(serde_json::Value::is_object)))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,5 +1,5 @@
 use crate::{
-    action::{Action, Decision, IdentifyQueries},
+    action::{Action, Decision, IdentifyQueries, ServiceKind, TimerKind, Trigger},
     cec::{
         bus::{BusModel, LearnedIdentity},
         frame::Frame,
@@ -54,6 +54,7 @@ pub enum Event {
     Tick,
     Command(Command),
     ConfigReloaded(Arc<Config>),
+    ServiceStarted,
 }
 #[derive(Clone, Debug)]
 pub struct RoleState {
@@ -90,6 +91,7 @@ struct StandbyVerification {
     sent: u8,
     acked: bool,
     nacked: u8,
+    parent: Option<u64>,
 }
 
 impl StandbyVerification {
@@ -104,6 +106,41 @@ impl StandbyVerification {
     }
 }
 
+/// Event provenance keeps raw CEC bytes inline; only recorded rows allocate hex.
+enum DecisionTrigger {
+    Frame {
+        from: u8,
+        to: u8,
+        data: [u8; 15],
+        len: usize,
+    },
+    Command(Command),
+    Timer(TimerKind),
+    Service(ServiceKind),
+}
+
+impl DecisionTrigger {
+    fn recorded(&self) -> Trigger {
+        match self {
+            Self::Frame {
+                from,
+                to,
+                data,
+                len,
+            } => Trigger::Frame {
+                from: *from,
+                to: *to,
+                data: hex::encode_upper(&data[..*len]),
+            },
+            Self::Command(command) => Trigger::Command {
+                command: command.clone(),
+            },
+            Self::Timer(name) => Trigger::Timer { name: *name },
+            Self::Service(name) => Trigger::Service { name: *name },
+        }
+    }
+}
+
 pub struct Engine {
     pub config: Arc<Config>,
     pub bus: BusModel,
@@ -114,14 +151,21 @@ pub struct Engine {
     pub bridge_online: bool,
     pub warming: bool,
     pub decisions: Vec<Decision>,
+    pub next_decision_id: u64,
+    trigger: Option<DecisionTrigger>,
     warm_until: Instant,
     off_at: Option<Instant>,
-    settle: Option<(Instant, String, bool)>,
+    settle: Option<(Instant, String, bool, u64)>,
     standby_verifications: Vec<StandbyVerification>,
     signals: BTreeMap<u8, Vec<PowerEvent>>,
 }
 impl Engine {
-    pub fn new(config: Config, now: Instant, restored: Vec<LearnedIdentity>) -> Self {
+    pub fn new(
+        config: Config,
+        now: Instant,
+        restored: Vec<LearnedIdentity>,
+        next_decision_id: u64,
+    ) -> Self {
         let roles = config
             .device
             .iter()
@@ -144,6 +188,8 @@ impl Engine {
             bridge_online: false,
             warming: true,
             decisions: vec![],
+            next_decision_id,
+            trigger: None,
             warm_until: now + Duration::from_secs(3),
             off_at: None,
             settle: None,
@@ -192,6 +238,30 @@ impl Engine {
     }
     pub fn handle(&mut self, event: Event, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
         self.decisions.clear();
+        self.trigger = match &event {
+            Event::Frame(frame) => {
+                let mut data = [0; 15];
+                let mut len = 0;
+                for byte in frame.opcode.iter().chain(&frame.params) {
+                    data[len] = *byte;
+                    len += 1;
+                }
+                Some(DecisionTrigger::Frame {
+                    from: frame.from,
+                    to: frame.to,
+                    data,
+                    len,
+                })
+            }
+            Event::Command(command) => Some(DecisionTrigger::Command(command.clone())),
+            Event::ServiceStarted => Some(DecisionTrigger::Service(ServiceKind::Started)),
+            Event::Tick
+            | Event::HaState { .. }
+            | Event::SendResult { .. }
+            | Event::BridgeOnline
+            | Event::ConfigReloaded(_)
+            | Event::BridgeOffline => None,
+        };
         let was_warming = self.warming;
         if self.warming && now >= self.warm_until {
             self.warming = false;
@@ -203,6 +273,10 @@ impl Engine {
         let mut actions =
             match event {
                 Event::BridgeOnline => self.handle_bridge_online(now),
+                Event::ServiceStarted => {
+                    self.record(None, None, None, "service_started", vec![], None);
+                    vec![]
+                }
                 Event::BridgeOffline => self.handle_bridge_offline(),
                 Event::HaState {
                     entity,
@@ -231,13 +305,27 @@ impl Engine {
                 Event::Tick => vec![],
             };
         if was_warming && !self.warming {
+            let event_trigger = self
+                .trigger
+                .replace(DecisionTrigger::Timer(TimerKind::Warmup));
             self.finish_warming(now, &mut actions);
+            self.trigger = event_trigger;
         }
         if let Some(reason) = command_reason
             && !actions.is_empty()
             && self.decisions.is_empty()
         {
-            self.record(None, None, None, reason, actions.clone());
+            let id = self.record(None, None, None, reason, actions.clone(), None);
+            for pending in &mut self.standby_verifications {
+                let matches = match &self.trigger {
+                    Some(DecisionTrigger::Command(Command::AllOff)) => true,
+                    Some(DecisionTrigger::Command(Command::Standby(role))) => pending.role == *role,
+                    _ => false,
+                };
+                if matches && pending.parent.is_none() {
+                    pending.parent = Some(id);
+                }
+            }
         }
         actions.extend(self.timers(now, wall));
         for action in &actions {
@@ -415,12 +503,13 @@ impl Engine {
                     "conflict"
                 },
                 vec![],
+                None,
             );
         }
         if self
             .settle
             .as_ref()
-            .is_some_and(|(_, role, _)| self.identity.blocked.contains(role))
+            .is_some_and(|(_, role, _, _)| self.identity.blocked.contains(role))
         {
             self.settle = None;
         }
@@ -554,6 +643,7 @@ impl Engine {
             None,
             "sonos_volume",
             vec![action.clone()],
+            None,
         );
         actions.push(action);
     }
@@ -566,13 +656,13 @@ impl Engine {
                 if mode == Mode::Shadow {
                     self.standby_verifications.clear();
                 }
-                self.record(None, None, None, "command_set_mode", vec![]);
+                self.record(None, None, None, "command_set_mode", vec![], None);
             }
             Command::Identify(la) => {
                 if la < 15 && la != self.bus.bridge {
                     actions.extend(self.bus.manual_identify(la, now));
                     // Accepted commands remain visible even when their send is queued.
-                    self.record(None, None, None, "command_identify", actions.clone());
+                    self.record(None, None, None, "command_identify", actions.clone(), None);
                 }
             }
             Command::Forget(la) => {
@@ -607,7 +697,7 @@ impl Engine {
                     for (role, signal, power) in newly_bound {
                         actions.extend(self.transition(&role, power, &format!("{signal:?}"), now));
                     }
-                    self.record(None, None, None, "command_forget", vec![]);
+                    self.record(None, None, None, "command_forget", vec![], None);
                 }
             }
             Command::SendRaw { to, data } => {
@@ -737,6 +827,8 @@ impl Engine {
         state.poll_at = (target == RolePower::On && poll)
             .then_some(now + Duration::from_secs(self.config.timing.presence_poll_s));
         let mut actions = vec![];
+        let first_decision = self.decisions.len();
+        let mut scheduled_settle = None;
         if target == RolePower::On {
             self.off_at = None;
             if !self.is_state(&self.config.tv.entity, "on") {
@@ -767,6 +859,7 @@ impl Engine {
                             Some(RolePower::Off),
                             "taken_over",
                             vec![],
+                            None,
                         );
                         actions.extend(stop);
                     }
@@ -789,7 +882,7 @@ impl Engine {
             }
             let preset = receiver_was_off || self.active_role.as_deref() != Some(role);
             self.active_role = Some(role.into());
-            self.settle = Some((
+            scheduled_settle = Some((
                 now + Duration::from_millis(self.config.timing.takeover_settle_ms),
                 role.into(),
                 preset,
@@ -801,13 +894,32 @@ impl Engine {
             }
             self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
         }
-        self.record(
+        let id = self.record(
             Some(role.into()),
             Some(previous),
             Some(target),
             reason,
             actions.clone(),
+            None,
         );
+        if let Some((deadline, role, preset)) = scheduled_settle {
+            self.settle = Some((deadline, role, preset, id));
+        }
+        for pending in &mut self.standby_verifications {
+            let stopped_here = if target == RolePower::On {
+                self.decisions[first_decision..self.decisions.len() - 1]
+                    .iter()
+                    .any(|decision| {
+                        decision.reason == "taken_over"
+                            && decision.role.as_deref() == Some(&pending.role)
+                    })
+            } else {
+                matches!(reason, "all_off" | "manual_standby") && pending.role == role
+            };
+            if stopped_here && pending.parent.is_none() {
+                pending.parent = Some(id);
+            }
+        }
         actions
     }
     fn stop_role(&mut self, role: &str, now: Instant) -> Vec<Action> {
@@ -845,6 +957,7 @@ impl Engine {
                         sent: 0,
                         acked: false,
                         nacked: 0,
+                        parent: None,
                     });
                 }
                 actions
@@ -861,9 +974,13 @@ impl Engine {
         if self.warming {
             return vec![];
         }
+        self.trigger = Some(DecisionTrigger::Timer(TimerKind::RoomOff));
         let mut actions = self.expire_off_timer(now);
+        self.trigger = Some(DecisionTrigger::Timer(TimerKind::TakeoverSettle));
         actions.extend(self.expire_settle_timer(now, wall));
+        self.trigger = Some(DecisionTrigger::Timer(TimerKind::Presence));
         self.poll_presence(now, &mut actions);
+        self.trigger = Some(DecisionTrigger::Timer(TimerKind::StandbyVerification));
         self.verify_standby(now, &mut actions);
         actions
     }
@@ -890,12 +1007,13 @@ impl Engine {
             } else if pending.attempts < self.config.timing.standby_retries {
                 let retry = StandbyVerification::actions(pending.la, pending.frames);
                 let role = pending.role.clone();
+                let parent = pending.parent;
                 let pending = &mut self.standby_verifications[index];
                 pending.attempts += 1;
                 pending.deadline =
                     now + Duration::from_millis(self.config.timing.takeover_settle_ms);
                 actions.extend_from_slice(&retry);
-                self.record(Some(role), None, None, "standby_retry", retry);
+                self.record(Some(role), None, None, "standby_retry", retry, parent);
                 index += 1;
             } else {
                 let pending = self.standby_verifications.swap_remove(index);
@@ -905,7 +1023,14 @@ impl Engine {
                 } else {
                     "standby_unconfirmed"
                 };
-                self.record(Some(pending.role), None, None, reason, vec![]);
+                self.record(
+                    Some(pending.role),
+                    None,
+                    None,
+                    reason,
+                    vec![],
+                    pending.parent,
+                );
             }
         }
     }
@@ -930,7 +1055,7 @@ impl Engine {
                 cached.state = "off".into();
             }
         }
-        self.record(None, None, None, "off_timer_expired", actions.clone());
+        self.record(None, None, None, "off_timer_expired", actions.clone(), None);
         actions
     }
 
@@ -938,7 +1063,7 @@ impl Engine {
         if !self.settle.as_ref().is_some_and(|settle| settle.0 <= now) {
             return vec![];
         }
-        let (_, role, preset) = self.settle.take().expect("due settle");
+        let (_, role, preset, parent) = self.settle.take().expect("due settle");
         if !self
             .roles
             .get(&role)
@@ -971,7 +1096,14 @@ impl Engine {
         if preset && let Some(script) = self.preset(wall) {
             actions.push(Action::ha("script", "turn_on", script));
         }
-        self.record(Some(role), None, None, "takeover_settled", actions.clone());
+        self.record(
+            Some(role),
+            None,
+            None,
+            "takeover_settled",
+            actions.clone(),
+            Some(parent),
+        );
         actions
     }
 
@@ -1056,6 +1188,7 @@ impl Engine {
         }
         vec![]
     }
+
     fn record(
         &mut self,
         role: Option<String>,
@@ -1063,14 +1196,21 @@ impl Engine {
         to: Option<RolePower>,
         reason: &str,
         actions: Vec<Action>,
-    ) {
+        parent: Option<u64>,
+    ) -> u64 {
+        let id = self.next_decision_id;
+        self.next_decision_id = id.checked_add(1).expect("decision id exhausted");
         self.decisions.push(Decision {
+            id,
+            parent,
+            trigger: self.trigger.as_ref().expect("decision trigger").recorded(),
             role,
             from,
             to,
             reason: reason.into(),
             actions,
         });
+        id
     }
     pub fn mode(&self) -> Mode {
         self.config.mode

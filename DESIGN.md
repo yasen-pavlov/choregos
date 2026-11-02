@@ -355,10 +355,25 @@ Resync additionally sends `83` immediately to each unverified restored LA. This 
 #### Persisted state
 
 The runtime loads versioned `choregos.state.json` from the config file's directory.
-Version 1 contains only learned identities (`la`, `physical`, `vendor`, `osd`,
-`device_type`, `confirmed_at`) and the newest 2000 `DecisionView` entries, newest
-last; no frames, credentials or live power state. Only identities confirmed by
-an `84` are persisted; empty entries and the bridge LA are excluded. On load,
+Version 2 contains `next_decision_id`, learned identities (`la`, `physical`,
+`vendor`, `osd`, `device_type`, `confirmed_at`) and the newest 2000 `DecisionView`
+entries, newest last. Each decision has a monotonic `id`, a tagged `trigger`
+(`frame {from,to,data}` with hex data, `command {command}` with the complete
+tagged `Command`, `timer {name}` with `room_off`, `takeover_settle`, `presence`,
+`standby_verification`, or `warmup`, or `service {name}` with `started`
+or `migrated`), and an optional `parent`; no frame ring,
+credentials or live power state are persisted. Wake-settle rows link to the wake
+decision; standby verification follow-ups link to the decision registering their
+stop sequence, including across address moves. Only roles stopped by that
+transition inherit its parent; already-Off targets use the command fallback row
+if present, otherwise null. Timer-driven rows retain their
+timer trigger even when another input processes the due timer. Version 1 is
+atomically migrated in place: ring-order ids start at 1, parents are null,
+triggers are `service {name:"migrated"}`, and the next counter is ring length
+plus one. The loader raises stale counters above retained ring ids and rejects
+exhausted counters as corrupt; ids are scoped to the persisted state lineage,
+not globally. Only identities confirmed by an `84` are persisted; empty entries
+and the bridge LA are excluded. On load,
 drop confirmations older than the fixed 30-day lifetime. Missing files start
 empty; corrupt or unknown versions warn and start empty without failing startup.
 
@@ -376,8 +391,13 @@ empty; corrupt or unknown versions warn and start empty without failing startup.
   shared correlation (`bridge::Correlation`: Tasmota FIFO, aether id map, boot
   tracking, `seq` dedupe), so replaying a trace reproduces exactly the events
   the engine saw. `telemetry` and `cfg` are not traced.
+  The runtime also captures `choregos/decision` creation rows with the full view,
+  `would`, and structured actions (not ring display strings); extraction retains
+  them and replay ignores them, recomputing from inputs with ids starting at 1.
 
-`Engine::new(config, now, restored)` receives the seed without I/O. Restored
+`Engine::new(config, now, restored, next_decision_id)` receives the seed and
+persisted id counter without I/O. `record` allocates ids; the startup service
+decision uses the same path. Restored
 entries have Unknown power, no last-seen time, and verified = false; their
 restore instant anchors the first retry deadline. Duplicate restored physical
 addresses keep the earlier LA. A matching received `84` verifies cached keys
@@ -449,7 +469,7 @@ Pages (all behind auth):
 - `/` Dashboard: mode switch (confirm when going active), bridge status, role cards (name, power, LA/PA, vendor/OSD, last event, "takeover" and "standby" buttons), TV/receiver/Sonos/Kodi HA states, active source, conflicts banner, "all off".
 - `/bus` Live bus: SSE stream of frames (decoded: from/to names, opcode name, operands) interleaved with decisions; filters by LA/opcode; last 2000 kept in memory (ring buffer in `AppState`).
 - `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "identify" and confirmed "forget" controls per non-bridge LA.
-- `/decisions` Decision log with reasons and resulting actions (and `would:` entries in shadow mode).
+- `/decisions` Decision log with stable `d-<id>` anchors, parent links, reasons and resulting actions (and `would:` entries in shadow mode).
 - `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
 Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; local username/password break-glass form at `/login/local`; signed session cookie (`tower-sessions` or axum-extra signed cookies); CSRF for POSTs via same-site cookie + hidden token. Visual design: dark, dense, monospace for bus data; mocked before implementation (see `docs/ui.md` once written).
@@ -458,7 +478,7 @@ Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; loca
 
 - Docker: multi-stage build, static musl binary, `FROM gcr.io/distroless/static`, non-root, `/healthz` healthcheck; writable `/config` holds `choregos.toml` and `choregos.state.json`, secrets via env. Published as `ghcr.io/yasen-pavlov/choregos` on tags, and `:edge` on every push to `main`.
 - `deploy/docker-compose.yml`: standalone example (host port, config directory mount, env secrets, health check). Integration into a specific stack (reverse proxy, log driver, networks) is left to the operator.
-- Logging: `tracing` JSON to stdout; decision log lines are structured (`event=decision role=… from=… to=… reason=…`).
+- Logging: `tracing` JSON to stdout; decision log lines are structured (`event=decision id=… parent=… role=… from=… to=… reason=…`).
 - CI (GitHub Actions): fmt, clippy `-D warnings`, test, `cargo llvm-cov --lcov`, SonarCloud (`sonar.projectKey=yasen-pavlov_choregos`, fork-PR guard), docker build (no push) on PR; release workflow on `v*` tags and `main` pushes: build + push multi-arch image; git-cliff notes and GitHub release only on tags. Dependabot for cargo + actions.
 - Versioning: `Cargo.toml` stays `0.0.0`; tags drive versions.
 

@@ -797,6 +797,11 @@ async fn bus_rows_mark_local_replies_and_nacked_frames() {
 /// runtime's `would: ` prefix, the identification query (never suppressed) carries none.
 fn shadow_decision() -> DecisionView {
     DecisionView {
+        id: 7,
+        trigger: crate::action::Trigger::Command {
+            command: crate::state::Command::Takeover("streamer".to_owned()),
+        },
+        parent: None,
         timestamp: chrono::Utc::now(),
         role: Some("streamer".to_owned()),
         from: Some(RolePower::Off),

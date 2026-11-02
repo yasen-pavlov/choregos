@@ -2,6 +2,45 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-02 — Decision identity
+
+- Assign each engine decision a monotonic `u64` id, an input/timer `trigger`,
+  and optional `parent` so a follow-up can be linked to the intent that scheduled
+  it without changing actions, timing, or append-only ring behavior.
+- Serialize triggers as `{"kind":"frame","from":…,"to":…,"data":"HEX"}`,
+  `{"kind":"command","command":<Command>}`, `{"kind":"timer","name":…}`,
+  or `{"kind":"service","name":…}`. Commands retain their tagged kind and
+  arguments; timer names are `room_off`, `takeover_settle`, `presence`,
+  `standby_verification`, and `warmup`; service names are `started`
+  and `migrated`. Inputs that cannot directly record rows have
+  no current trigger; bridge events need no serialized trigger variant.
+- Keep timer/service provenance allocation-free and encode frame hex only when
+  recording a row. Warmup provenance applies only to warmup decisions, never
+  another command handled at the same deadline.
+- `takeover_settled` links to its wake decision; standby retry and terminal
+  verification rows link to the decision that registered the stop sequence,
+  preserving that link when the target moves logical address. Due timers use
+  their own trigger even when processed alongside another input.
+  Parent only verification slots for roles actually stopped by that transition;
+  an already-Off role uses its command fallback row if one exists, otherwise
+  leaves parent null rather than claiming another role's row.
+- Persist state version 2 with `next_decision_id`. Migrate version 1 atomically
+  in place: ring-order ids start at 1, parent is null, trigger is
+  `{"kind":"service","name":"migrated"}`, and the next counter is ring length
+  plus one. Restore the counter, not the newest retained row, across restarts.
+  Repair stale counters to exceed every retained ring id; exhausted counters are
+  corrupt state, not a startup panic. Uniqueness is per persisted state lineage;
+  crash/write failure or restoring backups can reuse trace ids, so correlate
+  historical trace rows by `(ts, id)` and restore state backups on v2 rollback.
+- Record creation rows on trace topic `choregos/decision`, including `would`
+  and structured actions rather than the ring's display strings. Extraction
+  retains them; replay ignores them (including for identity-seed selection) and
+  recomputes decisions from engine inputs.
+- Replay numbers decisions from 1 per run and emits fields in order:
+  `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`, `reason`, `actions`.
+  The golden corpus changes only by the added identity fields; expectations,
+  observations, verdicts, and behavior changes remain out of scope.
+
 ## 2026-11-02 — Golden replay corpus and trace extraction
 
 - Curate five real-use replay windows covering native bridge wake/takeover,

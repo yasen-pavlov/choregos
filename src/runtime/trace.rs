@@ -54,6 +54,8 @@ pub enum TraceEntry {
         changed: Option<DateTime<Utc>>,
     },
     Command(Command),
+    /// Full decision row with structured actions (not UI display strings).
+    Decision(Value),
     Identities(Vec<LearnedIdentity>),
     Connection {
         mqtt: bool,
@@ -109,6 +111,7 @@ pub fn line(ts: DateTime<Utc>, entry: &TraceEntry) -> String {
             json!({"entity":entity,"state":state,"attrs":attrs,"changed":changed}),
         ),
         TraceEntry::Command(command) => ("choregos/command".into(), json!(command)),
+        TraceEntry::Decision(payload) => ("choregos/decision".into(), payload.clone()),
         TraceEntry::Identities(identities) => ("choregos/identities".into(), json!(identities)),
         TraceEntry::Connection { mqtt } => ("choregos/connection".into(), json!({"mqtt":mqtt})),
     };
@@ -139,7 +142,11 @@ pub fn parse_checked(line: &str) -> anyhow::Result<Option<(DateTime<Utc>, TraceE
 fn known_topic(topic: &str) -> bool {
     if matches!(
         topic,
-        "choregos/identities" | "choregos/command" | "choregos/connection" | "ha/state"
+        "choregos/identities"
+            | "choregos/command"
+            | "choregos/connection"
+            | "choregos/decision"
+            | "ha/state"
     ) {
         return true;
     }
@@ -157,6 +164,7 @@ fn parse_entry(topic: &str, payload: Value) -> Option<TraceEntry> {
     Some(match topic {
         "choregos/identities" => TraceEntry::Identities(serde_json::from_value(payload).ok()?),
         "choregos/command" => TraceEntry::Command(serde_json::from_value(payload).ok()?),
+        "choregos/decision" => TraceEntry::Decision(payload),
         "choregos/connection" => TraceEntry::Connection {
             mqtt: payload.get("mqtt")?.as_bool()?,
         },

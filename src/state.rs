@@ -260,7 +260,7 @@ pub enum UiEvent {
     Decision(DecisionView),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Command {
     AllOff,
@@ -411,6 +411,9 @@ pub enum FrameDirection {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DecisionView {
+    pub id: u64,
+    pub trigger: crate::action::Trigger,
+    pub parent: Option<u64>,
     pub timestamp: DateTime<Utc>,
     pub role: Option<String>,
     pub from: Option<RolePower>,

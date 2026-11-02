@@ -9,6 +9,7 @@ changes with `UPDATE_GOLDEN=1 cargo test --locked --test golden` and explain the
 differences in the same PR. Configurations preserve the captured role policies,
 timing, presets and speaker settings; generic web settings satisfy the current
 configuration schema but are unused by replay. No test contacts real devices.
+Expected lines are ordered `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`, `reason`, `actions`; ids restart at 1 for each replay, and the decision-identity re-bless adds only `id`/`parent`/`trigger` without changing the existing fields.
 
 ## Cases
 

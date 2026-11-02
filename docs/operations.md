@@ -12,16 +12,22 @@ Use a matching local `choregos` CLI for offline replay and extraction.
   Secrets are environment-only and are not serialized into the configuration;
   saving is not a scrubber for secrets pasted into comments. Back up the file
   before manual edits, and stop the service while editing it outside the UI.
-- **`choregos.state.json`** holds learned identities and the newest 2000
-  decisions, newest last. It contains no live power or active-source state.
-  It is safe to delete while stopped: the ring is lost and identities must be
-  re-learned through interrogation or the next device wake. Restored identities
+- **`choregos.state.json`** version 2 holds learned identities, the newest 2000
+  decisions (newest last), and `next_decision_id`; version 1 is migrated in place.
+  It contains no live power or active-source state. Deleting it while stopped
+  loses the ring and id continuity; identities must be re-learned through
+  interrogation or the next device wake. Restored identities
   also need bus confirmation; confirmations older than 30 days are discarded.
 - **`cec-bus.<UTC date>.jsonl`** holds daily replay traces, including identity
   headers, CEC traffic/results, bridge availability, accepted commands and HA
   engine inputs. `[trace] keep_days` controls retention (default 30, range
   0–365; 0 disables capture). Startup and daily rollover prune old files.
   Trace write failures warn without stopping control.
+
+Decision ids are unique within a state-file lineage, not globally: after a crash
+or failed asynchronous writes, restart resumes from the last persisted counter.
+Deleting or restoring state can also reuse ids already present in traces or logs;
+correlate trace decision rows by `(ts, id)`, not by id alone.
 
 **The container runs as UID/GID 65532.** Both the directory and its files must
 be accessible to that user. A root-owned mode-0600 config causes `Permission
@@ -108,6 +114,7 @@ Copy the day's trace before retention removes it. Traces can contain private
 names and entities even though HA attributes are filtered: keep raw copies
 private. For a window spanning midnight, copy both files and pass them in
 chronological order. Replay is offline and never executes device actions.
+The `choregos/decision` trace topic preserves each creation row, including id, parent, trigger, structured actions and `would`; extraction keeps these rows, while replay ignores them and assigns fresh per-run ids to recomputed decisions.
 
 ```sh
 docker cp choregos:/config/cec-bus.2026-11-01.jsonl ./incident-private.jsonl
@@ -178,9 +185,12 @@ curl --fail --silent --show-error http://127.0.0.1:8095/healthz
 
 Check all health fields and the latest ring rows (`service_started`, resync and
 subsequent device transitions), not just Docker's healthy label. To roll back,
-restore the previous image tag and run `pull` plus `up -d` again. If configuration
-changed incompatibly, restore its matching backup while stopped with UID/GID
-65532 ownership. Recheck health and decisions after rollback.
+restore the previous image tag and run `pull` plus `up -d` again. When rolling
+back across the state-v2 migration, restore the matching `choregos.state.json`
+backup while stopped: the old image treats v2 as unknown and otherwise starts
+empty, losing identities and history. If configuration changed incompatibly,
+restore its matching backup too. Keep UID/GID 65532 ownership on restored files.
+Recheck health and decisions after rollback.
 
 ## Bridge swap / rename
 
