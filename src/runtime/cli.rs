@@ -296,67 +296,76 @@ fn write_extracted(
     Ok(())
 }
 
+/// Renames inside the ASCII operand of a Set OSD Name (`47`) frame; `None` when the
+/// operand is not decodable ASCII or no rename touched it.
+fn rename_osd_name(data: &str, renames: &[(String, String)]) -> anyhow::Result<Option<String>> {
+    let Ok(bytes) = hex::decode(&data[2..]) else {
+        return Ok(None);
+    };
+    if !bytes.is_ascii() {
+        return Ok(None);
+    }
+    let original = std::str::from_utf8(&bytes)?;
+    let mut name = original.to_owned();
+    for (old, new) in renames {
+        name = name.replace(old, new);
+    }
+    if name == original {
+        return Ok(None);
+    }
+    anyhow::ensure!(name.is_ascii(), "renamed Set OSD Name must be ASCII");
+    anyhow::ensure!(
+        name.len() < 15,
+        "renamed Set OSD Name exceeds 15-byte frame limit"
+    );
+    Ok(Some(format!("47{}", hex::encode_upper(name))))
+}
+
+fn rename_text(text: &mut String, renames: &[(String, String)]) -> anyhow::Result<()> {
+    // Some captures store an entire JSON payload inside a JSON string.
+    if let Ok(mut nested @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+        serde_json::from_str(text)
+    {
+        let before = nested.clone();
+        rename_strings(&mut nested, renames)?;
+        if nested != before {
+            *text = serde_json::to_string(&nested)?;
+        }
+        return Ok(());
+    }
+    for (old, new) in renames {
+        *text = text.replace(old, new);
+    }
+    Ok(())
+}
+
 fn rename_strings(
     value: &mut serde_json::Value,
     renames: &[(String, String)],
 ) -> anyhow::Result<()> {
     match value {
-        serde_json::Value::String(text) => {
-            // Some captures store an entire JSON payload inside a JSON string.
-            if let Ok(mut nested @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
-                serde_json::from_str(text)
-            {
-                let before = nested.clone();
-                rename_strings(&mut nested, renames)?;
-                if nested != before {
-                    *text = serde_json::to_string(&nested)?;
-                }
-            } else {
-                for (old, new) in renames {
-                    *text = text.replace(old, new);
-                }
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                rename_strings(value, renames)?;
-            }
-        }
+        serde_json::Value::String(text) => rename_text(text, renames),
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .try_for_each(|value| rename_strings(value, renames)),
         serde_json::Value::Object(values) => {
             for (key, value) in values {
-                if matches!(key.as_str(), "data" | "Data")
-                    && let Some(data) = value.as_str()
-                    && data.starts_with("47")
-                {
-                    let Ok(bytes) = hex::decode(&data[2..]) else {
-                        continue;
-                    };
-                    if !bytes.is_ascii() {
-                        continue;
-                    }
-                    let original = std::str::from_utf8(&bytes)?;
-                    let mut name = original.to_owned();
-                    for (old, new) in renames {
-                        if name.contains(old) {
-                            name = name.replace(old, new);
-                        }
-                    }
-                    if name != original {
-                        anyhow::ensure!(name.is_ascii(), "renamed Set OSD Name must be ASCII");
-                        anyhow::ensure!(
-                            name.len() < 15,
-                            "renamed Set OSD Name exceeds 15-byte frame limit"
-                        );
-                        *value = format!("47{}", hex::encode_upper(name)).into();
+                let osd_frame = matches!(key.as_str(), "data" | "Data")
+                    && value.as_str().is_some_and(|data| data.starts_with("47"));
+                if osd_frame {
+                    if let Some(renamed) =
+                        rename_osd_name(value.as_str().unwrap_or_default(), renames)?
+                    {
+                        *value = renamed.into();
                     }
                 } else if key != "ts" {
                     rename_strings(value, renames)?;
                 }
             }
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 pub fn replay(config: Config, text: &str, output: &mut impl Write) -> anyhow::Result<()> {
