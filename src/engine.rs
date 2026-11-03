@@ -317,12 +317,7 @@ impl Engine {
         self.now = now;
         self.wall = wall;
         self.trigger = DecisionTrigger::from_event(&event);
-        if self
-            .next_expectation_deadline()
-            .is_some_and(|deadline| deadline <= now)
-        {
-            self.evaluate_due_expectations(now);
-        }
+        self.settle_due_independent(now);
         let was_warming = self.warming;
         if self.warming && now >= self.warm_until {
             self.warming = false;

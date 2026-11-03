@@ -495,8 +495,13 @@ impl Engine {
 
     /// Expire independent evidence before an incoming late sample replaces it.
     /// Active CEC checks remain owned by the normal post-event timer pass.
-    pub(super) fn evaluate_due_expectations(&mut self, now: Instant) {
-        self.evaluate_expectations_inner(now, true);
+    pub(super) fn settle_due_independent(&mut self, now: Instant) {
+        if self
+            .next_expectation_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.evaluate_expectations_inner(now, true);
+        }
     }
 
     pub(super) fn evaluate_expectations(&mut self, now: Instant) {
@@ -519,48 +524,13 @@ impl Engine {
                 {
                     continue;
                 }
-                let progress = &mut pending.progress[index];
-                // Only current independent samples count: an unreachable sample
-                // replaces that source's earlier disagreement, not its truth.
-                let mut disagreement = progress.cec_disagreement_at.map(|latency_ms| Observation {
-                    value: "on",
-                    latency_ms,
-                });
-                for &via in &expectation.via {
-                    let Some(observation) = self.observation(pending.wall, expectation, via) else {
-                        continue;
-                    };
-                    if observation.value == expectation.expect {
-                        expectation.outcome = Outcome::Met {
-                            via,
-                            observed: observation.value.into(),
-                            latency_ms: observation.latency_ms,
-                        };
-                        break;
-                    } else if disagreement
-                        .is_none_or(|previous| observation.latency_ms >= previous.latency_ms)
-                    {
-                        disagreement = Some(observation);
-                    }
-                }
-                if expectation.outcome != Outcome::Pending {
-                    continue;
-                }
                 let expired = now >= pending.at + Duration::from_millis(expectation.deadline_ms);
-                if progress.cec_met && (!expectation.via.contains(&Via::Ps5) || expired) {
-                    expectation.outcome = Outcome::CecOnly {
-                        observed: expectation.expect.clone(),
-                    };
-                } else if expired {
-                    expectation.outcome = match disagreement {
-                        Some(observation) => Outcome::Missed {
-                            observed: observation.value.into(),
-                        },
-                        None => Outcome::Unknown {
-                            observed: progress.absent.then(|| "absent".into()),
-                        },
-                    };
-                }
+                self.evaluate_expectation(
+                    pending.wall,
+                    expectation,
+                    &pending.progress[index],
+                    expired,
+                );
             }
             if pending
                 .expectations
@@ -577,6 +547,52 @@ impl Engine {
             false
         });
         self.pending_decisions = decisions;
+    }
+
+    fn evaluate_expectation(
+        &self,
+        wall: DateTime<Utc>,
+        expectation: &mut Expectation,
+        progress: &ExpectationProgress,
+        expired: bool,
+    ) {
+        // Only current independent samples count: an unreachable sample
+        // replaces that source's earlier disagreement, not its truth.
+        let mut disagreement = progress.cec_disagreement_at.map(|latency_ms| Observation {
+            value: "on",
+            latency_ms,
+        });
+        for &via in &expectation.via {
+            let Some(observation) = self.observation(wall, expectation, via) else {
+                continue;
+            };
+            if observation.value == expectation.expect {
+                expectation.outcome = Outcome::Met {
+                    via,
+                    observed: observation.value.into(),
+                    latency_ms: observation.latency_ms,
+                };
+                return;
+            } else if disagreement
+                .is_none_or(|previous| observation.latency_ms >= previous.latency_ms)
+            {
+                disagreement = Some(observation);
+            }
+        }
+        if progress.cec_met && (!expectation.via.contains(&Via::Ps5) || expired) {
+            expectation.outcome = Outcome::CecOnly {
+                observed: expectation.expect.clone(),
+            };
+        } else if expired {
+            expectation.outcome = match disagreement {
+                Some(observation) => Outcome::Missed {
+                    observed: observation.value.into(),
+                },
+                None => Outcome::Unknown {
+                    observed: progress.absent.then(|| "absent".into()),
+                },
+            };
+        }
     }
 
     pub(super) fn cancel_cec_expectations(&mut self) {
