@@ -4511,6 +4511,389 @@ fn room_off_verdict_reports_achieved_and_missed_without_changing_intent() {
     }
 }
 
+fn room_off_after_confirmed_ha_on() -> (Engine, Instant, u64) {
+    let (mut engine, start, _) = verdict_wake();
+    std::sync::Arc::make_mut(&mut engine.config).tv.off = choregos::config::TvOffConfig::Webos {
+        host: "tv.example".into(),
+        port: 3001,
+        key_env: "CHOREGOS_TV_KEY".into(),
+    };
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 2000, tv, "on");
+    verdict_ha(&mut engine, start, 2100, receiver, "on");
+    verdict_event(
+        &mut engine,
+        start,
+        5000,
+        Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+    );
+    verdict_event(&mut engine, start, 8000, Event::Tick);
+    let id = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "off_timer_expired")
+        .unwrap()
+        .id;
+    (engine, start, id)
+}
+
+#[test]
+fn quick_rewake_cannot_reuse_ha_on_older_than_pending_room_off() {
+    let (mut engine, start, off_id) = room_off_after_confirmed_ha_on();
+    let actions = verdict_event(
+        &mut engine,
+        start,
+        20000,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    assert!(actions.contains(&Action::WakeTv));
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(wake.expectations[0].outcome, Outcome::Pending);
+    assert_eq!(
+        engine.expectations(off_id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+}
+
+#[test]
+fn quick_rewake_uses_newer_direct_off_instead_of_older_matching_ha_on() {
+    let (mut engine, start, off_id) = room_off_after_confirmed_ha_on();
+    verdict_event(
+        &mut engine,
+        start,
+        9000,
+        Event::TvPower {
+            state: TvState::Off,
+            at: wall() + chrono::Duration::milliseconds(9000),
+        },
+    );
+    engine.settle_expectations(start + Duration::from_millis(18000));
+    assert_eq!(
+        engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == off_id)
+            .unwrap()
+            .verdict,
+        Verdict::Partial
+    );
+    let actions = verdict_event(
+        &mut engine,
+        start,
+        20000,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    assert!(actions.contains(&Action::WakeTv));
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(wake.expectations[0].outcome, Outcome::Pending);
+}
+
+#[test]
+fn quick_room_off_cannot_reuse_ha_off_older_than_pending_wake() {
+    let (mut engine, start, wake_id) = verdict_wake();
+    let tv = engine.config.tv.entity.clone();
+    verdict_event(
+        &mut engine,
+        start,
+        300,
+        Event::HaState {
+            entity: tv,
+            state: "off".into(),
+            attrs: BTreeMap::new(),
+            changed: Some(wall() + chrono::Duration::milliseconds(50)),
+            updated: None,
+        },
+    );
+    verdict_event(
+        &mut engine,
+        start,
+        5000,
+        Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+    );
+    verdict_event(&mut engine, start, 8000, Event::Tick);
+    let off = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "off_timer_expired")
+        .unwrap();
+    assert_eq!(off.expectations[0].outcome, Outcome::Pending);
+    assert_eq!(
+        engine.expectations(wake_id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+}
+
+#[test]
+fn all_off_keeps_creation_met_rows_when_attaching_an_already_off_role() {
+    let (mut engine, start) = setup();
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.mode = Mode::Active;
+    config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
+        host: "console.example".into(),
+        port: 9302,
+    });
+    identify_atv(&mut engine, start);
+    frame(&mut engine, start, 8, 15, "84240004");
+    frame(&mut engine, start, 8, 15, "87080046");
+    frame(&mut engine, start, 8, 0, "47436F6E736F6C652042");
+    verdict_event(
+        &mut engine,
+        start,
+        100,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    verdict_event(
+        &mut engine,
+        start,
+        500,
+        Event::ConsolePower {
+            role: "streamer".into(),
+            state: choregos::state::ConsoleState::Standby,
+            at: wall() + chrono::Duration::milliseconds(500),
+        },
+    );
+    verdict_event(&mut engine, start, 1000, Event::Command(Command::AllOff));
+    let decision = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "all_off")
+        .unwrap();
+    let id = decision.id;
+    assert_eq!(decision.verdict, Verdict::Pending);
+    assert_eq!(decision.expectations.len(), 2);
+    let met = Outcome::Met {
+        via: Via::Ps5,
+        observed: "standby".into(),
+        latency_ms: 0,
+    };
+    assert_eq!(engine.expectations(id).unwrap().len(), 2);
+    assert_eq!(engine.expectations(id).unwrap()[0].outcome, met);
+    let deadline_ms = 1000
+        + engine.config.timing.takeover_settle_ms
+            * (u64::from(engine.config.timing.standby_retries) + 1);
+    engine.settle_expectations(start + Duration::from_millis(deadline_ms));
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Partial);
+    assert_eq!(update.expectations.len(), 2);
+    assert_eq!(update.expectations[0].outcome, met);
+    assert_eq!(update.expectations[1].subject, "role:console_b");
+    assert_eq!(
+        update.expectations[1].outcome,
+        Outcome::Unknown { observed: None }
+    );
+}
+
+#[test]
+fn room_off_accepts_only_recent_already_off_receiver_samples_at_creation() {
+    for age_ms in [1200, 10_000, 10_001] {
+        let (mut engine, start, _) = verdict_wake();
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 500, tv, "on");
+        verdict_ha(&mut engine, start, 600, receiver, "on");
+        verdict_event(
+            &mut engine,
+            start,
+            17000,
+            Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+        );
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_event(
+            &mut engine,
+            start,
+            19000,
+            Event::HaState {
+                entity: receiver,
+                state: "off".into(),
+                attrs: BTreeMap::new(),
+                changed: Some(wall() + chrono::Duration::milliseconds(20000 - age_ms)),
+                updated: Some(wall() + chrono::Duration::milliseconds(19000)),
+            },
+        );
+        verdict_event(&mut engine, start, 20000, Event::Tick);
+        let decision = engine
+            .decisions
+            .iter()
+            .find(|decision| decision.reason == "off_timer_expired")
+            .unwrap();
+        let id = decision.id;
+        let expected = if age_ms <= 10_000 {
+            Outcome::Met {
+                via: Via::Ha,
+                observed: "off".into(),
+                latency_ms: 0,
+            }
+        } else {
+            Outcome::Pending
+        };
+        assert_eq!(decision.expectations[1].outcome, expected, "age {age_ms}");
+        let tv = engine.config.tv.entity.clone();
+        verdict_ha(&mut engine, start, 21000, tv, "off");
+        if age_ms > 10_000 {
+            assert_eq!(
+                engine.expectations(id).unwrap()[1].outcome,
+                Outcome::Pending
+            );
+            engine.settle_expectations(start + Duration::from_millis(30_000));
+        }
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(
+            update.verdict,
+            if age_ms <= 10_000 {
+                Verdict::Achieved
+            } else {
+                Verdict::Partial
+            }
+        );
+        assert_eq!(
+            update.expectations[1].outcome,
+            if age_ms <= 10_000 {
+                expected
+            } else {
+                Outcome::Unknown { observed: None }
+            }
+        );
+    }
+}
+
+#[test]
+fn room_off_already_satisfied_independent_sources_achieve_at_creation() {
+    let (mut engine, start, _) = verdict_wake();
+    std::sync::Arc::make_mut(&mut engine.config).tv.off = choregos::config::TvOffConfig::Webos {
+        host: "tv.example".into(),
+        port: 3001,
+        key_env: "CHOREGOS_TV_KEY".into(),
+    };
+    verdict_event(
+        &mut engine,
+        start,
+        200,
+        Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+    );
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 2000, receiver, "off");
+    verdict_event(
+        &mut engine,
+        start,
+        2100,
+        Event::TvPower {
+            state: TvState::Off,
+            at: wall() + chrono::Duration::milliseconds(2100),
+        },
+    );
+    verdict_event(&mut engine, start, 3200, Event::Tick);
+    let decision = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "off_timer_expired")
+        .unwrap();
+    assert_eq!(decision.verdict, Verdict::Achieved);
+    for (expectation, via) in decision.expectations.iter().zip([Via::TvDirect, Via::Ha]) {
+        assert_eq!(
+            expectation.outcome,
+            Outcome::Met {
+                via,
+                observed: "off".into(),
+                latency_ms: 0
+            }
+        );
+    }
+    assert!(
+        engine
+            .verdicts
+            .iter()
+            .all(|update| update.id != decision.id)
+    );
+}
+
+#[test]
+fn already_standby_probe_settles_an_attached_command_expectation_at_creation() {
+    let (mut engine, start) = setup();
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.mode = Mode::Active;
+    config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
+        host: "console.example".into(),
+        port: 9302,
+    });
+    identify_atv(&mut engine, start);
+    verdict_event(
+        &mut engine,
+        start,
+        100,
+        Event::ConsolePower {
+            role: "streamer".into(),
+            state: choregos::state::ConsoleState::Standby,
+            at: wall() + chrono::Duration::milliseconds(100),
+        },
+    );
+    verdict_event(
+        &mut engine,
+        start,
+        1000,
+        Event::Command(Command::Standby("streamer".into())),
+    );
+    let decision = engine
+        .decisions
+        .iter()
+        .find(|row| !row.expectations.is_empty())
+        .unwrap();
+    assert_eq!(decision.verdict, Verdict::Achieved);
+    assert_eq!(
+        decision.expectations[0].outcome,
+        Outcome::Met {
+            via: Via::Ps5,
+            observed: "standby".into(),
+            latency_ms: 0
+        }
+    );
+}
+
+#[test]
+fn already_standby_cec_never_presettles_a_command_expectation() {
+    let (mut engine, start) = setup();
+    std::sync::Arc::make_mut(&mut engine.config).mode = Mode::Active;
+    identify_atv(&mut engine, start);
+    verdict_event(
+        &mut engine,
+        start,
+        100,
+        Event::Frame(Frame::from_hex(4, 0, "9001").unwrap()),
+    );
+    verdict_event(
+        &mut engine,
+        start,
+        1000,
+        Event::Command(Command::Standby("streamer".into())),
+    );
+    let decision = engine
+        .decisions
+        .iter()
+        .find(|row| !row.expectations.is_empty())
+        .unwrap();
+    assert_eq!(decision.verdict, Verdict::Pending);
+    assert_eq!(decision.expectations[0].via, vec![Via::Cec]);
+    assert_eq!(decision.expectations[0].outcome, Outcome::Pending);
+}
+
 #[test]
 fn source_selection_expectation_requires_a_new_ha_source_observation() {
     let (mut engine, start, wake) = verdict_wake();

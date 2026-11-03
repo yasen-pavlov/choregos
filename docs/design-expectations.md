@@ -112,6 +112,23 @@ CEC retry sequence exhausts; this does not extend or reschedule CEC retries.
 
 
 
+## Evaluation
+
+At creation, an expectation settles `met` with `latency_ms: 0` if the newest
+sample before the decision across its listed independent sources (`ha`,
+`tv_direct`, or `ps5`, never `cec`) matches and is timestamped in
+`[decision.at - deadline_ms, decision.at)`. A newer disagreeing sample blocks
+an older match. The sample must also be newer than every still-pending
+decision carrying an expectation on the same subject and field, preventing
+evidence predating an unresolved command from satisfying a later action.
+The deadline bounds sample age, not room-cycle duration. HA uses `changed`
+for power/playback and `updated` for source attributes; direct sources use
+their timestamps.
+If every expectation is already satisfied, the decision is `achieved` at
+creation. CEC still requires fresh evidence at its due verification check.
+Otherwise evaluation and deadline freshness remain unchanged: observations
+arriving after creation must be newer than the decision, not merely recent.
+
 Deadlines are per-field config under `[verify]` with the defaults above;
 calibration may change the defaults in a later release, not the schema.
 The TV default is a 45-second observation window: HA can reconnect 20–33 s
