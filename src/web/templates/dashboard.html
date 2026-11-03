@@ -49,7 +49,7 @@
       <strong>{% if let Some(name) = active_name %}{{ name }}{% else %}<span class="dim">none</span>{% endif %}</strong>
       <span class="bridge-detail" title="What Choregos intends the room to be; observations are compared against it">· intent {{ snapshot.intent.power }}{% if let Some(role) = snapshot.intent.active_role %} / {{ role }}{% endif %}</span>
       {% if let Some((state, at)) = snapshot.tv_direct %}
-      <span class="bridge-detail" title="TV power as reported directly by the TV, independent of Home Assistant">· tv direct {{ state }} {{ view::since(at) }}</span>
+      <span class="bridge-detail" title="Answered by the TV's own webOS service, the earliest LAN signal after a wake (Home Assistant follows ~10 s later)">· tv (webOS) {{ state }} {{ view::since(at) }}</span>
       {% endif %}
     </div>
     <div class="group end">

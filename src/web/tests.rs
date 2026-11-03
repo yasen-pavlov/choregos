@@ -1038,7 +1038,7 @@ async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
     assert!(!status.contains("warming"));
     assert!(status.contains("conn up\" title=\"MQTT connected"));
     assert!(html.contains("intent on / streamer"));
-    assert!(html.contains("tv direct on"));
+    assert!(html.contains("tv (webOS) on"));
     for id in [
         "mode-shadow",
         "mode-active",

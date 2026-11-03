@@ -9,6 +9,16 @@ can be attached to a decision after the fact. This phase closes the loop:
 Reporting only. Nothing in this phase sends an action because a verdict was
 `missed`.
 
+## What `tv_direct` measures
+
+Observed 2026-11-03 on three cold wakes: after the WoL frame the TV's webOS
+service answers `unreachable` for 15–19 s (TCP connect fails while the set
+boots), then `on`; Home Assistant's webostv integration follows 8–11 s later.
+The set itself takes roughly 20 s from WoL to picture (operator estimate, not
+measured), so `tv_direct` is the closest LAN-observable proxy for "picture on"
+and HA is the laggard. The dashboard labels it "tv (webOS)" because it is the service, not the
+panel, that answers.
+
 ## Measured baseline (ring + traces, 2026-10-31 → 11-02)
 
 | expectation | n | p50 | p90 | max | source |
@@ -65,7 +75,7 @@ Latency on the verdict = the slowest `met` expectation.
 
 | decision | expectations (subject.field = expect, via, default deadline) |
 | --- | --- |
-| off→on transition (wake) | `tv.power = on` only if `WakeTv` was sent (tv_direct, ha; 45 s) · `receiver.power = on` only if `turn_on` was sent (ha; 10 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` only for stopped CEC policies with verification enabled or any stopped role with a probe (`takeover_settle_ms × (standby_retries + 1)`; source policy below) |
+| off→on transition (wake) | `tv.power = on` only if `WakeTv` was sent (tv_direct, ha; 45 s) · `receiver.power = on` only if `turn_on` was sent (ha; 10 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` only for stopped CEC policies with verification enabled or any stopped role with a probe (CEC retry window, probe poll window, or their maximum; source policy below) |
 | `takeover_settled` | `receiver.source = <role source>` if `select_source` was sent (ha; 10 s). Preset scripts have no observable → no expectation. |
 | `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct, ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (ha; 10 s) |
 | `all_off`, `manual_standby` | Same standby eligibility: CEC policies with verification enabled, or probe-only for a stopped role with a probe; no CEC expectation for HA media-stop/none policies |
@@ -94,6 +104,12 @@ The original CEC verification slot remains independent of the expectation:
 it is removed only at its due cancellation/confirmation/exhaustion check,
 and retries schedule `now + settle`. A verdict must never change suppression
 of `90 xx`, the retry sequence, or the lifetime of that slot.
+Standby deadlines follow the enabled legs: `[cec]` uses
+`takeover_settle_ms × (standby_retries + 1)`, `[ps5]` uses
+`verify.probe_window_s × 1000`, and `[ps5, cec]` uses the maximum.
+The probe therefore retains its full configured observation window after the
+CEC retry sequence exhausts; this does not extend or reschedule CEC retries.
+
 
 
 Deadlines are per-field config under `[verify]` with the defaults above;
@@ -209,8 +225,12 @@ can ship as one release, 4 after a few days of verdicts.
 - Independent sources' fresh matches meet immediately, even after another
   source disagreed or became unreachable. CEC success comes only from the
   verification confirmed branch, never raw bus lookup; checked success keeps
-  the probe wait and survives later cancellation. Retain disagreements only
-  for missed observations.
+  the probe wait and survives later cancellation. Independent disagreements
+  are derived from each source's current sample, not retained across samples.
+  Direct Unreachable and HA unavailable/unknown clear that source's earlier
+  disagreement without confirming or refuting. At the deadline, the newest
+  current usable sample newer than the decision supplies `missed.observed`;
+  if no such sample or checked CEC evidence exists, settle unknown.
 - `cec_only` requires a checked CEC confirmation for roles permitting verification.
   Opted-out roles without a probe contribute no expectation; with a probe they
   accept only independent evidence. CEC On is not a refutation for them.
