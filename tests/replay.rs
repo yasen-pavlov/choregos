@@ -1,5 +1,5 @@
 use choregos::{
-    action::{Action, IdentifyQueries, TimerKind, Trigger},
+    action::{Action, Expectation, IdentifyQueries, Outcome, TimerKind, Trigger, Verdict, Via},
     cec::Frame,
     config::{Config, Takeover},
     engine::{Engine, Event},
@@ -54,6 +54,7 @@ fn ha(
             state: state.into(),
             attrs: BTreeMap::new(),
             changed,
+            updated: None,
         },
         now,
         wall(),
@@ -245,6 +246,24 @@ fn assert_no_standby_decision(engine: &Engine, role: &str) {
     }));
 }
 
+fn standby_expectation<'a>(engine: &'a Engine, role: &str) -> &'a Expectation {
+    (1..engine.next_decision_id)
+        .rev()
+        .filter_map(|id| engine.expectations(id))
+        .flat_map(|expectations| expectations.iter())
+        .find(|expectation| expectation.subject.strip_prefix("role:") == Some(role))
+        .expect("standby expectation")
+}
+
+fn assert_standby_unknown(engine: &Engine, role: &str, absent: bool) {
+    assert_eq!(
+        standby_expectation(engine, role).outcome,
+        Outcome::Unknown {
+            observed: absent.then(|| "absent".into()),
+        }
+    );
+}
+
 #[test]
 fn takeover_retries_unconfirmed_standby_in_order_then_expires() {
     let (mut engine, takeover, settle) = takeover_from_streamer();
@@ -266,13 +285,7 @@ fn takeover_retries_unconfirmed_standby_in_order_then_expires() {
     for attempt in 1..=retries {
         let now = takeover + settle * u32::from(attempt);
         let actions = engine.handle(Event::Tick, now, wall());
-        let decision = engine
-            .decisions
-            .iter()
-            .find(|decision| decision.reason == "standby_retry")
-            .unwrap();
-        assert_eq!(decision.role.as_deref(), Some("streamer"));
-        assert_eq!(decision.actions, expected);
+        assert_eq!(standby_expectation(&engine, "streamer").attempts, attempt);
         assert!(actions.windows(2).any(|pair| pair == expected));
         if attempt == 1 {
             assert_eq!(engine.next_deadline(), Some(now + settle));
@@ -280,13 +293,7 @@ fn takeover_retries_unconfirmed_standby_in_order_then_expires() {
     }
     let exhausted = takeover + settle * (u32::from(retries) + 1);
     engine.handle(Event::Tick, exhausted, wall());
-    let decision = engine
-        .decisions
-        .iter()
-        .find(|decision| decision.reason == "standby_unconfirmed")
-        .unwrap();
-    assert_eq!(decision.role.as_deref(), Some("streamer"));
-    assert!(decision.actions.is_empty());
+    assert_standby_unknown(&engine, "streamer", false);
     engine.handle(Event::Tick, exhausted + settle, wall());
     assert_no_standby_decision(&engine, "streamer");
 }
@@ -420,12 +427,10 @@ fn exhaust_standby_with_results(results: &[(u8, u8, bool)]) -> Engine {
             wall(),
         );
         if attempt < engine.config.timing.standby_retries {
-            let retry = engine
-                .decisions
-                .iter()
-                .find(|decision| decision.reason == "standby_retry")
-                .unwrap();
-            assert_eq!(retry.actions.len(), 2);
+            assert_eq!(
+                standby_expectation(&engine, "streamer").attempts,
+                attempt + 1
+            );
         }
     }
     engine
@@ -434,39 +439,27 @@ fn exhaust_standby_with_results(results: &[(u8, u8, bool)]) -> Engine {
 #[test]
 fn all_nacked_standby_frames_record_target_absent_after_bounded_retries() {
     let engine = exhaust_standby_with_results(&[(4, 0x36, false), (4, 0x8f, false)]);
-    let decision = engine
-        .decisions
-        .iter()
-        .find(|decision| decision.reason == "standby_target_absent")
-        .unwrap();
-    assert_eq!(decision.role.as_deref(), Some("streamer"));
-    assert!(decision.actions.is_empty());
+    assert_standby_unknown(&engine, "streamer", true);
     assert_eq!(engine.bus.entries[&4].power, BusPower::On);
 }
 
 #[test]
 fn mixed_ack_standby_frames_without_power_report_remain_unconfirmed() {
     let engine = exhaust_standby_with_results(&[(4, 0x36, false), (4, 0x8f, true)]);
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
-    }));
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
 fn send_results_for_other_las_and_opcodes_do_not_count_as_standby_nacks() {
     let engine =
         exhaust_standby_with_results(&[(8, 0x36, false), (8, 0x8f, false), (4, 0x83, false)]);
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
-    }));
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
 fn missing_standby_send_results_do_not_imply_absence() {
     let engine = exhaust_standby_with_results(&[(4, 0x36, false)]);
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
-    }));
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
@@ -495,9 +488,7 @@ fn repeated_standby_with_stale_nacks_still_records_target_absent() {
         );
     }
     engine.handle(Event::Tick, stopped + settle, wall());
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_target_absent"
-    }));
+    assert_standby_unknown(&engine, "streamer", true);
 }
 
 #[test]
@@ -505,9 +496,7 @@ fn resync_nacks_during_verification_never_override_an_observed_ack() {
     // The extra 8F NACK belongs to resync, not to the pending standby pair.
     let engine =
         exhaust_standby_with_results(&[(4, 0x36, true), (4, 0x8f, false), (4, 0x8f, false)]);
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
-    }));
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
@@ -597,13 +586,7 @@ fn pause_standby_takeover_retries_the_entire_directed_sequence() {
         .filter(|action| matches!(action, Action::CecSend { .. }))
         .collect();
     assert_eq!(sent, streamer_stop_actions(Takeover::CecPauseStandby));
-    let retry = engine
-        .decisions
-        .iter()
-        .find(|decision| decision.reason == "standby_retry")
-        .unwrap();
-    assert_eq!(retry.role.as_deref(), Some("streamer"));
-    assert_eq!(retry.actions, sent);
+    assert_eq!(standby_expectation(&engine, "streamer").attempts, 1);
 }
 
 #[test]
@@ -712,14 +695,7 @@ fn pause_standby_nack_accounting_counts_all_three_frames_per_round() {
                 wall(),
             );
         }
-        let reason = if missing.is_none() {
-            "standby_target_absent"
-        } else {
-            "standby_unconfirmed"
-        };
-        assert!(engine.decisions.iter().any(|decision| {
-            decision.role.as_deref() == Some("streamer") && decision.reason == reason
-        }));
+        assert_standby_unknown(&engine, "streamer", missing.is_none());
     }
 }
 
@@ -766,15 +742,7 @@ fn pause_standby_acked_standby_without_power_report_remains_unconfirmed() {
         );
     }
     assert_eq!(engine.bus.entries[&4].power, BusPower::On);
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer") && decision.reason == "standby_unconfirmed"
-    }));
-    assert!(
-        !engine
-            .decisions
-            .iter()
-            .any(|decision| { decision.reason == "standby_target_absent" })
-    );
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
@@ -802,7 +770,7 @@ fn all_off_uses_the_same_standby_verification() {
             },
         ]
     );
-    assert_eq!(engine.decisions[0].reason, "standby_retry");
+    assert_eq!(standby_expectation(&engine, "streamer").attempts, 1);
 }
 
 #[test]
@@ -846,9 +814,7 @@ fn silent_role_woken_only_by_physical_address_is_not_assumed_in_standby() {
             },
         ]
     }));
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("console_a") && decision.reason == "standby_retry"
-    }));
+    assert_eq!(standby_expectation(&engine, "console_a").attempts, 1);
 }
 
 #[test]
@@ -876,19 +842,19 @@ fn standby_verification_cancels_blocked_and_remapped_roles() {
 #[test]
 fn zero_standby_retries_records_unconfirmed_without_resending() {
     let (mut engine, takeover, settle) = takeover_from_streamer();
-    std::sync::Arc::make_mut(&mut engine.config)
-        .timing
-        .standby_retries = 0;
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.timing.standby_retries = 0;
+    engine.handle(
+        Event::Command(Command::Standby("streamer".into())),
+        takeover,
+        wall(),
+    );
     let actions = engine.handle(Event::Tick, takeover + settle, wall());
     assert!(!actions.contains(&Action::CecSend {
         to: 4,
         data: vec![0x36],
     }));
-    assert!(engine.decisions.iter().any(|decision| {
-        decision.role.as_deref() == Some("streamer")
-            && decision.reason == "standby_unconfirmed"
-            && decision.actions.is_empty()
-    }));
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
@@ -903,14 +869,7 @@ fn new_standby_replaces_pending_verification_for_same_address() {
     engine.handle(Event::Tick, takeover + settle, wall());
     assert_no_standby_decision(&engine, "streamer");
     engine.handle(Event::Tick, stopped + settle, wall());
-    assert_eq!(
-        engine
-            .decisions
-            .iter()
-            .filter(|decision| decision.reason == "standby_retry")
-            .count(),
-        1
-    );
+    assert_eq!(standby_expectation(&engine, "streamer").attempts, 1);
 }
 
 #[test]
@@ -959,9 +918,7 @@ fn verification_power_on_reply_never_takes_back_the_room_or_buffers_a_wake() {
             data: vec![0x36],
         }));
         assert_eq!(engine.roles["console_a"].power, RolePower::On);
-        assert!(engine.decisions.iter().any(|decision| {
-            decision.role.as_deref() == Some("streamer") && decision.reason == "standby_retry"
-        }));
+        assert_eq!(standby_expectation(&engine, "streamer").attempts, 2);
     }
 }
 
@@ -1177,6 +1134,7 @@ fn preset_uses_injected_timezone_and_existing_receiver_source_is_preserved() {
             state: "on".into(),
             attrs,
             changed: None,
+            updated: None,
         },
         now,
         wall(),
@@ -1535,6 +1493,7 @@ fn ha_changed_prefers_ha_then_stamps_transitions_but_not_attribute_updates() {
             state: "off".into(),
             attrs: attrs.clone(),
             changed: None,
+            updated: None,
         },
         now,
         wall() + chrono::Duration::seconds(1),
@@ -2914,32 +2873,25 @@ fn logical_address_move_retargets_pending_standby_without_replaying_wake() {
             },
         ]
     );
-    let retry_row = engine
-        .decisions
-        .iter()
-        .find(|decision| decision.reason == "standby_retry")
-        .unwrap();
-    assert_eq!(retry_row.parent, Some(stopping_id));
-    assert!(retry_row.id > stopping_id);
-    assert_eq!(
-        retry_row.trigger,
-        Trigger::Timer {
-            name: TimerKind::StandbyVerification
-        }
-    );
-    let retry_id = retry_row.id;
+    assert_eq!(engine.expectations(stopping_id).unwrap()[0].attempts, 1);
     frame(&mut engine, retry_at, 11, 0, "9000");
     assert_eq!(engine.roles["console_b"].power, RolePower::Off);
     frame(&mut engine, retry_at, 11, 0, "9001");
     let after = retry_at + Duration::from_millis(engine.config.timing.takeover_settle_ms);
     let actions = engine.handle(Event::Tick, after, wall());
+    assert_eq!(engine.verdicts[0].id, stopping_id);
+    assert_eq!(engine.verdicts[0].verdict, Verdict::Achieved);
+    assert!(matches!(
+        engine.verdicts[0].expectations[0].outcome,
+        Outcome::CecOnly { .. }
+    ));
     assert!(
         actions
             .iter()
             .all(|action| !matches!(action, Action::CecSend { .. }))
     );
     assert_no_standby_decision(&engine, "console_b");
-    assert!(engine.next_decision_id > retry_id);
+    assert!(engine.next_decision_id > stopping_id);
 }
 
 #[test]
@@ -3080,15 +3032,7 @@ fn retarget_after_last_standby_retry_clears_old_address_send_accounting() {
             "84240004",
         );
         engine.handle(Event::Tick, last_retry + settle, wall());
-        assert_eq!(
-            engine
-                .decisions
-                .iter()
-                .filter(|decision| decision.role.as_deref() == Some("console_b"))
-                .map(|decision| decision.reason.as_str())
-                .collect::<Vec<_>>(),
-            vec!["standby_unconfirmed"]
-        );
+        assert_standby_unknown(&engine, "console_b", false);
     }
 }
 
@@ -3217,15 +3161,7 @@ fn retargeted_standby_does_not_keep_old_address_acknowledgements() {
         }
     }
     engine.handle(Event::Tick, now + settle * (u32::from(retries) + 1), wall());
-    assert_eq!(
-        engine
-            .decisions
-            .iter()
-            .filter(|decision| decision.role.as_deref() == Some("console_b"))
-            .map(|decision| decision.reason.as_str())
-            .collect::<Vec<_>>(),
-        vec!["standby_target_absent"]
-    );
+    assert_standby_unknown(&engine, "console_b", true);
 }
 
 fn console_physical_change_config() -> Config {
@@ -3594,15 +3530,7 @@ fn native_transport_failures_neither_ack_nor_establish_target_absence() {
                     wall(),
                 );
             }
-            let reason = if later_nacks {
-                "standby_target_absent"
-            } else {
-                "standby_unconfirmed"
-            };
-            assert!(
-                engine.decisions.iter().any(|d| d.reason == reason),
-                "{status:?} {reason}"
-            );
+            assert_standby_unknown(&engine, "streamer", later_nacks);
         }
     }
 }
@@ -3836,7 +3764,7 @@ fn decision_ids_are_monotonic_and_triggers_identify_inputs_and_due_timers() {
 }
 
 #[test]
-fn standby_followups_keep_the_wake_decision_parent_across_retries() {
+fn standby_expectation_stays_on_the_wake_decision_across_retries() {
     let (mut engine, takeover, settle) = takeover_from_streamer();
     let wake = engine
         .decisions
@@ -3851,30 +3779,28 @@ fn standby_followups_keep_the_wake_decision_parent_across_retries() {
     );
     for round in 1..=u32::from(engine.config.timing.standby_retries) + 1 {
         engine.handle(Event::Tick, takeover + settle * round, wall());
+        assert_no_standby_decision(&engine, "streamer");
         for followup in &engine.decisions {
-            if followup.reason.starts_with("standby_") {
-                assert_eq!(followup.parent, Some(parent));
-                assert_eq!(
-                    followup.trigger,
-                    Trigger::Timer {
-                        name: TimerKind::StandbyVerification
-                    }
-                );
-            } else if followup.reason == "takeover_settled" {
+            if followup.reason == "takeover_settled" {
                 assert_eq!(followup.parent, Some(parent));
             }
         }
+        assert_eq!(
+            engine
+                .expectations(parent)
+                .unwrap()
+                .iter()
+                .find(|expectation| expectation.subject == "role:streamer")
+                .unwrap()
+                .attempts,
+            round.min(u32::from(engine.config.timing.standby_retries)) as u8
+        );
     }
-    assert!(
-        engine
-            .decisions
-            .iter()
-            .any(|decision| decision.reason == "standby_unconfirmed")
-    );
+    assert_standby_unknown(&engine, "streamer", false);
 }
 
 #[test]
-fn mixed_all_off_never_parents_an_off_roles_verification_to_another_role() {
+fn mixed_all_off_attaches_every_dispatched_stop_to_the_command_decision() {
     let (mut engine, now) = console_before_address_move();
     engine.handle(Event::Command(Command::SetMode(Mode::Active)), now, wall());
     engine.handle(
@@ -3896,22 +3822,17 @@ fn mixed_all_off_never_parents_an_off_roles_verification_to_another_role() {
     let stopping_id = stop.id;
     let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
     engine.handle(Event::Tick, now + settle, wall());
-    let console = engine
-        .decisions
-        .iter()
-        .find(|decision| {
-            decision.reason == "standby_retry" && decision.role.as_deref() == Some("console_b")
-        })
-        .unwrap();
-    assert_eq!(console.parent, None);
-    let streamer = engine
-        .decisions
-        .iter()
-        .find(|decision| {
-            decision.reason == "standby_retry" && decision.role.as_deref() == Some("streamer")
-        })
-        .unwrap();
-    assert_eq!(streamer.parent, Some(stopping_id));
+    let expectations = engine.expectations(stopping_id).unwrap();
+    for role in ["streamer", "console_b"] {
+        assert_eq!(
+            expectations
+                .iter()
+                .find(|expectation| expectation.subject.strip_prefix("role:") == Some(role))
+                .unwrap()
+                .attempts,
+            1
+        );
+    }
 }
 
 #[test]
@@ -3962,16 +3883,33 @@ fn warmup_boundary_preserves_command_trigger_and_does_not_claim_buffered_role_ro
                         name: TimerKind::Warmup
                     })
     );
-    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
-    engine.handle(Event::Tick, now + settle, wall());
-    let retry = engine
+    let command = engine
         .decisions
         .iter()
-        .find(|decision| {
-            decision.reason == "standby_retry" && decision.role.as_deref() == Some("console_b")
-        })
+        .find(|decision| decision.reason == "command_standby")
         .unwrap();
-    assert_eq!(retry.parent, None);
+    assert_eq!(
+        command.actions,
+        vec![
+            Action::CecSend {
+                to: 8,
+                data: vec![0x36]
+            },
+            Action::CecSend {
+                to: 8,
+                data: vec![0x8f]
+            }
+        ]
+    );
+    assert!(
+        command
+            .expectations
+            .iter()
+            .any(|expectation| expectation.subject == "role:console_b")
+    );
+    let settle = Duration::from_millis(engine.config.timing.takeover_settle_ms);
+    engine.handle(Event::Tick, now + settle, wall());
+    assert_no_standby_decision(&engine, "console_b");
 
     // Early completion by an unrelated device's reply is still warmup, not
     // evidence that this reply itself woke the buffered role.
@@ -4238,4 +4176,1127 @@ fn config_reload_discards_all_direct_observations_without_a_bridge_change() {
     engine.handle(Event::ConfigReloaded(engine.config.clone()), now, wall());
     assert_eq!(engine.tv_direct, None);
     assert!(engine.roles.values().all(|role| role.direct.is_none()));
+}
+
+fn verdict_event(engine: &mut Engine, start: Instant, ms: u64, event: Event) -> Vec<Action> {
+    engine.handle(
+        event,
+        start + Duration::from_millis(ms),
+        wall() + chrono::Duration::milliseconds(ms as i64),
+    )
+}
+
+fn verdict_ha(engine: &mut Engine, start: Instant, ms: u64, entity: String, state: &str) {
+    verdict_event(
+        engine,
+        start,
+        ms,
+        Event::HaState {
+            entity,
+            state: state.into(),
+            attrs: BTreeMap::new(),
+            changed: Some(wall() + chrono::Duration::milliseconds(ms as i64)),
+            updated: None,
+        },
+    );
+}
+
+fn verdict_wake() -> (Engine, Instant, u64) {
+    let (mut engine, start) = setup();
+    identify_atv(&mut engine, start);
+    verdict_event(
+        &mut engine,
+        start,
+        0,
+        Event::Command(Command::SetMode(Mode::Active)),
+    );
+    verdict_event(
+        &mut engine,
+        start,
+        100,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    let id = engine.decisions.last().unwrap().id;
+    (engine, start, id)
+}
+
+#[test]
+fn wake_verdict_achieves_with_fresh_ha_and_records_latency() {
+    let (mut engine, start, id) = verdict_wake();
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    // A retained pre-decision On is not evidence of this wake.
+    verdict_event(
+        &mut engine,
+        start,
+        200,
+        Event::HaState {
+            entity: tv.clone(),
+            state: "on".into(),
+            attrs: BTreeMap::new(),
+            changed: Some(wall()),
+            updated: None,
+        },
+    );
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    verdict_ha(&mut engine, start, 1000, receiver, "on");
+    verdict_ha(&mut engine, start, 1500, tv, "on");
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Achieved);
+    assert_eq!(
+        update.expectations[0].outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            observed: "on".into(),
+            latency_ms: 1400
+        }
+    );
+    assert_eq!(
+        update.expectations[1].outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            observed: "on".into(),
+            latency_ms: 900
+        }
+    );
+}
+
+#[test]
+fn wake_verdict_is_partial_when_receiver_never_reports_on() {
+    let (mut engine, start, id) = verdict_wake();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 1000, tv, "on");
+    verdict_event(&mut engine, start, 10100, Event::Tick);
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Partial);
+    assert_eq!(
+        update.expectations[1].outcome,
+        Outcome::Unknown { observed: None }
+    );
+}
+
+#[test]
+fn direct_tv_observation_wins_before_ha_and_ha_only_configuration_excludes_it() {
+    for direct in [true, false] {
+        let (mut engine, start, id) = verdict_wake();
+        if !direct {
+            // Change the transport before creating a fresh wake, through a reload.
+            let mut config = (*engine.config).clone();
+            config.tv.off = choregos::config::TvOffConfig::Ha;
+            verdict_event(
+                &mut engine,
+                start,
+                200,
+                Event::ConfigReloaded(std::sync::Arc::new(config)),
+            );
+            assert_eq!(
+                engine.expectations(id).unwrap()[0].outcome,
+                Outcome::Unknown { observed: None }
+            );
+            verdict_event(
+                &mut engine,
+                start,
+                4000,
+                Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+            );
+            verdict_event(
+                &mut engine,
+                start,
+                4100,
+                Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+            );
+            let expectation = &engine.decisions.last().unwrap().expectations[0];
+            assert_eq!(expectation.via, vec![Via::Ha]);
+            continue;
+        }
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 500, receiver, "on");
+        verdict_event(
+            &mut engine,
+            start,
+            600,
+            Event::TvPower {
+                state: TvState::On,
+                at: wall() + chrono::Duration::milliseconds(600),
+            },
+        );
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(update.verdict, Verdict::Achieved);
+        assert_eq!(
+            update.expectations[0].outcome,
+            Outcome::Met {
+                via: Via::TvDirect,
+                observed: "on".into(),
+                latency_ms: 500
+            }
+        );
+    }
+}
+
+#[test]
+fn takeover_standby_uses_independent_console_evidence_or_honest_cec_only() {
+    for direct in [true, false] {
+        let (mut engine, start) = setup();
+        let config = std::sync::Arc::make_mut(&mut engine.config);
+        config.mode = Mode::Active;
+        config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
+            host: "console.example".into(),
+            port: 9302,
+        });
+        identify_atv(&mut engine, start);
+        verdict_event(
+            &mut engine,
+            start,
+            100,
+            Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+        );
+        verdict_event(
+            &mut engine,
+            start,
+            1000,
+            Event::Frame(Frame::from_hex(8, 15, "84230004").unwrap()),
+        );
+        let id = engine.decisions.last().unwrap().id;
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 1100, tv, "on");
+        verdict_ha(&mut engine, start, 1200, receiver, "on");
+        verdict_event(
+            &mut engine,
+            start,
+            1300,
+            Event::Frame(Frame::from_hex(4, 0, "9001").unwrap()),
+        );
+        // CEC cannot prematurely hide the independent probe's result.
+        assert_eq!(
+            standby_expectation(&engine, "streamer").outcome,
+            Outcome::Pending
+        );
+        if direct {
+            verdict_event(
+                &mut engine,
+                start,
+                1400,
+                Event::ConsolePower {
+                    role: "streamer".into(),
+                    state: choregos::state::ConsoleState::Standby,
+                    at: wall() + chrono::Duration::milliseconds(1400),
+                },
+            );
+        } else {
+            verdict_event(&mut engine, start, 7000, Event::Tick);
+        }
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(update.verdict, Verdict::Achieved);
+        let outcome = &update
+            .expectations
+            .iter()
+            .find(|expectation| expectation.subject == "role:streamer")
+            .unwrap()
+            .outcome;
+        if direct {
+            assert!(matches!(outcome, Outcome::Met { via: Via::Ps5, .. }));
+        } else {
+            assert!(matches!(outcome, Outcome::CecOnly { observed } if observed == "standby"));
+        }
+    }
+}
+
+#[test]
+fn displaced_role_reporting_on_misses_after_the_final_retry() {
+    let (mut engine, takeover, settle) = takeover_from_streamer();
+    for round in 1..=u32::from(engine.config.timing.standby_retries) + 1 {
+        frame(
+            &mut engine,
+            takeover + settle * round - Duration::from_millis(1),
+            4,
+            0,
+            "9000",
+        );
+        engine.handle(Event::Tick, takeover + settle * round, wall());
+    }
+    let expectation = standby_expectation(&engine, "streamer");
+    assert_eq!(expectation.attempts, engine.config.timing.standby_retries);
+    assert_eq!(
+        expectation.outcome,
+        Outcome::Missed {
+            observed: "on".into()
+        }
+    );
+}
+
+#[test]
+fn non_verifying_roles_without_probes_contribute_no_standby_expectations() {
+    for report in [false, true] {
+        let (mut engine, stopped, settle) = stop_non_verifying_console(Takeover::CecStandby, false);
+        if report {
+            frame(
+                &mut engine,
+                stopped + Duration::from_millis(1),
+                8,
+                0,
+                "9001",
+            );
+        }
+        engine.handle(Event::Tick, stopped + settle * 3, wall());
+        assert!(
+            (1..engine.next_decision_id)
+                .filter_map(|id| engine.expectations(id))
+                .flatten()
+                .all(|expectation| expectation.subject != "role:console_a")
+        );
+    }
+}
+
+#[test]
+fn room_off_verdict_reports_achieved_and_missed_without_changing_intent() {
+    for reached in [true, false] {
+        let (mut engine, start, _) = verdict_wake();
+        verdict_event(
+            &mut engine,
+            start,
+            200,
+            Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+        );
+        verdict_event(&mut engine, start, 3200, Event::Tick);
+        let id = engine
+            .decisions
+            .iter()
+            .find(|decision| decision.reason == "off_timer_expired")
+            .unwrap()
+            .id;
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        let value = if reached { "off" } else { "on" };
+        verdict_ha(&mut engine, start, 4000, tv, value);
+        verdict_ha(&mut engine, start, 4100, receiver, value);
+        if !reached {
+            let deadline = 3200 + engine.config.verify.tv_s * 1000;
+            verdict_event(&mut engine, start, deadline, Event::Tick);
+        }
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(
+            update.verdict,
+            if reached {
+                Verdict::Achieved
+            } else {
+                Verdict::Missed
+            }
+        );
+        assert_eq!(engine.intent.power, RoomPower::Off);
+    }
+}
+
+#[test]
+fn source_selection_expectation_requires_a_new_ha_source_observation() {
+    let (mut engine, start, wake) = verdict_wake();
+    verdict_event(&mut engine, start, 2100, Event::Tick);
+    let decision = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "takeover_settled")
+        .unwrap();
+    assert_eq!(decision.parent, Some(wake));
+    let id = decision.id;
+    let expectation = &decision.expectations[0];
+    assert_eq!(expectation.field, choregos::action::Field::Source);
+    let expected = expectation.expect.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_event(
+        &mut engine,
+        start,
+        2500,
+        Event::HaState {
+            entity: receiver,
+            state: "on".into(),
+            attrs: [("source".into(), serde_json::json!(expected))].into(),
+            changed: Some(wall()),
+            updated: Some(wall() + chrono::Duration::milliseconds(2500)),
+        },
+    );
+    assert_eq!(
+        engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap()
+            .verdict,
+        Verdict::Achieved
+    );
+    let receiver_power = engine
+        .expectations(wake)
+        .unwrap()
+        .iter()
+        .find(|expectation| expectation.subject == "receiver")
+        .unwrap();
+    assert_eq!(
+        receiver_power.outcome,
+        Outcome::Pending,
+        "attribute freshness is not power freshness"
+    );
+}
+
+#[test]
+fn bridge_offline_and_unrelated_reload_preserve_independent_expectations() {
+    for cancellation in 0..3 {
+        let (mut engine, start, id) = verdict_wake();
+        let event = match cancellation {
+            0 => Event::BridgeOffline,
+            1 => Event::ConfigReloaded(engine.config.clone()),
+            _ => Event::Command(Command::SetMode(Mode::Shadow)),
+        };
+        verdict_event(&mut engine, start, 500, event);
+        if cancellation == 2 {
+            let update = engine
+                .verdicts
+                .iter()
+                .find(|update| update.id == id)
+                .unwrap();
+            assert_eq!(update.verdict, Verdict::Unknown);
+            assert!(
+                update
+                    .expectations
+                    .iter()
+                    .all(|expectation| expectation.outcome == Outcome::Unknown { observed: None })
+            );
+            assert_eq!(engine.next_expectation_deadline(), None);
+        } else {
+            assert!(engine.verdicts.iter().all(|update| update.id != id));
+            let tv = engine.config.tv.entity.clone();
+            let receiver = engine.config.receiver.entity.clone();
+            verdict_ha(&mut engine, start, 600, tv, "on");
+            verdict_ha(&mut engine, start, 700, receiver, "on");
+            assert_eq!(
+                engine
+                    .verdicts
+                    .iter()
+                    .find(|update| update.id == id)
+                    .unwrap()
+                    .verdict,
+                Verdict::Achieved
+            );
+        }
+    }
+}
+
+#[test]
+fn shadow_rows_and_actionless_rows_have_no_observable_verdict() {
+    let (mut engine, start) = setup();
+    identify_atv(&mut engine, start);
+    frame(&mut engine, start, 4, 0, "04");
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .all(|decision| decision.verdict == Verdict::None && decision.expectations.is_empty())
+    );
+    assert_eq!(engine.next_expectation_deadline(), None);
+}
+
+#[test]
+fn an_unreachable_sample_does_not_erase_the_last_observed_disagreement() {
+    let (mut engine, start, id) = verdict_wake();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 500, receiver, "on");
+    for (ms, state) in [(600, TvState::Off), (700, TvState::Unreachable)] {
+        verdict_event(
+            &mut engine,
+            start,
+            ms,
+            Event::TvPower {
+                state,
+                at: wall() + chrono::Duration::milliseconds(ms as i64),
+            },
+        );
+    }
+    let deadline = 100 + engine.config.verify.tv_s * 1000;
+    verdict_event(&mut engine, start, deadline, Event::Tick);
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Partial);
+    assert_eq!(
+        update.expectations[0].outcome,
+        Outcome::Missed {
+            observed: "off".into()
+        }
+    );
+}
+
+#[test]
+fn wake_power_expectations_exist_only_for_dispatched_power_actions() {
+    for tv_on in [false, true] {
+        for receiver_on in [false, true] {
+            let (mut engine, start) = setup();
+            identify_atv(&mut engine, start);
+            verdict_event(
+                &mut engine,
+                start,
+                0,
+                Event::Command(Command::SetMode(Mode::Active)),
+            );
+            let tv = engine.config.tv.entity.clone();
+            let receiver = engine.config.receiver.entity.clone();
+            verdict_ha(&mut engine, start, 10, tv, if tv_on { "on" } else { "off" });
+            verdict_ha(
+                &mut engine,
+                start,
+                20,
+                receiver,
+                if receiver_on { "on" } else { "off" },
+            );
+            let actions = verdict_event(
+                &mut engine,
+                start,
+                100,
+                Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+            );
+            let decision = engine.decisions.last().unwrap();
+            assert_eq!(actions.contains(&Action::WakeTv), !tv_on);
+            assert_eq!(
+                decision
+                    .expectations
+                    .iter()
+                    .any(|expectation| expectation.subject == "tv"),
+                !tv_on
+            );
+            assert_eq!(
+                decision
+                    .expectations
+                    .iter()
+                    .any(|expectation| expectation.subject == "receiver"),
+                !receiver_on
+            );
+            assert_eq!(
+                decision.verdict,
+                if tv_on && receiver_on {
+                    Verdict::None
+                } else {
+                    Verdict::Pending
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn opted_out_cec_standby_uses_only_a_configured_probe() {
+    use choregos::{config::ProbeConfig, state::ConsoleState};
+    for confirmed in [false, true] {
+        let (mut engine, start) = setup();
+        let config = std::sync::Arc::make_mut(&mut engine.config);
+        config.mode = Mode::Active;
+        let console = config
+            .device
+            .iter_mut()
+            .find(|device| device.role == "console_a")
+            .unwrap();
+        assert!(!console.verify_standby);
+        console.probe = Some(ProbeConfig::Ps5 {
+            host: "console.example".into(),
+            port: 9302,
+        });
+        identify_atv(&mut engine, start);
+        verdict_event(
+            &mut engine,
+            start,
+            100,
+            Event::Frame(Frame::from_hex(8, 15, "84230004").unwrap()),
+        );
+        verdict_event(
+            &mut engine,
+            start,
+            1000,
+            Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+        );
+        let id = engine.decisions.last().unwrap().id;
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 1100, tv, "on");
+        verdict_ha(&mut engine, start, 1150, receiver, "on");
+        for (ms, data) in [(1200, "9000"), (1250, "9001")] {
+            verdict_event(
+                &mut engine,
+                start,
+                ms,
+                Event::Frame(Frame::from_hex(8, 0, data).unwrap()),
+            );
+            let expectation = standby_expectation(&engine, "console_a");
+            assert_eq!(expectation.via, vec![Via::Ps5]);
+            assert_eq!(
+                expectation.outcome,
+                Outcome::Pending,
+                "CEC neither confirms nor refutes an opted-out role"
+            );
+        }
+        if confirmed {
+            verdict_event(
+                &mut engine,
+                start,
+                1300,
+                Event::ConsolePower {
+                    role: "console_a".into(),
+                    state: ConsoleState::Standby,
+                    at: wall() + chrono::Duration::milliseconds(1300),
+                },
+            );
+        } else {
+            let actions = verdict_event(&mut engine, start, 7000, Event::Tick);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::CecSend { to: 8, .. }))
+            );
+        }
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        let expectation = update
+            .expectations
+            .iter()
+            .find(|expectation| expectation.subject == "role:console_a")
+            .unwrap();
+        assert_eq!(expectation.attempts, 0);
+        assert_eq!(
+            update.verdict,
+            if confirmed {
+                Verdict::Achieved
+            } else {
+                Verdict::Partial
+            }
+        );
+        if confirmed {
+            assert!(matches!(
+                expectation.outcome,
+                Outcome::Met { via: Via::Ps5, .. }
+            ));
+        } else {
+            assert_eq!(expectation.outcome, Outcome::Unknown { observed: None });
+        }
+    }
+}
+
+#[test]
+fn ha_tv_wake_with_reconnect_lag_is_within_the_default_observation_window() {
+    let (mut engine, start, id) = verdict_wake();
+    let receiver = engine.config.receiver.entity.clone();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 500, receiver, "on");
+    verdict_ha(&mut engine, start, 33000, tv, "on");
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Achieved);
+    assert_eq!(
+        update.expectations[0].outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            observed: "on".into(),
+            latency_ms: 32900
+        }
+    );
+}
+
+fn review_step(
+    engine: &mut Engine,
+    tag: &str,
+    start: Instant,
+    ms: u64,
+    event: Event,
+) -> Vec<String> {
+    let actions = engine.handle(event, start + Duration::from_millis(ms), wall());
+    let sends: Vec<_> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::CecSend { to, data } => Some(format!("{to}:{}", hex::encode_upper(data))),
+            _ => None,
+        })
+        .collect();
+    println!("PROBE {tag} +{ms}ms sends={sends:?}");
+    sends
+}
+
+#[test]
+fn review_p12_standby_then_on_keeps_verification_suppression_and_retries() {
+    let (mut engine, start, _) = takeover_from_streamer();
+    for (ms, event) in [
+        (300, Event::Frame(Frame::from_hex(4, 0, "9001").unwrap())),
+        (600, Event::Frame(Frame::from_hex(4, 0, "9000").unwrap())),
+        (2000, Event::Tick),
+        (4000, Event::Tick),
+        (6000, Event::Tick),
+        (8000, Event::Tick),
+    ] {
+        let sends = review_step(&mut engine, "p12", start, ms, event);
+        assert_eq!(
+            sends,
+            if [2000, 4000].contains(&ms) {
+                vec!["4:36", "4:8F"]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+        assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    }
+}
+
+#[test]
+fn review_p7_confirmed_verification_releases_suppression_at_its_check() {
+    let (mut engine, start) = setup();
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.mode = Mode::Active;
+    config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
+        host: "console.example".into(),
+        port: 9302,
+    });
+    identify_atv(&mut engine, start);
+    for (ms, event) in [
+        (100, Event::Frame(Frame::from_hex(4, 0, "04").unwrap())),
+        (
+            1000,
+            Event::Frame(Frame::from_hex(8, 15, "84230004").unwrap()),
+        ),
+        (2300, Event::Frame(Frame::from_hex(4, 0, "9001").unwrap())),
+        (3000, Event::Tick),
+        (4000, Event::Frame(Frame::from_hex(4, 0, "9000").unwrap())),
+        (5000, Event::Tick),
+        (7000, Event::Tick),
+        (9000, Event::Tick),
+    ] {
+        let sends = review_step(&mut engine, "p7", start, ms, event);
+        let expected = match ms {
+            1000 => vec!["4:36", "4:8F"],
+            4000 => vec!["8:36", "8:8F"],
+            _ => vec![],
+        };
+        assert_eq!(sends, expected);
+        if ms >= 4000 {
+            assert_eq!(engine.roles["streamer"].power, RolePower::On);
+        }
+    }
+}
+
+#[test]
+fn review_p10_warming_delays_retries_without_bunching_or_cancelling_them() {
+    let (mut engine, start, _) = takeover_from_streamer();
+    assert!(review_step(&mut engine, "p10", start, 1500, Event::BridgeOnline).is_empty());
+    for ms in [2000, 4000, 4500, 4501, 5000, 6000, 6500, 8000, 10000] {
+        let sends = review_step(&mut engine, "p10", start, ms, Event::Tick);
+        assert_eq!(
+            sends,
+            if [4500, 6500].contains(&ms) {
+                vec!["4:36", "4:8F"]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
+#[test]
+fn review_p9_ha_media_stop_does_not_invent_a_cec_standby_expectation() {
+    let (mut engine, start) = setup();
+    std::sync::Arc::make_mut(&mut engine.config).mode = Mode::Active;
+    identify_atv(&mut engine, start);
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 0, tv, "on");
+    verdict_ha(&mut engine, start, 0, receiver, "on");
+    frame(&mut engine, start, 1, 0, "474B6F6469");
+    frame(
+        &mut engine,
+        start + Duration::from_millis(10),
+        1,
+        15,
+        "822200",
+    );
+    let actions = frame(&mut engine, start + Duration::from_secs(1), 4, 0, "04");
+    assert!(actions.iter().any(|action| service(action, "media_stop")));
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(wake.verdict, Verdict::None);
+    assert!(wake.expectations.is_empty());
+}
+
+#[test]
+fn review_p4r_all_off_ignores_unobservable_media_stop_roles() {
+    let (mut engine, start) = console_before_address_move();
+    engine.handle(
+        Event::Command(Command::SetMode(Mode::Active)),
+        start,
+        wall(),
+    );
+    identify_atv(&mut engine, start);
+    frame(&mut engine, start, 4, 0, "04");
+    verdict_event(&mut engine, start, 500, Event::Command(Command::AllOff));
+    let row = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "all_off")
+        .unwrap();
+    let id = row.id;
+    assert_eq!(row.expectations.len(), 2);
+    assert!(
+        row.expectations
+            .iter()
+            .all(|expectation| expectation.subject != "role:kodi")
+    );
+    verdict_event(
+        &mut engine,
+        start,
+        600,
+        Event::Frame(Frame::from_hex(8, 0, "9001").unwrap()),
+    );
+    verdict_event(&mut engine, start, 2500, Event::Tick);
+    verdict_event(
+        &mut engine,
+        start,
+        2600,
+        Event::Frame(Frame::from_hex(4, 0, "9001").unwrap()),
+    );
+    verdict_event(&mut engine, start, 4500, Event::Tick);
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Achieved);
+    assert!(
+        update
+            .expectations
+            .iter()
+            .all(|expectation| matches!(expectation.outcome, Outcome::CecOnly { .. }))
+    );
+}
+
+#[test]
+fn review_p11_any_fresh_matching_source_wins_over_a_direct_disagreement() {
+    for unreachable in [false, true] {
+        let (mut engine, start, _) = verdict_wake();
+        verdict_event(
+            &mut engine,
+            start,
+            200,
+            Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+        );
+        verdict_event(&mut engine, start, 3200, Event::Tick);
+        let id = engine
+            .decisions
+            .iter()
+            .find(|decision| decision.reason == "off_timer_expired")
+            .unwrap()
+            .id;
+        verdict_event(
+            &mut engine,
+            start,
+            4000,
+            Event::TvPower {
+                state: TvState::On,
+                at: wall() + chrono::Duration::milliseconds(4000),
+            },
+        );
+        if unreachable {
+            verdict_event(
+                &mut engine,
+                start,
+                6000,
+                Event::TvPower {
+                    state: TvState::Unreachable,
+                    at: wall() + chrono::Duration::milliseconds(6000),
+                },
+            );
+        }
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 8000, tv, "off");
+        verdict_ha(&mut engine, start, 8100, receiver, "off");
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(update.verdict, Verdict::Achieved);
+        assert_eq!(
+            update.expectations[0].outcome,
+            Outcome::Met {
+                via: Via::Ha,
+                observed: "off".into(),
+                latency_ms: 4800
+            }
+        );
+    }
+}
+
+#[test]
+fn reload_cancels_only_expectations_whose_relevant_configuration_changed() {
+    for relevant in [false, true] {
+        let (mut engine, start, id) = verdict_wake();
+        let mut config = (*engine.config).clone();
+        if relevant {
+            config.tv.entity = "media_player.replacement_tv".into();
+        } else {
+            config.trace.keep_days += 1;
+        }
+        verdict_event(
+            &mut engine,
+            start,
+            500,
+            Event::ConfigReloaded(std::sync::Arc::new(config)),
+        );
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 600, tv, "on");
+        verdict_ha(&mut engine, start, 700, receiver, "on");
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(
+            update.verdict,
+            if relevant {
+                Verdict::Partial
+            } else {
+                Verdict::Achieved
+            }
+        );
+    }
+}
+
+#[test]
+fn bridge_offline_cancels_cec_only_but_preserves_independent_probe_expectations() {
+    for probe in [false, true] {
+        let (mut engine, start) = setup();
+        let config = std::sync::Arc::make_mut(&mut engine.config);
+        config.mode = Mode::Active;
+        if probe {
+            config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
+                host: "console.example".into(),
+                port: 9302,
+            });
+        }
+        identify_atv(&mut engine, start);
+        verdict_event(
+            &mut engine,
+            start,
+            100,
+            Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+        );
+        verdict_event(
+            &mut engine,
+            start,
+            1000,
+            Event::Frame(Frame::from_hex(8, 15, "84230004").unwrap()),
+        );
+        let id = engine.decisions.last().unwrap().id;
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 1100, tv, "on");
+        verdict_ha(&mut engine, start, 1200, receiver, "on");
+        verdict_event(&mut engine, start, 1300, Event::BridgeOffline);
+        if probe {
+            assert!(engine.verdicts.iter().all(|update| update.id != id));
+            verdict_event(
+                &mut engine,
+                start,
+                1400,
+                Event::ConsolePower {
+                    role: "streamer".into(),
+                    state: choregos::state::ConsoleState::Standby,
+                    at: wall() + chrono::Duration::milliseconds(1400),
+                },
+            );
+        }
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        assert_eq!(
+            update.verdict,
+            if probe {
+                Verdict::Achieved
+            } else {
+                Verdict::Partial
+            }
+        );
+    }
+}
+
+#[test]
+fn bus_power_freshness_tracks_reports_not_identity_chatter_or_invalid_status() {
+    let (mut engine, start) = setup();
+    identify_atv(&mut engine, start);
+    frame(&mut engine, start + Duration::from_secs(1), 4, 0, "04");
+    assert_eq!(
+        engine.bus.entries[&4].power_at,
+        Some(start + Duration::from_secs(1))
+    );
+    frame(
+        &mut engine,
+        start + Duration::from_secs(2),
+        4,
+        15,
+        "870010FA",
+    );
+    assert_eq!(
+        engine.bus.entries[&4].power_at,
+        Some(start + Duration::from_secs(1))
+    );
+    frame(&mut engine, start + Duration::from_secs(3), 4, 0, "9001");
+    frame(
+        &mut engine,
+        start + Duration::from_millis(3500),
+        4,
+        0,
+        "9007",
+    );
+    assert_eq!(
+        engine.bus.entries[&4].power_at,
+        Some(start + Duration::from_secs(3))
+    );
+    frame(&mut engine, start + Duration::from_secs(4), 4, 15, "822100");
+    assert_eq!(engine.bus.entries[&4].power, BusPower::On);
+    assert_eq!(
+        engine.bus.entries[&4].power_at,
+        Some(start + Duration::from_secs(4))
+    );
+}
+
+#[test]
+fn review_q7_transient_standby_does_not_confirm_a_device_still_on_at_exhaustion() {
+    let (mut engine, start, settle) = takeover_from_streamer();
+    for (ms, data) in [(300, "9001"), (600, "9000")] {
+        frame(&mut engine, start + Duration::from_millis(ms), 4, 0, data);
+        assert_eq!(
+            standby_expectation(&engine, "streamer").outcome,
+            Outcome::Pending
+        );
+    }
+    for round in 1..=u32::from(engine.config.timing.standby_retries) + 1 {
+        engine.handle(Event::Tick, start + settle * round, wall());
+    }
+    let expectation = standby_expectation(&engine, "streamer");
+    assert_eq!(expectation.attempts, engine.config.timing.standby_retries);
+    assert_eq!(
+        expectation.outcome,
+        Outcome::Missed {
+            observed: "on".into()
+        }
+    );
+}
+
+#[test]
+fn review_q6_only_checked_cec_confirmation_survives_a_later_user_wake() {
+    for checked in [false, true] {
+        let (mut engine, start) = setup();
+        let config = std::sync::Arc::make_mut(&mut engine.config);
+        config.mode = Mode::Active;
+        if checked {
+            config.timing.takeover_settle_ms = 1000;
+        }
+        config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
+            host: "console.example".into(),
+            port: 9302,
+        });
+        identify_atv(&mut engine, start);
+        verdict_event(
+            &mut engine,
+            start,
+            100,
+            Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+        );
+        verdict_event(
+            &mut engine,
+            start,
+            1000,
+            Event::Frame(Frame::from_hex(8, 15, "84230004").unwrap()),
+        );
+        let id = engine.decisions.last().unwrap().id;
+        let tv = engine.config.tv.entity.clone();
+        let receiver = engine.config.receiver.entity.clone();
+        verdict_ha(&mut engine, start, 1100, tv, "on");
+        verdict_ha(&mut engine, start, 1200, receiver, "on");
+        verdict_event(
+            &mut engine,
+            start,
+            2300,
+            Event::Frame(Frame::from_hex(4, 0, "9001").unwrap()),
+        );
+        assert_eq!(
+            standby_expectation(&engine, "streamer").outcome,
+            Outcome::Pending
+        );
+        if checked {
+            verdict_event(&mut engine, start, 2400, Event::Tick);
+        }
+        verdict_event(
+            &mut engine,
+            start,
+            2600,
+            Event::Frame(Frame::from_hex(4, 15, "822100").unwrap()),
+        );
+        verdict_event(
+            &mut engine,
+            start,
+            if checked { 4000 } else { 3000 },
+            Event::Tick,
+        );
+        let update = engine
+            .verdicts
+            .iter()
+            .find(|update| update.id == id)
+            .unwrap();
+        let expectation = update
+            .expectations
+            .iter()
+            .find(|expectation| expectation.subject == "role:streamer")
+            .unwrap();
+        if checked {
+            assert_eq!(
+                expectation.outcome,
+                Outcome::CecOnly {
+                    observed: "standby".into()
+                }
+            );
+            assert_eq!(update.verdict, Verdict::Achieved);
+        } else {
+            assert_eq!(expectation.outcome, Outcome::Unknown { observed: None });
+            assert_eq!(update.verdict, Verdict::Partial);
+        }
+        assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    }
 }

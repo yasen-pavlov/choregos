@@ -418,6 +418,11 @@ impl Runtime {
         let mut snapshot = state.snapshot();
         snapshot.decisions = restored.decisions.into_iter().rev().take(2000).collect();
         snapshot.decisions.make_contiguous().reverse();
+        for decision in &snapshot.decisions {
+            if decision.verdict == crate::action::Verdict::Pending {
+                engine.cancel_interrupted(decision.id, decision.expectations.clone());
+            }
+        }
         // Startup uses the same engine id allocation and publication path as all decisions.
         let trace = trace::TraceWriter::start(
             state_directory(&state_path).to_path_buf(),
@@ -685,6 +690,8 @@ impl Runtime {
                     .collect(),
                 // A service-start boundary is an observed fact, not a shadow intent.
                 would: self.engine.mode() == Mode::Shadow && decision.reason != "service_started",
+                expectations: decision.expectations.clone(),
+                verdict: decision.verdict,
             };
             if self.engine.config.trace.keep_days != 0 && self.trace.is_some() {
                 let mut payload = serde_json::to_value(decision).expect("serializable decision");
@@ -695,6 +702,29 @@ impl Runtime {
             push_ring(&mut self.snapshot.decisions, view.clone(), 2000);
             self.decisions_dirty = true;
             ui_events.push(UiEvent::Decision(view));
+        }
+        for update in &self.engine.verdicts {
+            if let Some(view) = self
+                .snapshot
+                .decisions
+                .iter_mut()
+                .find(|view| view.id == update.id)
+            {
+                view.expectations.clone_from(&update.expectations);
+                view.verdict = update.verdict;
+                self.decisions_dirty = true;
+                ui_events.push(UiEvent::Verdict {
+                    id: update.id,
+                    verdict: update.verdict,
+                    expectations: update.expectations.clone(),
+                });
+            }
+            self.trace_entry(
+                wall,
+                trace::TraceEntry::Verdict(
+                    serde_json::to_value(update).expect("serializable verdict"),
+                ),
+            );
         }
     }
 
@@ -725,11 +755,13 @@ impl Runtime {
                 state,
                 attrs,
                 changed,
+                updated,
             } => TraceEntry::HaState {
                 entity: entity.clone(),
                 state: state.clone(),
                 attrs: trace_ha_attrs(attrs),
                 changed: *changed,
+                updated: *updated,
             },
             Event::TvPower { state, at } => TraceEntry::TvPower {
                 state: *state,
@@ -760,7 +792,7 @@ impl Runtime {
     ) {
         update_snapshot(&mut self.snapshot, &self.engine, now, wall);
         let entity_states = format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             self.snapshot.mode,
             self.snapshot.bridge_online,
             self.snapshot.active_role,
@@ -771,6 +803,15 @@ impl Runtime {
                 .iter()
                 .map(|role| role.power)
                 .collect::<Vec<_>>(),
+            self.snapshot
+                .decisions
+                .iter()
+                .rev()
+                .find(|decision| !matches!(
+                    decision.verdict,
+                    crate::action::Verdict::None | crate::action::Verdict::Pending
+                ))
+                .map(|decision| (decision.id, decision.verdict)),
         );
         if self.snapshot.connections.mqtt_connected && entity_states != self.last_states {
             self.adapters().executor.mqtt.states(&self.snapshot);
@@ -894,6 +935,7 @@ fn disconnected_events(mqtt: bool, connected: bool, config: &Config) -> Vec<Even
             state: "unknown".into(),
             attrs: Default::default(),
             changed: None,
+            updated: None,
         })
         .collect()
 }
@@ -1425,6 +1467,7 @@ mod review_tests {
                 state: "on".into(),
                 attrs: Default::default(),
                 changed: None,
+                updated: None,
             },
             now,
             wall,
@@ -1726,6 +1769,8 @@ mod persistence_tests {
             reason: "service_started".into(),
             actions: vec![],
             would: false,
+            expectations: vec![],
+            verdict: crate::action::Verdict::None,
         });
         let saved = PersistedState::capture(&engine, &ring);
         persist_bytes(&path, &serde_json::to_vec(&saved).unwrap())

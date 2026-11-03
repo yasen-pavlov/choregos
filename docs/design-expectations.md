@@ -1,4 +1,4 @@
-# Expectations and verdicts (phase 1 design, draft for review)
+# Expectations and verdicts (phase 1, steps 1–3 implemented)
 
 A decision today ends when the engine has emitted its actions. CEC sends come
 back as ack/nack and feed only standby verification; HA calls, webOS off and
@@ -32,8 +32,7 @@ Decision
               | {"kind":"command","command":<Command with kind and optional data>}
               | {"kind":"timer","name":"room_off"|"takeover_settle"|"presence"|"standby_verification"|"warmup"}
               | {"kind":"service","name":"started"|"migrated"}
-  parent        Option<id>   for takeover_settled, standby_retry,
-                            standby_unconfirmed, standby_target_absent follow-ups
+  parent        Option<id>   for takeover_settled follow-ups
   expectations  [Expectation]   empty for rows with no observable effect
   verdict       pending | achieved | partial | missed | unknown | none
 
@@ -41,12 +40,12 @@ Expectation
   subject   tv | receiver | speakers | role:<name>
   field     power | source | playback
   expect    "on" | "off" | "standby" | <source name> | "stopped"
-  via       [tv_direct, ps5, ha, cec]   sources that may confirm, in priority order
-  deadline  ms from `at`
-  attempts  u8   CEC standby resends (replaces the standby_retry rows)
+  via       [tv_direct, ps5, ha, cec]   allowed confirming sources; any fresh match may meet
+  deadline_ms  ms from `at`
+  attempts  u8   CEC standby resends (replaces separate retry rows)
   outcome   pending | met { via, observed, latency_ms }
           | missed { observed }            deadline passed, last observation disagrees
-          | unknown                        deadline passed, no observation at all
+          | unknown { observed? }           no observation; optional "absent" for all-NACK targets
           | cec_only { observed }          met, but only CEC could see it
 ```
 
@@ -66,22 +65,45 @@ Latency on the verdict = the slowest `met` expectation.
 
 | decision | expectations (subject.field = expect, via, default deadline) |
 | --- | --- |
-| off→on transition (wake) | `tv.power = on` (tv_direct, ha; 15 s) · `receiver.power = on` (ha; 10 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` for every role stopped (cec; `takeover_settle_ms × (standby_retries + 1)`) |
+| off→on transition (wake) | `tv.power = on` only if `WakeTv` was sent (tv_direct, ha; 45 s) · `receiver.power = on` only if `turn_on` was sent (ha; 10 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` only for stopped CEC policies with verification enabled or any stopped role with a probe (`takeover_settle_ms × (standby_retries + 1)`; source policy below) |
 | `takeover_settled` | `receiver.source = <role source>` if `select_source` was sent (ha; 10 s). Preset scripts have no observable → no expectation. |
-| `off_timer_expired` | `tv.power = off` (tv_direct, ha; 15 s) · `receiver.power = off` (ha; 10 s) |
-| `all_off`, `manual_standby` | `role:<r>.power = standby` per stopped role (cec; as above) |
+| `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct, ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (ha; 10 s) |
+| `all_off`, `manual_standby` | Same standby eligibility: CEC policies with verification enabled, or probe-only for a stopped role with a probe; no CEC expectation for HA media-stop/none policies |
 | everything else | none |
 
 A role's own `on` is what triggered the decision, so it is not an expectation.
-`cec_only` counts as met: a console that leaves the bus in standby
-(`verify_standby = false`) still lets its takeover read `achieved`, and the
-expanded row keeps the honesty. The former `standby_retry` /
-`standby_unconfirmed` / `standby_target_absent` rows are folded into the
-displaced role's expectation (`attempts`, terminal outcome) and stop being
-separate ring rows; golden corpus re-blessed in that PR, ops glossary updated.
+Expectations describe actions actually emitted, not unchanged room state:
+a takeover with TV/receiver already On has no power expectation for either.
+`cec_only` counts as met but requires actual fresh Standby/Transition evidence;
+silence from a disappearing console remains `unknown`, not achievement.
+Standby retry mechanics are folded into the displaced role's expectation
+(`attempts`, terminal outcome), with no separate verification ring rows.
+`verify_standby = false` opts out of CEC standby verification and retries.
+With a configured probe, create `[ps5]` only; without one, create no standby
+expectation for that role. Such consoles may answer `36` with `90 00` and
+sleep silently later, so CEC neither confirms nor refutes their standby.
+Verifying roles use `[cec]`, or `[ps5, cec]` with a probe. The CEC leg is marked
+only at the verification's due confirmed check, with fresh Standby/Transition
+still present; a raw transient report is not success. With a probe, checked
+CEC evidence waits until the deadline for independent confirmation and is not
+erased by a later cancellation. Fresh On at exhaustion yields missed; no usable
+observation yields unknown.
+`ha_media_stop` and `none` do not imply CEC standby; without a probe they
+contribute no standby expectation, including all-off's already-Off media players.
+The original CEC verification slot remains independent of the expectation:
+it is removed only at its due cancellation/confirmation/exhaustion check,
+and retries schedule `now + settle`. A verdict must never change suppression
+of `90 xx`, the retry sequence, or the lifetime of that slot.
+
 
 Deadlines are per-field config under `[verify]` with the defaults above;
 calibration may change the defaults in a later release, not the schema.
+The TV default is a 45-second observation window: HA can reconnect 20–33 s
+after a WoL wake, while the observed latency is recorded independently.
+HA power/playback freshness uses `changed > decision.at`; receiver source
+freshness uses `updated > decision.at` from HA `last_updated`. Trace
+`ha/state.updated` preserves that timestamp; old traces fall back to line `ts`.
+
 
 ## Observations
 
@@ -116,8 +138,8 @@ It is what the verifier compares against once all decisions have settled:
   is off.
 - Drift rows carry no actions. Remediation is out of scope for this phase.
 
-Intent and direct TV/console observations are delivered in step 2; drift and
-verdict comparison remain later steps. A per-device `ps5` discovery probe
+Intent, direct observations and verdict comparison are implemented in steps 1–3;
+drift remains step 4. A per-device `ps5` discovery probe
 provides Awake/Standby/Unreachable over unicast UDP; it requires Remote Play
 and a reachable UDP path from the Choregos host. Its trace topic is `probe/state`.
 
@@ -145,12 +167,11 @@ and a reachable UDP path from the Choregos host. Its trace topic is `probe/state
 - Ring/UI: `/decisions` rows show a verdict chip; a row expands to its
   expectations (expected / observed / via / latency). Minimal; the real
   surfaces come with the phase-2 redesign.
-- Snapshot: `last_verdict`, `drift: Option<Drift>`; per-role stats computed
-  from the ring on demand (wake achieved %, standby confirmed %, p50/p95
-  latency) for the future device page.
-- Home Assistant: `binary_sensor.choregos_drift` (attributes: subject, field,
-  intended, observed, since) and `sensor.choregos_last_decision` (state =
-  verdict; attributes id, role, reason, latency_ms). Same vocabulary as the UI.
+- Snapshot: the existing mutable decision ring exposes verdicts; the newest
+  settled observable row supplies the last-decision sensor. Per-role stats
+  and a dedicated drift snapshot are deferred with their future surfaces.
+- Home Assistant: `sensor.choregos_last_decision` (state = verdict; attributes
+  id, role, reason, latency_ms). The drift binary sensor is step 4.
 
 ## Not in this phase
 
@@ -160,13 +181,14 @@ richer identities header for mid-session replay (separate follow-up noted in
 
 ## Delivery
 
-1. Decision identity + trigger + parent; state v2 migration; trace
-   `choregos/decision`. No behaviour change; golden re-bless (fields only).
-2. `TvPower` observation + `tv/state` trace; optimistic cache write replaced
-   by room intent.
-3. Expectations + verdicts + `[verify]` config; verdict lines in replay;
-   `/decisions` chip; HA sensors.
-4. Drift rows.
+1. **Implemented:** decision identity + trigger + parent; state v2 migration;
+   trace `choregos/decision`.
+2. **Implemented:** direct TV/console observations and room intent, without
+   optimistic HA-cache writes.
+3. **Implemented:** expectations + verdicts + `[verify]` deadlines; mutable
+   persisted ring, verdict trace/replay lines and final drain; UI chip/details;
+   HA last-decision sensor. Golden output updated with case explanations.
+4. **Not implemented:** drift rows/sensor (intentionally out of this task).
 
 Each step is its own PR with Opus engine review and Luna test/doc review; 1–3
 can ship as one release, 4 after a few days of verdicts.
@@ -178,3 +200,29 @@ can ship as one release, 4 after a few days of verdicts.
 2. Drift grace 30 s, direct polls every 2 s while an expectation is pending.
 3. Home Assistant exposure as described.
 4. Standby verification rows are folded into the parent's expectation.
+
+## Step 3 implementation details / deviations
+
+- Outcomes serialize as objects tagged by `kind`; `expect` and `observed`
+  stay strings. Unknown optionally carries `observed: "absent"` so target
+  NACK evidence is preserved without falsely claiming standby.
+- Independent sources' fresh matches meet immediately, even after another
+  source disagreed or became unreachable. CEC success comes only from the
+  verification confirmed branch, never raw bus lookup; checked success keeps
+  the probe wait and survives later cancellation. Retain disagreements only
+  for missed observations.
+- `cec_only` requires a checked CEC confirmation for roles permitting verification.
+  Opted-out roles without a probe contribute no expectation; with a probe they
+  accept only independent evidence. CEC On is not a refutation for them.
+- No redundant `Snapshot.last_verdict`: derive the latest settled observable
+  decision from the ring. Statistics and drift exposure remain later work.
+- Persisted pending rows interrupted by restart settle their unfinished fields
+  unknown, preserving already completed evidence; old monotonic deadlines and
+  effects are not resumed.
+- Replay retains the five-second control-timer drain. Its additional reporting
+  tail evaluates only expectation deadlines, never presence/off/standby timers.
+- Bridge offline cancels only all-`[cec]` expectations; HA/direct/probe evidence
+  remains usable. Reload cancels only relevant endpoint/policy/target/deadline
+  changes, not unrelated configuration edits.
+- Bus entries own fresh power provenance (`power_at`); no verifier-local CEC
+  power cache exists. Reporting is never a control input.

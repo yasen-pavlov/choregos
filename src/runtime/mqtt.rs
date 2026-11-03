@@ -240,6 +240,30 @@ impl Mqtt {
                 ("bridge_uptime".into(), telemetry.uptime_s.to_string()),
             ]);
         }
+        let last = snapshot.decisions.iter().rev().find(|decision| {
+            !matches!(
+                decision.verdict,
+                crate::action::Verdict::None | crate::action::Verdict::Pending
+            )
+        });
+        let payload = last.map_or_else(
+            || json!({"verdict":"none","id":null,"role":null,"reason":null,"latency_ms":null}),
+            |decision| json!({
+                "verdict": decision.verdict,
+                "id": decision.id,
+                "role": decision.role,
+                "reason": decision.reason,
+                "latency_ms": decision.expectations.iter().filter_map(|expectation| match expectation.outcome {
+                    crate::action::Outcome::Met { latency_ms, .. } => Some(latency_ms),
+                    _ => None,
+                }).max(),
+            }),
+        );
+        self.publish(
+            "choregos/state/last_decision".into(),
+            true,
+            payload.to_string(),
+        );
         for (name, value) in states {
             self.publish(format!("choregos/state/{name}"), true, value);
         }
@@ -341,6 +365,7 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
             ("sensor", "bridge_signal", "Bridge signal"),
             ("sensor", "bridge_link_count", "Bridge link count"),
             ("sensor", "bridge_uptime", "Bridge uptime"),
+            ("sensor", "last_decision", "Last decision"),
         ]
         .map(|(a, b, c)| (a.into(), b.into(), c.into())),
     );
@@ -350,6 +375,11 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
         if component == "select" { payload["options"] = json!(["shadow","active"]); }
         if component == "select" || component == "button" { payload["command_topic"] = json!(format!("choregos/cmd/{name}")); }
         match name.as_str() {
+            "last_decision" => {
+                payload["value_template"] = json!("{{ value_json.verdict }}");
+                payload["json_attributes_topic"] = json!("choregos/state/last_decision");
+                payload["json_attributes_template"] = json!("{{ {'id': value_json.id, 'role': value_json.role, 'reason': value_json.reason, 'latency_ms': value_json.latency_ms} | tojson }}");
+            }
             "bridge_signal" => {
                 payload["unit_of_measurement"] = json!("dBm");
                 payload["device_class"] = json!("signal_strength");
@@ -524,7 +554,7 @@ mod tests {
                 .subscribe("cmnd/test_bridge/HdmiSend", QoS::AtLeastOnce)
                 .await
                 .unwrap();
-            assert_retained_discovery(&mut received, config.device.len() + 8).await;
+            assert_retained_discovery(&mut received, config.device.len() + 9).await;
             observer
                 .publish(
                     "tele/test_bridge/SENSOR",

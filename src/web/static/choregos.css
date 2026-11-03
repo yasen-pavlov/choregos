@@ -61,6 +61,16 @@ main { padding: 12px; display: flex; flex-direction: column; gap: 12px; max-widt
 .pill.power-transition { color: var(--accent); border-color: var(--accent); }
 .pill.state-unavailable { color: var(--red); border-color: var(--red); }
 .pill.bus-fault { color: var(--red); border-color: var(--red); }
+.pill.verdict-achieved { color: var(--green); border-color: var(--green); }
+.pill.verdict-partial, .pill.verdict-pending { color: var(--amber); border-color: var(--amber); }
+.pill.verdict-missed { color: var(--red); border-color: var(--red); }
+.pill.verdict-unknown { color: var(--dim); border-color: var(--dim); }
+details.verdict > summary { list-style: none; cursor: pointer; }
+details.verdict > summary::-webkit-details-marker { display: none; }
+table.expectations { margin-top: .3rem; font-size: .85em; }
+table.expectations td { padding: .1rem .5rem .1rem 0; }
+table.expectations tr.outcome-missed td { color: var(--red); }
+table.expectations tr.outcome-unknown td, table.expectations tr.outcome-pending td { color: var(--dim); }
 .conn { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .conn::before {
   content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;

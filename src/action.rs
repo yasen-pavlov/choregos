@@ -90,6 +90,109 @@ pub enum Trigger {
     Service { name: ServiceKind },
 }
 
+/// One observable effect of a decision. Values stay strings across adapters.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Expectation {
+    pub subject: String,
+    pub field: Field,
+    pub expect: String,
+    pub via: Vec<Via>,
+    pub deadline_ms: u64,
+    pub attempts: u8,
+    pub outcome: Outcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Field {
+    Power,
+    Source,
+    Playback,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    TvDirect,
+    Ps5,
+    Ha,
+    Cec,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    Pending,
+    Met {
+        via: Via,
+        observed: String,
+        latency_ms: u64,
+    },
+    Missed {
+        observed: String,
+    },
+    Unknown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed: Option<String>,
+    },
+    CecOnly {
+        observed: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Pending,
+    Achieved,
+    Partial,
+    Missed,
+    Unknown,
+    #[default]
+    None,
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Achieved => "achieved",
+            Self::Partial => "partial",
+            Self::Missed => "missed",
+            Self::Unknown => "unknown",
+            Self::None => "none",
+        })
+    }
+}
+
+impl std::fmt::Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Power => "power",
+            Self::Source => "source",
+            Self::Playback => "playback",
+        })
+    }
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TvDirect => "tv_direct",
+            Self::Ps5 => "ps5",
+            Self::Ha => "ha",
+            Self::Cec => "cec",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VerdictUpdate {
+    pub id: u64,
+    pub verdict: Verdict,
+    pub expectations: Vec<Expectation>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Decision {
     pub id: u64,
@@ -100,6 +203,8 @@ pub struct Decision {
     pub to: Option<RolePower>,
     pub reason: String,
     pub actions: Vec<Action>,
+    pub expectations: Vec<Expectation>,
+    pub verdict: Verdict,
 }
 
 #[cfg(test)]

@@ -464,7 +464,12 @@ impl TraceWindow {
         {
             return Ok(None);
         }
-        if !header && !matches!(entry, Some(TraceEntry::Decision(_))) {
+        if !header
+            && !matches!(
+                entry,
+                Some(TraceEntry::Decision(_) | TraceEntry::Verdict(_))
+            )
+        {
             self.started = true;
         }
         Ok(Some(WindowEntry { timestamp, entry }))
@@ -515,7 +520,10 @@ impl Replay {
         let Some(entry) = entry else {
             return Ok(());
         };
-        if matches!(entry, TraceEntry::Identities(_) | TraceEntry::Decision(_)) {
+        if matches!(
+            entry,
+            TraceEntry::Identities(_) | TraceEntry::Decision(_) | TraceEntry::Verdict(_)
+        ) {
             return Ok(());
         }
         if self.engine.is_none()
@@ -567,11 +575,13 @@ impl Replay {
                 state,
                 attrs,
                 changed,
+                updated,
             } => vec![Event::HaState {
                 entity,
                 state,
                 attrs: serde_json::from_value(attrs)?,
                 changed,
+                updated: updated.or(Some(timestamp)),
             }],
             TraceEntry::TvPower { state, at } => vec![Event::TvPower { state, at }],
             TraceEntry::ConsolePower { role, state, at } => {
@@ -586,7 +596,9 @@ impl Replay {
                     vec![Event::BridgeOffline]
                 }
             }
-            TraceEntry::Identities(_) | TraceEntry::Decision(_) => unreachable!(),
+            TraceEntry::Identities(_) | TraceEntry::Decision(_) | TraceEntry::Verdict(_) => {
+                unreachable!()
+            }
         };
         for event in events {
             emit(engine, event, now, timestamp, output)?;
@@ -597,11 +609,17 @@ impl Replay {
 
     fn finish(&mut self, output: &mut impl Write) -> anyhow::Result<()> {
         if let Some((now, wall)) = self.last {
-            let duration = Duration::from_secs(5);
             let engine = self.engine.as_mut().expect("replay initialized");
-            while let Some(deadline) = engine.next_deadline().filter(|d| *d <= now + duration) {
+            let until = now + Duration::from_secs(5);
+            while let Some(deadline) = engine.next_deadline().filter(|deadline| *deadline <= until)
+            {
                 let timestamp = wall + chrono::Duration::from_std(deadline.duration_since(now))?;
                 emit(engine, Event::Tick, deadline, timestamp, output)?;
+            }
+            while let Some(deadline) = engine.next_expectation_deadline() {
+                let timestamp = wall + chrono::Duration::from_std(deadline.duration_since(now))?;
+                engine.settle_expectations(deadline);
+                emit_verdicts(engine, timestamp, output)?;
             }
         }
         Ok(())
@@ -624,6 +642,33 @@ fn emit(
             decision: &'a crate::action::Decision,
         }
         serde_json::to_writer(&mut *output, &TimedDecision { at: wall, decision })?;
+        writeln!(output)?;
+    }
+    emit_verdicts(engine, wall, output)
+}
+
+fn emit_verdicts(
+    engine: &Engine,
+    wall: chrono::DateTime<chrono::Utc>,
+    output: &mut impl Write,
+) -> anyhow::Result<()> {
+    for update in &engine.verdicts {
+        #[derive(serde::Serialize)]
+        struct TimedVerdict<'a> {
+            at: chrono::DateTime<chrono::Utc>,
+            verdict_for: u64,
+            verdict: crate::action::Verdict,
+            expectations: &'a [crate::action::Expectation],
+        }
+        serde_json::to_writer(
+            &mut *output,
+            &TimedVerdict {
+                at: wall,
+                verdict_for: update.id,
+                verdict: update.verdict,
+                expectations: &update.expectations,
+            },
+        )?;
         writeln!(output)?;
     }
     Ok(())
@@ -671,6 +716,7 @@ mod tests {
                     state: "on".into(),
                     attrs: json!({"source":"Streamer"}),
                     changed: Some(epoch),
+                    updated: Some(epoch),
                 },
             ),
             (
@@ -730,6 +776,7 @@ mod tests {
                     state: "on".into(),
                     attrs: json!({}),
                     changed: None,
+                    updated: Some(epoch + chrono::Duration::seconds(3)),
                 },
             ),
         ];
@@ -740,6 +787,119 @@ mod tests {
                 .map(|(ms, entry)| trace::line(epoch + chrono::Duration::milliseconds(ms), &entry))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn replay_reporting_tail_never_invents_presence_timeout_or_room_off() {
+        use crate::{cec::Frame, state::Mode};
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.mode = Mode::Active;
+        let epoch: chrono::DateTime<chrono::Utc> = "2026-10-30T12:00:00Z".parse().unwrap();
+        let bridge = config.bridge.name().to_owned();
+        let text: String = [
+            (
+                0,
+                TraceEntry::Lwt {
+                    bridge: bridge.clone(),
+                    online: true,
+                },
+            ),
+            (
+                4000,
+                TraceEntry::Received {
+                    bridge,
+                    frame: Frame::from_hex(8, 15, "84230004").unwrap(),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(ms, entry)| trace::line(epoch + chrono::Duration::milliseconds(ms), &entry))
+        .collect();
+        let mut output = vec![];
+        replay(config, &text, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let decisions: Vec<_> = rows
+            .iter()
+            .filter(|row| row.get("reason").is_some())
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .all(|row| row["reason"] != "presence_timeout"
+                    && row["reason"] != "off_timer_expired")
+        );
+        assert!(!text.contains(r#""kind":"tv_off""#));
+        let verdicts: Vec<_> = rows
+            .iter()
+            .filter(|row| row.get("verdict_for").is_some())
+            .collect();
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts.last().unwrap()["at"], "2026-10-30T12:00:49Z");
+    }
+
+    #[test]
+    fn verdict_lines_are_recomputed_extracted_and_drained_past_five_seconds() {
+        let (config, mut lines) = capture();
+        let mut baseline = vec![];
+        replay(config.clone(), &lines.concat(), &mut baseline).unwrap();
+        let output = String::from_utf8(baseline.clone()).unwrap();
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let off = rows
+            .iter()
+            .find(|row| row["reason"] == "off_timer_expired")
+            .unwrap();
+        let verdict = rows
+            .iter()
+            .find(|row| row["verdict_for"] == off["id"])
+            .unwrap();
+        assert_eq!(
+            verdict
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["at", "expectations", "verdict", "verdict_for"]
+        );
+        assert_eq!(verdict["at"], "2026-10-30T12:00:50Z");
+        assert_eq!(verdict["verdict"], "unknown");
+        assert_eq!(verdict["expectations"].as_array().unwrap().len(), 2);
+        let ts = "2026-10-30T12:00:03Z".parse().unwrap();
+        lines.push(trace::line(
+            ts,
+            &TraceEntry::Verdict(
+                serde_json::json!({"id":999,"verdict":"achieved","expectations":[]}),
+            ),
+        ));
+        let mut actual = vec![];
+        replay(config, &lines.concat(), &mut actual).unwrap();
+        assert_eq!(actual, baseline);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.jsonl");
+        std::fs::write(&path, lines.concat()).unwrap();
+        let mut extracted = vec![];
+        extract_files(
+            &[path],
+            "2026-10-30T12:00:00Z".parse().unwrap(),
+            ts,
+            &[],
+            None,
+            &mut extracted,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(extracted)
+                .unwrap()
+                .contains("choregos/verdict")
+        );
     }
 
     #[test]
@@ -845,7 +1005,7 @@ mod tests {
         let mut output = vec![];
         replay(config.clone(), &lines.concat(), &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("standby_target_absent"), "{text}");
+        assert!(text.contains(r#""observed":"absent""#), "{text}");
         assert!(text.contains("takeover_settled"), "{text}");
         let without_results: String = lines
             .into_iter()
@@ -854,8 +1014,8 @@ mod tests {
         let mut output = vec![];
         replay(config, &without_results, &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(!text.contains("standby_target_absent"));
-        assert!(text.contains("standby_unconfirmed"), "{text}");
+        assert!(!text.contains(r#""observed":"absent""#));
+        assert!(text.contains(r#""kind":"unknown""#), "{text}");
     }
 
     #[test]
@@ -910,7 +1070,7 @@ mod tests {
         assert!(
             String::from_utf8(multiple)
                 .unwrap()
-                .contains("standby_target_absent")
+                .contains(r#""observed":"absent""#)
         );
     }
 
@@ -936,7 +1096,7 @@ mod tests {
         replay_files(&config_path, &[first, second], None, None, &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("takeover_settled"), "{text}");
-        assert!(text.contains("standby_target_absent"), "{text}");
+        assert!(text.contains(r#""observed":"absent""#), "{text}");
         let mut single = vec![];
         replay(config, &lines.concat(), &mut single).unwrap();
         assert_eq!(text, String::from_utf8(single).unwrap());
@@ -978,7 +1138,7 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("takeover_settled"), "{text}");
-        assert!(text.contains("standby_target_absent"), "{text}");
+        assert!(text.contains(r#""observed":"absent""#), "{text}");
     }
 
     #[test]
@@ -1002,8 +1162,8 @@ mod tests {
         let mut output = vec![];
         replay(config, &lines.concat(), &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(!text.contains("standby_target_absent"), "{text}");
-        assert!(text.contains("standby_unconfirmed"), "{text}");
+        assert!(!text.contains(r#""observed":"absent""#), "{text}");
+        assert!(text.contains(r#""kind":"unknown""#), "{text}");
     }
 
     #[test]
@@ -1402,10 +1562,15 @@ mod native_tests {
         }
         while let Some(deadline) = engine
             .next_deadline()
-            .filter(|d| *d <= start + Duration::from_millis(6004))
+            .filter(|deadline| *deadline <= start + Duration::from_millis(6004))
         {
             let wall = epoch + chrono::Duration::from_std(deadline.duration_since(start)).unwrap();
             emit(&mut engine, Event::Tick, deadline, wall, &mut live).unwrap();
+        }
+        while let Some(deadline) = engine.next_expectation_deadline() {
+            let wall = epoch + chrono::Duration::from_std(deadline.duration_since(start)).unwrap();
+            engine.settle_expectations(deadline);
+            emit_verdicts(&engine, wall, &mut live).unwrap();
         }
         let mut replayed = vec![];
         replay(config, &lines, &mut replayed).unwrap();
@@ -1413,7 +1578,7 @@ mod native_tests {
         assert!(
             String::from_utf8(live)
                 .unwrap()
-                .contains("standby_target_absent")
+                .contains(r#""observed":"absent""#)
         );
     }
 

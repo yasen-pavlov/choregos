@@ -175,7 +175,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries (`from`, `to` as `HH:MM`, HA `script`). Slots must cover exactly 24 hours; `24:00` is valid only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` role IDs whose volume keys are forwarded while Sonos is `playing` |
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
-| `verify` | Optional `tv_poll_ms` / `probe_poll_ms` (each default 2000, 500–10000 ms) and `tv_window_s` / `probe_window_s` (each default 45, 5–300 seconds). Active-mode, action-scoped direct observation windows; live-reloadable. |
+| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10`, `speakers_s = 5`, `source_s = 10` (seconds). The TV window allows HA reconnect lag; observed latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Active-mode observation only; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
 | `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302}` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
@@ -198,23 +198,30 @@ may not be `bridge`, `mode`, `conflicts`, `active_source` or `all_off`.
 | --- | --- |
 | `on` / `off` events | `image_view_on`, `text_view_on`, `active_source`, `power_on`, `standby`, `inactive_source`, `power_standby`, `report_physical_address` |
 | `takeover` | `cec_standby` (Standby `36`, then power query `8F`), `cec_pause_standby` (`Play: Still` `41 25`, `36`, `8F`: for sources that ignore Standby while playing), `ha_media_stop` (needs `media_player`), `none` |
-| `verify_standby` | Boolean, default `true`; `false` sends the CEC stop/query sequence once without verification, retries, or `standby_*` decisions |
+| `verify_standby` | Boolean, default `true`; `false` sends the CEC stop/query sequence once with no retries and opts out of CEC standby evidence. A configured probe still creates a probe-only expectation; otherwise the role contributes no expectation. |
 | `presence` | `events`, or `poll` for playback devices that leave the bus in standby |
 
 In active mode CEC stops are verified by default: only an observed Standby or
 Transition power report from that address counts. The sequence is sent once,
 then re-sent after each `takeover_settle_ms` up to `standby_retries` more times
-(`0` disables retries). Exhaustion records `standby_unconfirmed`, or, with
-patched firmware, `standby_target_absent` when every frame was NACKed and none
-ACKed (normal for devices that leave the bus in standby).
+(`0` disables retries). Resends increment the parent expectation's `attempts`,
+not separate decision rows. At its deadline, a fresh On report is `missed`;
+silence is `unknown`. If every frame was NACKed and none ACKed, the unknown
+outcome records `observed: "absent"`; absence is not proof of standby.
 Replies to the verification query update bus state but can never wake a role
 back up; a real On event from the user still cancels verification.
+Verification control slots are independent of verdicts: replies stay suppressed
+until the next verification check removes the slot, and delayed retries wait a
+full settle interval. HA media-stop/none roles do not gain CEC power expectations;
+only a configured independent probe can verify their standby.
 
 Set a role's `verify_standby = false` when it replies On (`90 00`) before
 silently sleeping or leaving the bus. `taken_over` already marks the role Off;
-nothing confirms the console actually slept. The initial stop/query sequence
-is unchanged; no verification is scheduled. Replies follow the normal
-`on`/`off` event lists. For CEC takeover policies, configuration rejects this
+nothing confirms the console actually slept without an independent probe.
+The initial stop/query sequence is unchanged, but no retries are scheduled.
+A configured probe creates `[ps5]` only: CEC neither confirms nor refutes it.
+Without a probe, no standby expectation is created for that opted-out role.
+Replies follow the normal `on`/`off` event lists. For CEC takeover policies, configuration rejects this
 opt-out when `on` includes `power_on`, because the query's `90 00` reply could
 wake the role and undo the takeover. Keep verification enabled for sources
 that need standby retries.
@@ -251,6 +258,7 @@ proxy tokens, titles or application names.
 | `homeassistant/…/config` (retained) | out | HA discovery: role power sensors, active source, conflicts, mode select, all-off button, bridge sensor |
 | `choregos/status` | out | `online`/`offline` (last will) |
 | `choregos/state/<name>` (retained) | out | Entity states |
+| `choregos/state/last_decision` (retained) | out | `sensor.choregos_last_decision`: verdict state; attributes `id`, `role`, `reason`, `latency_ms` (slowest independently met expectation, or null) |
 | `choregos/cmd/mode`, `choregos/cmd/all_off` | in | `shadow`/`active`; any payload triggers all-off |
 
 One instance per broker namespace.
@@ -272,11 +280,18 @@ while you check the decisions against what actually happened.
 | `/` | Mode switch, bridge/MQTT/HA status, TV/receiver/Sonos, each role's power with takeover/standby buttons, active source, all-off |
 | `/bus` | Live frame stream (SSE) with decoded opcodes and operands |
 | `/devices` | Bus table (addresses, identity keys, power, last seen, matched role) with manual identify; roles; raw frame send |
-| `/decisions` | The decision ring with reasons and actions |
+| `/decisions` | The decision ring with reasons, actions, verdict chips and expandable expectations |
 | `/config` | Validate-and-save editor for the TOML file |
 
-Every decision records the role, the transition, the reason and the exact
-actions that followed (or, in shadow mode, would have followed):
+Every decision records its id, trigger, parent, role, transition, reason and exact
+actions (or shadow `would:` actions). Observable effects get expectations with
+deadlines, evidence sources, latency and standby resend counts. Rows remain
+mutable until their verdict settles: `achieved`, `partial`, `missed`, or
+`unknown`; no observable effect (including shadow rows) means `none`.
+CEC-only confirmation counts toward achievement but remains visibly `cec_only`.
+Verdicts report what happened; they never send corrective actions.
+Creation and settlement are captured as `choregos/decision` and
+`choregos/verdict` trace entries; offline replay recomputes both.
 
 ![Decision log](docs/decisions.png)
 

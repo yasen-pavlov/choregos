@@ -66,6 +66,10 @@ tv_poll_ms = 2000                 # direct webOS observation cadence, 500–1000
 tv_window_s = 45                  # stop at target or this deadline, 5–300 seconds
 probe_poll_ms = 2000              # configured console probes, 500–10000 ms
 probe_window_s = 45               # stop at target or deadline, 5–300 seconds
+tv_s = 45                        # TV observation window allows HA reconnect lag; latency is recorded separately
+receiver_s = 10
+speakers_s = 5
+source_s = 10
 
 [fake_tv]
 replies = true                  # false if bridge firmware owns directed TV replies; never answers Request Active Source
@@ -118,7 +122,7 @@ source = "Console A"
 on = ["report_physical_address", "image_view_on", "active_source"]
 off = ["standby", "inactive_source"]
 takeover = "cec_standby"
-verify_standby = false            # taken_over already marks the role Off; nothing confirms the console actually slept
+verify_standby = false            # no CEC standby expectation/retries; optional probe remains independent
 presence = "poll"
 
 [web]

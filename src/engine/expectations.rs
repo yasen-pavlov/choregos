@@ -1,0 +1,645 @@
+//! Reporting-only verification. Deadlines are injected monotonic time; evidence
+//! must be newer than the decision, never an optimistic command-side cache write.
+use super::*;
+use crate::{
+    action::{Field, Via},
+    config::TvOffConfig,
+};
+
+pub(super) struct PendingDecision {
+    pub at: Instant,
+    pub wall: DateTime<Utc>,
+    pub expectations: Vec<Expectation>,
+    progress: Vec<ExpectationProgress>,
+}
+
+impl PendingDecision {
+    pub fn new(at: Instant, wall: DateTime<Utc>, expectations: Vec<Expectation>) -> Self {
+        let progress = (0..expectations.len())
+            .map(|_| ExpectationProgress::default())
+            .collect();
+        Self {
+            at,
+            wall,
+            expectations,
+            progress,
+        }
+    }
+
+    fn push(&mut self, expectation: Expectation) {
+        self.expectations.push(expectation);
+        self.progress.push(ExpectationProgress::default());
+    }
+
+    pub fn deadlines(&self) -> impl Iterator<Item = Instant> + '_ {
+        self.expectations
+            .iter()
+            .filter(|expectation| expectation.outcome == Outcome::Pending)
+            .map(|expectation| self.at + Duration::from_millis(expectation.deadline_ms))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Observation<'a> {
+    value: &'a str,
+    latency_ms: u64,
+}
+
+#[derive(Default)]
+struct ExpectationProgress {
+    last_disagreement: Option<(u64, String)>,
+    cec_met: bool,
+    absent: bool,
+}
+
+impl Engine {
+    pub fn next_expectation_deadline(&self) -> Option<Instant> {
+        self.pending_decisions
+            .values()
+            .flat_map(PendingDecision::deadlines)
+            .min()
+    }
+
+    /// Read-only inspection of pending or newly settled expectations, used by replay tests.
+    pub fn expectations(&self, id: u64) -> Option<&[Expectation]> {
+        self.pending_decisions
+            .get(&id)
+            .map(|pending| pending.expectations.as_slice())
+            .or_else(|| {
+                self.verdicts
+                    .iter()
+                    .find(|update| update.id == id)
+                    .map(|update| update.expectations.as_slice())
+            })
+    }
+
+    /// Complete reporting deadlines without running any control, presence, or off timers.
+    pub fn settle_expectations(&mut self, now: Instant) {
+        self.decisions.clear();
+        self.verdicts.clear();
+        self.evaluate_expectations(now);
+    }
+
+    pub(super) fn standby_result(
+        &mut self,
+        verification: &StandbyVerification,
+        result: VerificationResult,
+    ) {
+        let Some(pending) = verification
+            .parent
+            .and_then(|id| self.pending_decisions.get_mut(&id))
+        else {
+            return;
+        };
+        let Some(index) = pending.expectations.iter().position(|expectation| {
+            expectation.subject.strip_prefix("role:") == Some(&verification.role)
+        }) else {
+            return;
+        };
+        if pending.expectations[index].outcome != Outcome::Pending {
+            return;
+        }
+        let progress = &mut pending.progress[index];
+        match result {
+            VerificationResult::Cancelled => {
+                if !progress.cec_met {
+                    pending.expectations[index].outcome = Outcome::Unknown { observed: None };
+                }
+            }
+            VerificationResult::Confirmed | VerificationResult::Exhausted => {
+                let entry = self.bus.entries.get(&verification.la);
+                let observed_at = entry.and_then(|entry| entry.power_at).filter(|at| {
+                    *at > pending.at
+                        && *at
+                            <= pending.at
+                                + Duration::from_millis(pending.expectations[index].deadline_ms)
+                });
+                if matches!(result, VerificationResult::Confirmed) {
+                    progress.cec_met |= observed_at.is_some();
+                } else {
+                    progress.absent = verification.sent > 0
+                        && !verification.acked
+                        && verification.nacked >= verification.sent;
+                    if let Some(at) = observed_at
+                        && entry.is_some_and(|entry| entry.power == BusPower::On)
+                    {
+                        progress.last_disagreement = Some((
+                            at.duration_since(pending.at).as_millis() as u64,
+                            "on".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn expectation(
+        &self,
+        subject: &str,
+        field: Field,
+        expect: &str,
+        via: Vec<Via>,
+        deadline_ms: u64,
+    ) -> Expectation {
+        Expectation {
+            subject: subject.into(),
+            field,
+            expect: expect.into(),
+            via,
+            deadline_ms,
+            attempts: 0,
+            outcome: Outcome::Pending,
+        }
+    }
+
+    fn tv_expectation(&self, value: &str) -> Expectation {
+        let via = if matches!(self.config.tv.off, TvOffConfig::Webos { .. }) {
+            vec![Via::TvDirect, Via::Ha]
+        } else {
+            vec![Via::Ha]
+        };
+        self.expectation(
+            "tv",
+            Field::Power,
+            value,
+            via,
+            self.config.verify.tv_s * 1000,
+        )
+    }
+
+    fn role_expectation(&self, role: &str) -> Option<Expectation> {
+        let device = self
+            .config
+            .device
+            .iter()
+            .find(|device| device.role == role)
+            .expect("configured role");
+        let cec = device.verify_standby
+            && matches!(
+                device.takeover,
+                Takeover::CecStandby | Takeover::CecPauseStandby
+            );
+        let via = match (cec, device.probe.is_some()) {
+            (false, false) => return None,
+            (false, true) => vec![Via::Ps5],
+            (true, true) => vec![Via::Ps5, Via::Cec],
+            (true, false) => vec![Via::Cec],
+        };
+        Some(self.expectation(
+            &format!("role:{role}"),
+            Field::Power,
+            "standby",
+            via,
+            self.config.timing.takeover_settle_ms
+                * (u64::from(self.config.timing.standby_retries) + 1),
+        ))
+    }
+
+    pub(super) fn decision_expectations(
+        &self,
+        role: Option<&str>,
+        to: Option<RolePower>,
+        reason: &str,
+        actions: &[Action],
+    ) -> Vec<Expectation> {
+        if self.config.mode == Mode::Shadow {
+            return vec![];
+        }
+        let mut expectations = vec![];
+        let wake = to == Some(RolePower::On);
+        if wake && actions.contains(&Action::WakeTv) {
+            expectations.push(self.tv_expectation("on"));
+        }
+        if reason == "off_timer_expired" && actions.contains(&Action::TvOff) {
+            expectations.push(self.tv_expectation("off"));
+        }
+        for action in actions {
+            match action {
+                Action::HaCall {
+                    entity,
+                    service,
+                    data,
+                    ..
+                } if entity == &self.config.receiver.entity => {
+                    let expectation = match service.as_str() {
+                        "turn_on" if wake => Some(self.expectation(
+                            "receiver",
+                            Field::Power,
+                            "on",
+                            vec![Via::Ha],
+                            self.config.verify.receiver_s * 1000,
+                        )),
+                        "turn_off" if reason == "off_timer_expired" => Some(self.expectation(
+                            "receiver",
+                            Field::Power,
+                            "off",
+                            vec![Via::Ha],
+                            self.config.verify.receiver_s * 1000,
+                        )),
+                        "select_source" if reason == "takeover_settled" => {
+                            data.get("source").and_then(Value::as_str).map(|source| {
+                                self.expectation(
+                                    "receiver",
+                                    Field::Source,
+                                    source,
+                                    vec![Via::Ha],
+                                    self.config.verify.source_s * 1000,
+                                )
+                            })
+                        }
+                        _ => None,
+                    };
+                    expectations.extend(expectation);
+                }
+                Action::HaCall {
+                    entity, service, ..
+                } if wake && service == "media_stop" && entity == &self.config.sonos.entity => {
+                    expectations.push(self.expectation(
+                        "speakers",
+                        Field::Playback,
+                        "stopped",
+                        vec![Via::Ha],
+                        self.config.verify.speakers_s * 1000,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if wake {
+            for device in &self.config.device {
+                if device.role == role.unwrap_or("") {
+                    continue;
+                }
+                let stopped = actions.iter().any(|action| match action {
+                    Action::CecSend { to, data } => {
+                        data == &[STANDBY] && self.identity.roles.get(&device.role) == Some(to)
+                    }
+                    Action::HaCall {
+                        entity, service, ..
+                    } => service == "media_stop" && device.media_player.as_ref() == Some(entity),
+                    _ => false,
+                });
+                if stopped {
+                    expectations.extend(self.role_expectation(&device.role));
+                }
+            }
+        } else if matches!(reason, "all_off" | "manual_standby")
+            && let Some(role) = role
+            && self.stopped_roles.iter().any(|stopped| stopped == role)
+        {
+            expectations.extend(self.role_expectation(role));
+        }
+        expectations
+    }
+
+    /// All-off can also dispatch to bound roles already Off. Attach every stop
+    /// to a command decision, never to an unrelated warm-up transition.
+    pub(super) fn attach_command_stops(&mut self, actions: &[Action]) {
+        if self.config.mode == Mode::Shadow
+            || !matches!(
+                self.trigger,
+                Some(DecisionTrigger::Command(
+                    Command::AllOff | Command::Standby(_)
+                ))
+            )
+        {
+            return;
+        }
+        let expectations: Vec<_> = self
+            .stopped_roles
+            .iter()
+            .filter(|role| {
+                self.config
+                    .device
+                    .iter()
+                    .find(|device| device.role == **role)
+                    .is_some_and(|device| {
+                        actions.iter().any(|action| match action {
+                            Action::CecSend { to, data } => {
+                                data == &[STANDBY] && self.identity.roles.get(*role) == Some(to)
+                            }
+                            Action::HaCall {
+                                entity, service, ..
+                            } => {
+                                service == "media_stop"
+                                    && device.media_player.as_ref() == Some(entity)
+                            }
+                            _ => false,
+                        })
+                    })
+            })
+            .filter(|role| {
+                !self.decisions.iter().any(|decision| {
+                    decision.expectations.iter().any(|expectation| {
+                        expectation.subject.strip_prefix("role:") == Some(role.as_str())
+                    })
+                })
+            })
+            .filter_map(|role| {
+                self.role_expectation(role)
+                    .map(|expectation| (role.clone(), expectation))
+            })
+            .collect();
+        if expectations.is_empty() {
+            return;
+        }
+        let index = if let Some(index) = self.decisions.iter().position(|decision| {
+            matches!(
+                decision.reason.as_str(),
+                "all_off" | "manual_standby" | "command_all_off" | "command_standby"
+            )
+        }) {
+            index
+        } else {
+            let reason = match self.trigger {
+                Some(DecisionTrigger::Command(Command::AllOff)) => "command_all_off",
+                _ => "command_standby",
+            };
+            self.record(None, None, None, reason, actions.to_vec(), None);
+            self.decisions.len() - 1
+        };
+        let id = self.decisions[index].id;
+        for (role, expectation) in expectations {
+            if !self.decisions[index]
+                .expectations
+                .iter()
+                .any(|existing| existing.subject == expectation.subject)
+            {
+                self.decisions[index].expectations.push(expectation.clone());
+                self.decisions[index].verdict = Verdict::Pending;
+                self.pending_decisions
+                    .entry(id)
+                    .or_insert_with(|| PendingDecision::new(self.now, self.wall, vec![]))
+                    .push(expectation);
+            }
+            for pending in &mut self.standby_verifications {
+                if pending.role == role && pending.parent.is_none() {
+                    pending.parent = Some(id);
+                }
+            }
+        }
+    }
+
+    fn observation<'a>(
+        &'a self,
+        wall: DateTime<Utc>,
+        expectation: &Expectation,
+        via: Via,
+    ) -> Option<Observation<'a>> {
+        let value = match via {
+            Via::TvDirect => self.tv_direct.and_then(|(state, at)| match state {
+                TvState::On => Some(("on", at)),
+                TvState::Off => Some(("off", at)),
+                TvState::Unreachable => None,
+            }),
+            Via::Ps5 => expectation
+                .subject
+                .strip_prefix("role:")
+                .and_then(|role| self.roles.get(role))
+                .and_then(|role| role.direct)
+                .and_then(|(state, at)| match state {
+                    ConsoleState::Awake => Some(("on", at)),
+                    ConsoleState::Standby => Some(("standby", at)),
+                    ConsoleState::Unreachable => None,
+                }),
+            Via::Ha => {
+                let entity = match expectation.subject.as_str() {
+                    "tv" => Some(&self.config.tv.entity),
+                    "receiver" => Some(&self.config.receiver.entity),
+                    "speakers" => Some(&self.config.sonos.entity),
+                    _ => None,
+                };
+                entity
+                    .and_then(|entity| self.ha.get(entity))
+                    .and_then(|state| {
+                        if matches!(state.state.as_str(), "unknown" | "unavailable") {
+                            return None;
+                        }
+                        let value = match expectation.field {
+                            Field::Source => state.attrs.get("source")?.as_str()?,
+                            Field::Playback
+                                if matches!(
+                                    state.state.as_str(),
+                                    "idle" | "paused" | "off" | "stopped" | "standby"
+                                ) =>
+                            {
+                                "stopped"
+                            }
+                            _ => &state.state,
+                        };
+                        Some((
+                            value,
+                            match expectation.field {
+                                Field::Source => state.updated?,
+                                Field::Power | Field::Playback => state.changed?,
+                            },
+                        ))
+                    })
+            }
+            Via::Cec => return None,
+        };
+        let (value, observed_at) = value?;
+        if observed_at <= wall
+            || observed_at > wall + chrono::Duration::milliseconds(expectation.deadline_ms as i64)
+        {
+            return None;
+        }
+        Some(Observation {
+            value,
+            latency_ms: (observed_at - wall).num_milliseconds() as u64,
+        })
+    }
+
+    pub(super) fn evaluate_expectations(&mut self, now: Instant) {
+        let mut decisions = std::mem::take(&mut self.pending_decisions);
+        decisions.retain(|&id, pending| {
+            for (index, expectation) in pending.expectations.iter_mut().enumerate() {
+                if expectation.outcome != Outcome::Pending {
+                    continue;
+                }
+                let progress = &mut pending.progress[index];
+                for &via in &expectation.via {
+                    let Some(observation) = self.observation(pending.wall, expectation, via) else {
+                        continue;
+                    };
+                    if observation.value == expectation.expect {
+                        expectation.outcome = Outcome::Met {
+                            via,
+                            observed: observation.value.into(),
+                            latency_ms: observation.latency_ms,
+                        };
+                        break;
+                    } else if progress
+                        .last_disagreement
+                        .as_ref()
+                        .is_none_or(|(at, value)| {
+                            observation.latency_ms > *at
+                                || observation.latency_ms == *at && observation.value != value
+                        })
+                    {
+                        progress.last_disagreement =
+                            Some((observation.latency_ms, observation.value.into()));
+                    }
+                }
+                if expectation.outcome != Outcome::Pending {
+                    continue;
+                }
+                let expired = now >= pending.at + Duration::from_millis(expectation.deadline_ms);
+                if progress.cec_met && (!expectation.via.contains(&Via::Ps5) || expired) {
+                    expectation.outcome = Outcome::CecOnly {
+                        observed: expectation.expect.clone(),
+                    };
+                } else if expired {
+                    expectation.outcome = match &progress.last_disagreement {
+                        Some((_, observed)) => Outcome::Missed {
+                            observed: observed.clone(),
+                        },
+                        None => Outcome::Unknown {
+                            observed: progress.absent.then(|| "absent".into()),
+                        },
+                    };
+                }
+            }
+            if pending
+                .expectations
+                .iter()
+                .any(|expectation| expectation.outcome == Outcome::Pending)
+            {
+                return true;
+            }
+            self.verdicts.push(VerdictUpdate {
+                id,
+                verdict: verdict(&pending.expectations),
+                expectations: std::mem::take(&mut pending.expectations),
+            });
+            false
+        });
+        self.pending_decisions = decisions;
+    }
+
+    pub(super) fn cancel_cec_expectations(&mut self) {
+        for pending in self.pending_decisions.values_mut() {
+            for expectation in &mut pending.expectations {
+                if expectation.outcome == Outcome::Pending
+                    && expectation.via.as_slice() == [Via::Cec]
+                {
+                    expectation.outcome = Outcome::Unknown { observed: None };
+                }
+            }
+        }
+    }
+
+    pub(super) fn cancel_reconfigured_expectations(&mut self, config: &Config) {
+        for pending in self.pending_decisions.values_mut() {
+            for expectation in &mut pending.expectations {
+                if expectation.outcome == Outcome::Pending
+                    && expectation_config_changed(&self.config, config, expectation)
+                {
+                    expectation.outcome = Outcome::Unknown { observed: None };
+                }
+            }
+        }
+    }
+
+    pub(super) fn cancel_expectations(&mut self) {
+        for (id, mut pending) in std::mem::take(&mut self.pending_decisions) {
+            self.cancel_interrupted(id, std::mem::take(&mut pending.expectations));
+        }
+    }
+
+    /// Restarts cannot resume an old monotonic deadline or its dispatched work.
+    /// Preserve completed evidence, but never leave an abandoned row pending.
+    pub(crate) fn cancel_interrupted(&mut self, id: u64, mut expectations: Vec<Expectation>) {
+        for expectation in &mut expectations {
+            if expectation.outcome == Outcome::Pending {
+                expectation.outcome = Outcome::Unknown { observed: None };
+            }
+        }
+        self.verdicts.push(VerdictUpdate {
+            id,
+            verdict: verdict(&expectations),
+            expectations,
+        });
+    }
+}
+
+fn expectation_config_changed(old: &Config, new: &Config, expectation: &Expectation) -> bool {
+    if new.mode == Mode::Shadow
+        || expectation.via.contains(&Via::Ha) && old.home_assistant.url != new.home_assistant.url
+    {
+        return true;
+    }
+    match expectation.subject.as_str() {
+        "tv" => {
+            old.tv.entity != new.tv.entity
+                || old.tv.off != new.tv.off
+                || old.tv.wake != new.tv.wake
+                || old.verify.tv_s != new.verify.tv_s
+        }
+        "receiver" if expectation.field == Field::Source => {
+            old.receiver.entity != new.receiver.entity
+                || old.receiver.select_source != new.receiver.select_source
+                || old.verify.source_s != new.verify.source_s
+                || old
+                    .device
+                    .iter()
+                    .find(|device| device.source == expectation.expect)
+                    .is_some_and(|device| {
+                        !new.device
+                            .iter()
+                            .any(|next| next.role == device.role && next.source == device.source)
+                    })
+        }
+        "receiver" => {
+            old.receiver.entity != new.receiver.entity
+                || old.verify.receiver_s != new.verify.receiver_s
+        }
+        "speakers" => {
+            old.sonos.entity != new.sonos.entity || old.verify.speakers_s != new.verify.speakers_s
+        }
+        subject => {
+            let Some(role) = subject.strip_prefix("role:") else {
+                return false;
+            };
+            let (Some(before), Some(after)) = (
+                old.device.iter().find(|device| device.role == role),
+                new.device.iter().find(|device| device.role == role),
+            ) else {
+                return true;
+            };
+            old.timing.takeover_settle_ms != new.timing.takeover_settle_ms
+                || old.timing.standby_retries != new.timing.standby_retries
+                || expectation.via.contains(&Via::Cec) && old.bridge != new.bridge
+                || before.probe != after.probe
+                || before.takeover != after.takeover
+                || before.verify_standby != after.verify_standby
+                || before.matches.vendor != after.matches.vendor
+                || before.matches.osd != after.matches.osd
+                || before.matches.physical != after.matches.physical
+        }
+    }
+}
+
+fn verdict(expectations: &[Expectation]) -> Verdict {
+    let met = expectations
+        .iter()
+        .filter(|expectation| {
+            matches!(
+                expectation.outcome,
+                Outcome::Met { .. } | Outcome::CecOnly { .. }
+            )
+        })
+        .count();
+    if met == expectations.len() {
+        Verdict::Achieved
+    } else if met > 0 {
+        Verdict::Partial
+    } else if expectations
+        .iter()
+        .all(|expectation| matches!(expectation.outcome, Outcome::Unknown { .. }))
+    {
+        Verdict::Unknown
+    } else {
+        Verdict::Missed
+    }
+}

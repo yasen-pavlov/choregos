@@ -140,7 +140,7 @@ pub struct TvConfig {
     pub off: TvOffConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WakeConfig {
     Wol {
@@ -155,7 +155,7 @@ pub enum WakeConfig {
     },
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[serde(from = "StrictTvOffConfig")]
 pub enum TvOffConfig {
@@ -257,6 +257,10 @@ pub struct VerifyConfig {
     pub tv_window_s: u64,
     pub probe_poll_ms: u64,
     pub probe_window_s: u64,
+    pub tv_s: u64,
+    pub receiver_s: u64,
+    pub speakers_s: u64,
+    pub source_s: u64,
 }
 
 impl Default for VerifyConfig {
@@ -266,11 +270,15 @@ impl Default for VerifyConfig {
             tv_window_s: 45,
             probe_poll_ms: 2000,
             probe_window_s: 45,
+            tv_s: 45,
+            receiver_s: 10,
+            speakers_s: 5,
+            source_s: 10,
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProbeConfig {
     Ps5 {
@@ -467,6 +475,17 @@ impl Config {
         if !(5..=300).contains(&self.verify.probe_window_s) {
             return invalid("verify probe_window_s must be in 5..=300 seconds");
         }
+        if [
+            self.verify.tv_s,
+            self.verify.receiver_s,
+            self.verify.speakers_s,
+            self.verify.source_s,
+        ]
+        .into_iter()
+        .any(|seconds| !(1..=300).contains(&seconds))
+        {
+            return invalid("verify expectation deadlines must be in 1..=300 seconds");
+        }
         if self.trace.keep_days > 365 {
             return invalid("trace keep_days must be in 0..=365");
         }
@@ -524,8 +543,15 @@ impl Config {
                 .role
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-                || ["bridge", "mode", "conflicts", "active_source", "all_off"]
-                    .contains(&device.role.as_str())
+                || [
+                    "bridge",
+                    "mode",
+                    "conflicts",
+                    "active_source",
+                    "all_off",
+                    "last_decision",
+                ]
+                .contains(&device.role.as_str())
             {
                 return invalid(
                     "device roles must use [a-z0-9_]+ and cannot use reserved entity names",

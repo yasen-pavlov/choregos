@@ -264,6 +264,11 @@ pub struct BridgeTelemetry {
 pub enum UiEvent {
     Frame(FrameView),
     Decision(DecisionView),
+    Verdict {
+        id: u64,
+        verdict: crate::action::Verdict,
+        expectations: Vec<crate::action::Expectation>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -514,6 +519,10 @@ pub struct DecisionView {
     /// Full, already-redacted action descriptions; `would` marks suppressed effects.
     pub actions: Vec<String>,
     pub would: bool,
+    #[serde(default)]
+    pub expectations: Vec<crate::action::Expectation>,
+    #[serde(default)]
+    pub verdict: crate::action::Verdict,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

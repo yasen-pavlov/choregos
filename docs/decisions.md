@@ -2,6 +2,51 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-03 — Expectations and verdicts
+
+- Implement phase 1 steps 1–3: observable decisions carry expectations and a
+  reporting-only verdict, without drift rows or corrective actions.
+- Default per-field deadlines under `[verify]`: TV 45 s, receiver power 10 s,
+  speakers stopped 5 s, receiver source 10 s. Role standby uses
+  `takeover_settle_ms × (standby_retries + 1)`.
+- Require observations newer than the decision: HA `changed` for power,
+  `updated` for source attributes, direct timestamps, or fresh CEC power
+  evidence. Old traces lacking `updated` use line time for attribute freshness.
+  The TV deadline is an observation window allowing HA reconnect lag; actual
+  confirmation latency is recorded separately. Any allowed source can meet an
+  expectation; an earlier disagreement from another source cannot veto a match.
+  CEC-only confirmation waits for the independent probe until the deadline.
+  Keep only the last disagreement for missed outcomes.
+- Fold standby retries into the displaced role's parent expectation; attempts
+  count resends, not the initial sequence. Preserve bounded retry sequences,
+  ACK/NACK accounting, address retargeting and cancellation. Opt-out roles
+  use only a configured probe (`[ps5]`) or no standby expectation; CEC On
+  cannot refute a console that answers before sleeping silently.
+- Preserve main's CEC verification lifecycle independently of reporting: remove
+  slots only at their due cancellation/confirmation/exhaustion check and schedule
+  retries from the actual check time. This preserves power-reply suppression
+  through transient Standby/On reports and delayed warm-up timers.
+- Never infer CEC standby for HA media-stop or none policies; an independent
+  configured probe is the only standby observable for those policies.
+- Bridge offline cancels only all-CEC fields; reload cancellation is field-specific
+  to relevant configuration changes. Bus entries own monotonic power provenance.
+- Keep replay's five-second control-timer drain, followed only by reporting
+  settlement. No later presence/off timers or device actions may be synthesized.
+- Use tagged `outcome.kind` variants. Extend `unknown` with optional `observed`
+  (omitted normally) to retain `"absent"` when every sent frame was NACKed and
+  none ACKed. This is not a claim that absence proves standby.
+- Keep state version 2; new fields are additive and missing fields default to
+  no expectations / verdict none. Final settlements mutate the existing ring
+  row, publish an SSE verdict event, trace `choregos/verdict`, and submit the
+  same single-slot state writer. HA exposes `sensor.choregos_last_decision`
+  with verdict state and id, role, reason and slowest independent latency.
+  Interrupted pending rows loaded after restart settle unknown through that
+  same path; old monotonic deadlines and dispatched work cannot be resumed.
+- Re-bless the golden corpus for removed verification follow-up rows and added
+  verdict lines; retain original ids modulo the removed rows, parent links and
+  all unchanged decision fields. Per-case outcomes are documented in the corpus.
+- Known follow-up (pre-existing q8): all-off at warm-up completion can replay a buffered wake after the stops and power the room back on; unchanged in this phase.
+
 ## 2026-11-02 — Direct observations and room intent
 
 - Remove the optimistic TV/receiver HA-cache writes at room-off: a command is
