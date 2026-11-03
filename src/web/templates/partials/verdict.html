@@ -2,6 +2,7 @@
 <details class="verdict">
   <summary><span class="pill verdict-{{ decision.verdict }}">{{ decision.verdict }}</span></summary>
   <table class="expectations">
+    <thead><tr><th>expectation</th><th>expected → observed</th><th>outcome</th></tr></thead>
     {% for e in decision.expectations %}
     <tr class="outcome-{{ view::outcome_kind(e.outcome) }}">
       <td class="mono">{{ e.subject }}.{{ e.field }}</td>

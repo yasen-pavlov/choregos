@@ -1,7 +1,6 @@
 use crate::{
     action::{
-        Action, Decision, Expectation, IdentifyQueries, Outcome, ServiceKind, TimerKind, Trigger,
-        Verdict, VerdictUpdate,
+        Action, Decision, IdentifyQueries, ServiceKind, TimerKind, Trigger, Verdict, VerdictUpdate,
     },
     cec::{
         bus::{BusModel, LearnedIdentity},

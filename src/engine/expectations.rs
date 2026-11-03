@@ -1,10 +1,15 @@
 //! Reporting-only verification. Deadlines are injected monotonic time; evidence
 //! must be newer than the decision, never an optimistic command-side cache write.
-use super::*;
+use super::{DecisionTrigger, Engine, StandbyVerification, VerificationResult};
 use crate::{
-    action::{Field, Via},
-    config::TvOffConfig,
+    action::{Action, Expectation, Field, Outcome, Verdict, VerdictUpdate, Via},
+    cec::opcode::STANDBY,
+    config::{Config, Takeover, TvOffConfig},
+    state::{BusPower, Command, ConsoleState, Mode, RolePower, TvState},
 };
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use std::time::{Duration, Instant};
 
 pub(super) struct PendingDecision {
     pub at: Instant,
