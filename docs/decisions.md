@@ -2,6 +2,27 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-03 — Already-satisfied expectations
+
+- At expectation creation, accept a matching current independent observation
+  (`ha`, `tv_direct`, or `ps5`) from `[decision.at - deadline_ms, decision.at)`,
+  recording `met` with zero latency. An entirely satisfied decision starts
+  `achieved`. Use the newest independent sample before the decision; a newer
+  disagreement blocks an older match. Require the sample to postdate every
+  still-pending decision with the same subject and field so an unresolved
+  command cannot reuse evidence from before that command. Older samples do
+  not count; post-creation freshness, deadline evaluation, and CEC's
+  due-confirmation requirements remain unchanged.
+- The receiver can obey a streamer's broadcast Standby before the room-off
+  timer sends its own power-off request. Requiring a later HA state change
+  then incorrectly reports unknown; the observed receiver is already Off.
+  Preserve the actual action sequence and fix reporting, not device control.
+- Add the real receiver-off-first golden and injected freshness-boundary,
+  independent-source, immediate-verdict, and CEC non-pre-settlement tests.
+- Follow-up candidate, not implemented: the off-timer could omit receiver
+  `turn_off` when HA already reports Off, like the wake path omits redundant
+  `select_source`. This change does not suppress that action.
+
 ## 2026-11-03 — Probe-only standby window and unreachable samples
 
 - Standby deadlines follow enabled evidence: CEC-only keeps

@@ -106,6 +106,26 @@ Standby/On chatter from being reported as success before verification checks it.
 
 ## Cases
 
+**`aether-receiver-off-first` — 4 decisions + 2 verdict lines.**
+2026-11-03 13:57:45–14:14:30 UTC: the receiver obeys the streamer's broadcast
+Standby before the room-off timer. Receiver HA Off at 14:13:09.730979 precedes
+replay decision 4 at 14:13:10.920; its expectation now starts
+`met { via: "ha", observed: "off", latency_ms: 0 }`. TV HA Off confirms
+3,244 ms later, settling the room-off decision `achieved` at 14:13:14.166.
+Before the fix it settled `partial` at 14:13:20.920 because the receiver had
+no newer HA sample and became unknown at its ten-second deadline.
+The recorded old verdict remains evidence, ignored by replay.
+
+The originally requested 14:10 start contained no wake and replayed no
+decisions: identity seeds do not carry role power. With approval the start
+extends to just before the preceding Streamer wake at 13:57:49.084, without
+inventing initial state. Replay verifies its identity at 13:57:50.309 and
+reconstructs `ActiveSource` rather than the live `PowerOn`. A cold HA cache
+causes TV/receiver wake actions absent live; neither gets new On evidence
+in this window, so that replay wake remains `unknown`. The first run without
+re-blessing showed changes only in this new case; all six existing cases
+remained byte-identical. Only the new case's two room-off lines were blessed.
+
 **`aether-console-swap-probe` — 11 decisions + 5 verdict lines.**
 2026-11-03 13:50–13:58:30 UTC: four consecutive source activations/takeovers,
 Console B → Console A → Kodi → Streamer. Console B has CEC verification

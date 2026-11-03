@@ -1337,11 +1337,7 @@ impl Engine {
         let id = self.next_decision_id;
         self.next_decision_id = id.checked_add(1).expect("decision id exhausted");
         let expectations = self.decision_expectations(role.as_deref(), to, reason, &actions);
-        let verdict = if expectations.is_empty() {
-            Verdict::None
-        } else {
-            Verdict::Pending
-        };
+        let verdict = expectations::verdict(&expectations);
         if verdict == Verdict::Pending {
             self.pending_decisions.insert(
                 id,

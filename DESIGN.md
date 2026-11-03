@@ -447,6 +447,7 @@ CEC leg uses `takeover_settle_ms × (standby_retries + 1)`; probe-only standby
 uses `verify.probe_window_s × 1000`. With both legs, use the greater deadline
 so independent confirmation can arrive after CEC retries exhaust. The CEC
 retry schedule and verification-slot lifetime are unchanged.
+At creation only, the newest sample before the decision across listed independent sources (`ha`, `tv_direct`, or `ps5`, never `cec`) settles `met` with zero latency if it matches, is in `[decision.at - deadline_ms, decision.at)`, and postdates every still-pending decision carrying the same subject and field; if all expectations meet this way, the decision is immediately `achieved`.
 On every event, evaluate pending fields against observations newer than the
 decision: HA power/playback uses `changed`, source attributes use `updated`,
 direct observations use their timestamps. Independent sources settle a fresh

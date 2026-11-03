@@ -1,5 +1,5 @@
 //! Reporting-only verification. Deadlines are injected monotonic time; evidence
-//! must be newer than the decision, never an optimistic command-side cache write.
+//! is observed independently, never an optimistic command-side cache write.
 use super::{DecisionTrigger, Engine, StandbyVerification, VerificationResult};
 use crate::{
     action::{Action, Expectation, Field, Outcome, Verdict, VerdictUpdate, Via},
@@ -161,7 +161,7 @@ impl Engine {
         via: Vec<Via>,
         deadline_ms: u64,
     ) -> Expectation {
-        Expectation {
+        let mut expectation = Expectation {
             subject: subject.into(),
             field,
             expect: expect.into(),
@@ -169,7 +169,9 @@ impl Engine {
             deadline_ms,
             attempts: 0,
             outcome: Outcome::Pending,
-        }
+        };
+        self.settle_already_satisfied(&mut expectation);
+        expectation
     }
 
     fn tv_expectation(&self, value: &str) -> Expectation {
@@ -396,11 +398,19 @@ impl Engine {
                 .any(|existing| existing.subject == expectation.subject)
             {
                 self.decisions[index].expectations.push(expectation.clone());
-                self.decisions[index].verdict = Verdict::Pending;
-                self.pending_decisions
-                    .entry(id)
-                    .or_insert_with(|| PendingDecision::new(self.now, self.wall, vec![]))
-                    .push(expectation);
+                self.decisions[index].verdict = verdict(&self.decisions[index].expectations);
+                if self.decisions[index].verdict == Verdict::Pending {
+                    self.pending_decisions
+                        .entry(id)
+                        .and_modify(|pending| pending.push(expectation))
+                        .or_insert_with(|| {
+                            PendingDecision::new(
+                                self.now,
+                                self.wall,
+                                self.decisions[index].expectations.clone(),
+                            )
+                        });
+                }
             }
             for pending in &mut self.standby_verifications {
                 if pending.role == role && pending.parent.is_none() {
@@ -410,13 +420,12 @@ impl Engine {
         }
     }
 
-    fn observation<'a>(
+    fn independent_sample<'a>(
         &'a self,
-        wall: DateTime<Utc>,
         expectation: &Expectation,
         via: Via,
-    ) -> Option<Observation<'a>> {
-        let value = match via {
+    ) -> Option<(&'a str, DateTime<Utc>)> {
+        match via {
             Via::TvDirect => self.tv_direct.and_then(|(state, at)| match state {
                 TvState::On => Some(("on", at)),
                 TvState::Off => Some(("off", at)),
@@ -466,9 +475,17 @@ impl Engine {
                         ))
                     })
             }
-            Via::Cec => return None,
-        };
-        let (value, observed_at) = value?;
+            Via::Cec => None,
+        }
+    }
+
+    fn observation<'a>(
+        &'a self,
+        wall: DateTime<Utc>,
+        expectation: &Expectation,
+        via: Via,
+    ) -> Option<Observation<'a>> {
+        let (value, observed_at) = self.independent_sample(expectation, via)?;
         if observed_at <= wall
             || observed_at > wall + chrono::Duration::milliseconds(expectation.deadline_ms as i64)
         {
@@ -547,6 +564,41 @@ impl Engine {
             false
         });
         self.pending_decisions = decisions;
+    }
+
+    /// Creation alone may use a recent matching independent observation.
+    /// CEC still requires its fresh, due verification check.
+    fn settle_already_satisfied(&self, expectation: &mut Expectation) {
+        let newest = expectation
+            .via
+            .iter()
+            .filter_map(|&via| {
+                self.independent_sample(expectation, via)
+                    .map(|(value, at)| (via, value, at))
+            })
+            .filter(|(_, _, at)| *at < self.wall)
+            .max_by_key(|(_, _, at)| *at);
+        let Some((via, value, at)) = newest else {
+            return;
+        };
+        let oldest = self.wall - chrono::Duration::milliseconds(expectation.deadline_ms as i64);
+        if value != expectation.expect
+            || at < oldest
+            || self.pending_decisions.values().any(|pending| {
+                pending.wall >= at
+                    && pending.expectations.iter().any(|previous| {
+                        previous.subject == expectation.subject
+                            && previous.field == expectation.field
+                    })
+            })
+        {
+            return;
+        }
+        expectation.outcome = Outcome::Met {
+            via,
+            observed: value.into(),
+            latency_ms: 0,
+        };
     }
 
     fn evaluate_expectation(
@@ -706,7 +758,16 @@ fn expectation_config_changed(old: &Config, new: &Config, expectation: &Expectat
     }
 }
 
-fn verdict(expectations: &[Expectation]) -> Verdict {
+pub(super) fn verdict(expectations: &[Expectation]) -> Verdict {
+    if expectations.is_empty() {
+        return Verdict::None;
+    }
+    if expectations
+        .iter()
+        .any(|expectation| expectation.outcome == Outcome::Pending)
+    {
+        return Verdict::Pending;
+    }
     let met = expectations
         .iter()
         .filter(|expectation| {
