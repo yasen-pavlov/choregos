@@ -317,6 +317,7 @@ impl Engine {
         self.now = now;
         self.wall = wall;
         self.trigger = DecisionTrigger::from_event(&event);
+        self.settle_due_independent(now);
         let was_warming = self.warming;
         if self.warming && now >= self.warm_until {
             self.warming = false;
@@ -1328,6 +1329,11 @@ impl Engine {
         actions: Vec<Action>,
         parent: Option<u64>,
     ) -> u64 {
+        if to == Some(RolePower::On)
+            && let Some(role) = role.as_deref()
+        {
+            self.cancel_woken_role_expectations(role);
+        }
         let id = self.next_decision_id;
         self.next_decision_id = id.checked_add(1).expect("decision id exhausted");
         let expectations = self.decision_expectations(role.as_deref(), to, reason, &actions);

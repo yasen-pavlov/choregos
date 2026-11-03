@@ -2,6 +2,31 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-03 — Probe-only standby window and unreachable samples
+
+- Standby deadlines follow enabled evidence: CEC-only keeps
+  `takeover_settle_ms × (standby_retries + 1)`; probe-only uses
+  `verify.probe_window_s × 1000`; mixed evidence uses the greater window.
+  This permits late independent standby confirmation without changing CEC
+  retries, power-reply suppression, or verification-slot lifetime.
+- Evaluate independent disagreements from current samples only. A direct
+  Unreachable or HA unavailable/unknown sample replaces its source's earlier
+  disagreement and cannot itself confirm or refute. At the deadline, use the
+  newest current usable observation newer than the decision for missed;
+  absent such evidence or checked CEC confirmation, settle unknown.
+- A new wake decision cancels that role's earlier pending standby expectation:
+  preserve checked CEC success as CEC-only, otherwise settle unknown. A later
+  Awake probe for the new intent must not refute the old standby decision.
+- Settle due independent expectations before applying an incoming event so
+  a sample arriving beyond the deadline cannot replace deadline evidence.
+  Active CEC verification slots retain their existing post-event timer pass.
+  Reload and shadow cancellation preserve checked CEC evidence; interrupted
+  rows preserve completed serialized outcomes rather than resuming timers.
+- Add the scrubbed console-swap probe golden: Console B → Console A → Kodi →
+  Streamer. Console B sleeps after the old six-second CEC deadline; its
+  independent probe must confirm inside the configured 45-second window.
+  Other golden cases have no probes and require no output changes.
+
 ## 2026-11-03 — Expectations and verdicts
 
 - Implement phase 1 steps 1–3: observable decisions carry expectations and a

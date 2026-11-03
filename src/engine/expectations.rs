@@ -35,6 +35,11 @@ impl PendingDecision {
         self.expectations.push(expectation);
         self.progress.push(ExpectationProgress::default());
     }
+    fn cancel(&mut self) {
+        for (expectation, progress) in self.expectations.iter_mut().zip(&self.progress) {
+            progress.cancel(expectation);
+        }
+    }
 
     pub fn deadlines(&self) -> impl Iterator<Item = Instant> + '_ {
         self.expectations
@@ -52,9 +57,23 @@ struct Observation<'a> {
 
 #[derive(Default)]
 struct ExpectationProgress {
-    last_disagreement: Option<(u64, String)>,
+    cec_disagreement_at: Option<u64>,
     cec_met: bool,
     absent: bool,
+}
+
+impl ExpectationProgress {
+    fn cancel(&self, expectation: &mut Expectation) {
+        if expectation.outcome == Outcome::Pending {
+            expectation.outcome = if self.cec_met {
+                Outcome::CecOnly {
+                    observed: expectation.expect.clone(),
+                }
+            } else {
+                Outcome::Unknown { observed: None }
+            };
+        }
+    }
 }
 
 impl Engine {
@@ -107,9 +126,7 @@ impl Engine {
         let progress = &mut pending.progress[index];
         match result {
             VerificationResult::Cancelled => {
-                if !progress.cec_met {
-                    pending.expectations[index].outcome = Outcome::Unknown { observed: None };
-                }
+                progress.cancel(&mut pending.expectations[index]);
             }
             VerificationResult::Confirmed | VerificationResult::Exhausted => {
                 let entry = self.bus.entries.get(&verification.la);
@@ -128,10 +145,8 @@ impl Engine {
                     if let Some(at) = observed_at
                         && entry.is_some_and(|entry| entry.power == BusPower::On)
                     {
-                        progress.last_disagreement = Some((
-                            at.duration_since(pending.at).as_millis() as u64,
-                            "on".into(),
-                        ));
+                        progress.cec_disagreement_at =
+                            Some(at.duration_since(pending.at).as_millis() as u64);
                     }
                 }
             }
@@ -190,13 +205,23 @@ impl Engine {
             (true, true) => vec![Via::Ps5, Via::Cec],
             (true, false) => vec![Via::Cec],
         };
+        let cec_deadline_ms = if cec {
+            self.config.timing.takeover_settle_ms
+                * (u64::from(self.config.timing.standby_retries) + 1)
+        } else {
+            0
+        };
+        let probe_deadline_ms = if device.probe.is_some() {
+            self.config.verify.probe_window_s * 1000
+        } else {
+            0
+        };
         Some(self.expectation(
             &format!("role:{role}"),
             Field::Power,
             "standby",
             via,
-            self.config.timing.takeover_settle_ms
-                * (u64::from(self.config.timing.standby_retries) + 1),
+            cec_deadline_ms.max(probe_deadline_ms),
         ))
     }
 
@@ -455,55 +480,57 @@ impl Engine {
         })
     }
 
+    pub(super) fn cancel_woken_role_expectations(&mut self, role: &str) {
+        for pending in self.pending_decisions.values_mut() {
+            for (expectation, progress) in pending.expectations.iter_mut().zip(&pending.progress) {
+                if expectation.subject.strip_prefix("role:") == Some(role)
+                    && expectation.field == Field::Power
+                    && expectation.expect == "standby"
+                {
+                    progress.cancel(expectation);
+                }
+            }
+        }
+    }
+
+    /// Expire independent evidence before an incoming late sample replaces it.
+    /// Active CEC checks remain owned by the normal post-event timer pass.
+    pub(super) fn settle_due_independent(&mut self, now: Instant) {
+        if self
+            .next_expectation_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.evaluate_expectations_inner(now, true);
+        }
+    }
+
     pub(super) fn evaluate_expectations(&mut self, now: Instant) {
+        self.evaluate_expectations_inner(now, false);
+    }
+
+    fn evaluate_expectations_inner(&mut self, now: Instant, before_event: bool) {
         let mut decisions = std::mem::take(&mut self.pending_decisions);
         decisions.retain(|&id, pending| {
             for (index, expectation) in pending.expectations.iter_mut().enumerate() {
                 if expectation.outcome != Outcome::Pending {
                     continue;
                 }
-                let progress = &mut pending.progress[index];
-                for &via in &expectation.via {
-                    let Some(observation) = self.observation(pending.wall, expectation, via) else {
-                        continue;
-                    };
-                    if observation.value == expectation.expect {
-                        expectation.outcome = Outcome::Met {
-                            via,
-                            observed: observation.value.into(),
-                            latency_ms: observation.latency_ms,
-                        };
-                        break;
-                    } else if progress
-                        .last_disagreement
-                        .as_ref()
-                        .is_none_or(|(at, value)| {
-                            observation.latency_ms > *at
-                                || observation.latency_ms == *at && observation.value != value
-                        })
-                    {
-                        progress.last_disagreement =
-                            Some((observation.latency_ms, observation.value.into()));
-                    }
-                }
-                if expectation.outcome != Outcome::Pending {
+                if before_event
+                    && expectation.via.contains(&Via::Cec)
+                    && self.standby_verifications.iter().any(|verification| {
+                        verification.parent == Some(id)
+                            && expectation.subject.strip_prefix("role:") == Some(&verification.role)
+                    })
+                {
                     continue;
                 }
                 let expired = now >= pending.at + Duration::from_millis(expectation.deadline_ms);
-                if progress.cec_met && (!expectation.via.contains(&Via::Ps5) || expired) {
-                    expectation.outcome = Outcome::CecOnly {
-                        observed: expectation.expect.clone(),
-                    };
-                } else if expired {
-                    expectation.outcome = match &progress.last_disagreement {
-                        Some((_, observed)) => Outcome::Missed {
-                            observed: observed.clone(),
-                        },
-                        None => Outcome::Unknown {
-                            observed: progress.absent.then(|| "absent".into()),
-                        },
-                    };
-                }
+                self.evaluate_expectation(
+                    pending.wall,
+                    expectation,
+                    &pending.progress[index],
+                    expired,
+                );
             }
             if pending
                 .expectations
@@ -522,13 +549,59 @@ impl Engine {
         self.pending_decisions = decisions;
     }
 
+    fn evaluate_expectation(
+        &self,
+        wall: DateTime<Utc>,
+        expectation: &mut Expectation,
+        progress: &ExpectationProgress,
+        expired: bool,
+    ) {
+        // Only current independent samples count: an unreachable sample
+        // replaces that source's earlier disagreement, not its truth.
+        let mut disagreement = progress.cec_disagreement_at.map(|latency_ms| Observation {
+            value: "on",
+            latency_ms,
+        });
+        for &via in &expectation.via {
+            let Some(observation) = self.observation(wall, expectation, via) else {
+                continue;
+            };
+            if observation.value == expectation.expect {
+                expectation.outcome = Outcome::Met {
+                    via,
+                    observed: observation.value.into(),
+                    latency_ms: observation.latency_ms,
+                };
+                return;
+            } else if disagreement
+                .is_none_or(|previous| observation.latency_ms >= previous.latency_ms)
+            {
+                disagreement = Some(observation);
+            }
+        }
+        if progress.cec_met && (!expectation.via.contains(&Via::Ps5) || expired) {
+            expectation.outcome = Outcome::CecOnly {
+                observed: expectation.expect.clone(),
+            };
+        } else if expired {
+            expectation.outcome = match disagreement {
+                Some(observation) => Outcome::Missed {
+                    observed: observation.value.into(),
+                },
+                None => Outcome::Unknown {
+                    observed: progress.absent.then(|| "absent".into()),
+                },
+            };
+        }
+    }
+
     pub(super) fn cancel_cec_expectations(&mut self) {
         for pending in self.pending_decisions.values_mut() {
-            for expectation in &mut pending.expectations {
+            for (expectation, progress) in pending.expectations.iter_mut().zip(&pending.progress) {
                 if expectation.outcome == Outcome::Pending
                     && expectation.via.as_slice() == [Via::Cec]
                 {
-                    expectation.outcome = Outcome::Unknown { observed: None };
+                    progress.cancel(expectation);
                 }
             }
         }
@@ -536,11 +609,11 @@ impl Engine {
 
     pub(super) fn cancel_reconfigured_expectations(&mut self, config: &Config) {
         for pending in self.pending_decisions.values_mut() {
-            for expectation in &mut pending.expectations {
+            for (expectation, progress) in pending.expectations.iter_mut().zip(&pending.progress) {
                 if expectation.outcome == Outcome::Pending
                     && expectation_config_changed(&self.config, config, expectation)
                 {
-                    expectation.outcome = Outcome::Unknown { observed: None };
+                    progress.cancel(expectation);
                 }
             }
         }
@@ -548,6 +621,7 @@ impl Engine {
 
     pub(super) fn cancel_expectations(&mut self) {
         for (id, mut pending) in std::mem::take(&mut self.pending_decisions) {
+            pending.cancel();
             self.cancel_interrupted(id, std::mem::take(&mut pending.expectations));
         }
     }
@@ -555,6 +629,10 @@ impl Engine {
     /// Restarts cannot resume an old monotonic deadline or its dispatched work.
     /// Preserve completed evidence, but never leave an abandoned row pending.
     pub(crate) fn cancel_interrupted(&mut self, id: u64, mut expectations: Vec<Expectation>) {
+        if let Some(mut pending) = self.pending_decisions.remove(&id) {
+            pending.cancel();
+            expectations = pending.expectations;
+        }
         for expectation in &mut expectations {
             if expectation.outcome == Outcome::Pending {
                 expectation.outcome = Outcome::Unknown { observed: None };
@@ -612,9 +690,12 @@ fn expectation_config_changed(old: &Config, new: &Config, expectation: &Expectat
             ) else {
                 return true;
             };
-            old.timing.takeover_settle_ms != new.timing.takeover_settle_ms
-                || old.timing.standby_retries != new.timing.standby_retries
-                || expectation.via.contains(&Via::Cec) && old.bridge != new.bridge
+            expectation.via.contains(&Via::Cec)
+                && (old.timing.takeover_settle_ms != new.timing.takeover_settle_ms
+                    || old.timing.standby_retries != new.timing.standby_retries
+                    || old.bridge != new.bridge)
+                || expectation.via.contains(&Via::Ps5)
+                    && old.verify.probe_window_s != new.verify.probe_window_s
                 || before.probe != after.probe
                 || before.takeover != after.takeover
                 || before.verify_standby != after.verify_standby

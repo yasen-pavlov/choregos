@@ -25,7 +25,7 @@ The corpus must remain byte-identical; no re-bless is needed.
 ## 2026-11-03 expectations/verdicts re-bless
 
 Re-blessed with `UPDATE_GOLDEN=1 cargo test --locked --test golden`. These
-fixtures have no `tv/state` or `probe/state` lines: no result is attributed
+five original fixtures have no `tv/state` or `probe/state` lines: no result is attributed
 to a direct source. TV/receiver power confirmation uses HA `changed` after
 the dispatched action; TV now has a 45-second observation window, allowing
 the captured HA reconnect lag while recording actual latency separately.
@@ -106,6 +106,25 @@ Standby/On chatter from being reported as success before verification checks it.
 
 ## Cases
 
+**`aether-console-swap-probe` — 11 decisions + 5 verdict lines.**
+2026-11-03 13:50–13:58:30 UTC: four consecutive source activations/takeovers,
+Console B → Console A → Kodi → Streamer. Console B has CEC verification
+disabled and an independent probe. Its post-stop Awake sample is followed
+by Unreachable samples before late Standby, after the old six-second deadline.
+Probe-only verification now uses the full configured 45-second window and
+settles the Console A takeover via the probe rather than falsely missing.
+This capture also includes direct TV and HA observations. Extracted probe
+roles are renamed to `console_b`; `ps5` remains only the public protocol/via
+identifier, including the captured decision/verdict evidence. The five
+earlier cases remain byte-identical.
+
+Replay decision 4 corresponds to captured decision 700: before the fix it
+settled `missed { observed: "on" }` at six seconds; afterward it settles
+`met { via: "ps5", observed: "standby", latency_ms: 10103 }` at
+13:53:03.484 UTC. The trace's recorded old verdict is retained as evidence
+but ignored by replay. Settled verdicts 1, 4, 5, 8 and 11 all achieve;
+their other confirmations use direct TV or HA observations.
+
 **`aether-console-wake-and-streamer-takeover` — 11 decisions.**
 2026-11-01 16:25–18:35 UTC: Console A wake stops playing speakers, then Streamer
 takes over with directed Standby/Give Device Power Status (`36`/`8F`). Streamer
@@ -148,6 +167,11 @@ first wake immediately, while replay buffers wake signals until the keys are
 verified. A later Active Source can replace an earlier buffered Power On or Text
 View On. Consequently:
 
+- In `aether-console-swap-probe`, live Console B `TextViewOn` at
+  13:52:20.040 becomes replay `ActiveSource` at 13:52:20.269, when the
+  physical-address reply verifies its identity. This shifts the TV direct
+  observation latency from 19,330 ms live to 19,101 ms in replay; the
+  observation itself remains at 13:52:39.371.
 - In `aether-streamer-to-console-pause-standby`, the first live `PowerOn` at
   22:08:30.777 becomes replay `ActiveSource` at 22:08:33.254, when the physical
   address reply verifies Streamer. Remaining reasons match.

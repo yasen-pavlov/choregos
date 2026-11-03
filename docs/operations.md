@@ -184,6 +184,9 @@ Any allowed source can confirm a field; an earlier direct disagreement does not
 override fresh HA confirmation. Bridge offline cancels only all-CEC pending
 fields. Unrelated reloads preserve expectations; relevant endpoint, policy,
 target/source and deadline changes cancel only their affected fields.
+A pending field restored after an abrupt restart settles unknown even if CEC
+had confirmed before the crash, because pending verification progress is not
+serialized.
 
 ## Incident replay
 

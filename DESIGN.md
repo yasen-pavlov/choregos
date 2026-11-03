@@ -442,8 +442,11 @@ expectations and verdict `none`.
 
 Default deadlines under `[verify]` are TV 45 s, receiver power 10 s, speakers
 5 s, source 10 s. The TV deadline is an observation window accommodating
-20–33 s HA reconnect lag after wake, not a latency target. Standby uses
-`takeover_settle_ms × (standby_retries + 1)`, including probe-only roles.
+20–33 s HA reconnect lag after wake, not a latency target. Standby with only a
+CEC leg uses `takeover_settle_ms × (standby_retries + 1)`; probe-only standby
+uses `verify.probe_window_s × 1000`. With both legs, use the greater deadline
+so independent confirmation can arrive after CEC retries exhaust. The CEC
+retry schedule and verification-slot lifetime are unchanged.
 On every event, evaluate pending fields against observations newer than the
 decision: HA power/playback uses `changed`, source attributes use `updated`,
 direct observations use their timestamps. Independent sources settle a fresh
@@ -453,8 +456,12 @@ with fresh Standby/Transition still present, never by raw frame sampling.
 A brief Standby followed by On before that check is not success; exhaustion with
 fresh On is missed, and without usable evidence is unknown. With a probe, retain
 checked CEC confirmation until the deadline if no independent match arrives;
-later cancellation must not erase that checked success. Keep the last
-disagreement only for `missed.observed`. Unreachable/unavailable is not truth.
+later cancellation must not erase that checked success. At the deadline,
+use only each independent source's current sample, newer than the decision:
+the latest usable disagreement supplies `missed.observed`. Unreachable direct
+samples and HA unavailable/unknown replace that source's earlier disagreement;
+they neither confirm nor refute. Without current fresh usable evidence the
+outcome is unknown, not a remembered missed result.
 All deadlines feed `next_deadline`, including during warm-up.
 
 When all expectations settle, verdict is `achieved` if all met/CEC-only,
@@ -464,6 +471,9 @@ Settlements mutate the existing ring row and persist via the single-slot
 writer; `UiEvent::Verdict {id, verdict, expectations}` refreshes the live bus.
 After restart, unfinished persisted fields settle unknown through this same
 path, retaining completed evidence; old monotonic deadlines are not resumed.
+A pending field restored after an abrupt restart settles unknown even if CEC
+had confirmed before the crash, because pending verification progress is not
+serialized.
 `choregos/verdict` traces `{id, verdict, expectations}`; replay ignores
 recorded verdicts and prints `{at, verdict_for, verdict, expectations}` on
 recomputed settlement. Replay runs control timers only through its existing
