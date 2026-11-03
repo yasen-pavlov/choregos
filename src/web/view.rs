@@ -209,6 +209,39 @@ pub(crate) fn ha_detail(entity: &HaEntityView) -> String {
         })
 }
 
+pub(crate) fn outcome_kind(outcome: &crate::action::Outcome) -> &'static str {
+    use crate::action::Outcome;
+    match outcome {
+        Outcome::Pending => "pending",
+        Outcome::Met { .. } => "met",
+        Outcome::Missed { .. } => "missed",
+        Outcome::Unknown { .. } => "unknown",
+        Outcome::CecOnly { .. } => "cec only",
+    }
+}
+
+pub(crate) fn outcome_observed(outcome: &crate::action::Outcome) -> String {
+    use crate::action::Outcome;
+    match outcome {
+        Outcome::Pending => "…".into(),
+        Outcome::Met { observed, .. }
+        | Outcome::Missed { observed }
+        | Outcome::CecOnly { observed } => observed.clone(),
+        Outcome::Unknown { observed } => observed.clone().unwrap_or_else(|| "nothing seen".into()),
+    }
+}
+
+/// Source and latency for a met expectation; `None` otherwise.
+pub(crate) fn outcome_detail(outcome: &crate::action::Outcome) -> Option<String> {
+    use crate::action::Outcome;
+    match outcome {
+        Outcome::Met {
+            via, latency_ms, ..
+        } => Some(format!("via {via} in {:.1} s", *latency_ms as f64 / 1000.0)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;

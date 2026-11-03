@@ -215,11 +215,16 @@ async fn forward_state(
             .as_str()
             .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
             .map(|timestamp| timestamp.with_timezone(&Utc));
+        let updated = value["last_updated"]
+            .as_str()
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
         tx.send(Input::Event(Event::HaState {
             entity: entity.into(),
             state: state.into(),
             attrs,
             changed,
+            updated,
         }))
         .await?;
     }
@@ -273,7 +278,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(request["type"], expected);
                 let result = if expected == "get_states" {
-                    json!([{"entity_id":entity,"state":"on","attributes":{"source":"HDMI"},"last_changed":"2026-10-25T12:00:00+02:00"}])
+                    json!([{"entity_id":entity,"state":"on","attributes":{"source":"HDMI"},"last_changed":"2026-10-25T12:00:00+02:00","last_updated":"2026-10-25T12:00:05+02:00"}])
                 } else {
                     Value::Null
                 };
@@ -323,19 +328,31 @@ mod tests {
         let test = async {
             let mut states = vec![];
             while states.len() < 4 {
-                if let Input::Event(Event::HaState { state, changed, .. }) =
-                    rx.recv().await.unwrap()
+                if let Input::Event(Event::HaState {
+                    state,
+                    changed,
+                    updated,
+                    ..
+                }) = rx.recv().await.unwrap()
                 {
-                    states.push((state, changed));
+                    states.push((state, changed, updated));
                 }
             }
             assert_eq!(
                 states,
                 [
-                    ("on".into(), Some("2026-10-25T10:00:00Z".parse().unwrap())),
-                    ("off".into(), Some("2026-10-25T10:01:00Z".parse().unwrap())),
-                    ("on".into(), None),
-                    ("off".into(), None),
+                    (
+                        "on".into(),
+                        Some("2026-10-25T10:00:00Z".parse().unwrap()),
+                        Some("2026-10-25T10:00:05Z".parse().unwrap())
+                    ),
+                    (
+                        "off".into(),
+                        Some("2026-10-25T10:01:00Z".parse().unwrap()),
+                        None
+                    ),
+                    ("on".into(), None, None),
+                    ("off".into(), None, None),
                 ]
             );
             ha.call("media_player", "turn_on", &config.tv.entity, json!({}))

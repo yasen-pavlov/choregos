@@ -812,7 +812,69 @@ fn shadow_decision() -> DecisionView {
             "cec.give_osd_name 4".to_owned(),
         ],
         would: true,
+        expectations: vec![],
+        verdict: crate::action::Verdict::None,
     }
+}
+
+fn verdict_decision() -> DecisionView {
+    use crate::action::{Expectation, Field, Outcome, Verdict, Via};
+    DecisionView {
+        id: 9,
+        would: false,
+        reason: "PowerOn".to_owned(),
+        actions: vec![],
+        verdict: Verdict::Partial,
+        expectations: vec![
+            Expectation {
+                subject: "tv".to_owned(),
+                field: Field::Power,
+                expect: "on".to_owned(),
+                via: vec![Via::TvDirect, Via::Ha],
+                deadline_ms: 15_000,
+                attempts: 0,
+                outcome: Outcome::Met {
+                    via: Via::TvDirect,
+                    observed: "on".to_owned(),
+                    latency_ms: 3_400,
+                },
+            },
+            Expectation {
+                subject: "role:console_b".to_owned(),
+                field: Field::Power,
+                expect: "standby".to_owned(),
+                via: vec![Via::Cec],
+                deadline_ms: 6_000,
+                attempts: 2,
+                outcome: Outcome::Missed {
+                    observed: "on".to_owned(),
+                },
+            },
+        ],
+        ..shadow_decision()
+    }
+}
+
+#[tokio::test]
+async fn decisions_page_renders_verdict_chip_and_expectations() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot
+        .decisions
+        .extend([shadow_decision(), verdict_decision()]);
+    h.state.publish(snapshot, []);
+    let page = body(h.get("/decisions", Some(&cookie)).await).await;
+    assert_eq!(
+        page.matches("class=\"pill verdict-").count(),
+        1,
+        "the `none` verdict renders no chip"
+    );
+    assert!(page.contains("pill verdict-partial\">partial<"));
+    assert!(page.contains("tv.power"));
+    assert!(page.contains("via tv_direct in 3.4 s"));
+    assert!(page.contains("standby → on"));
+    assert!(page.contains("2 retries"));
 }
 
 /// Class tokens of the element whose text starts at the first occurrence of `text`.
@@ -905,6 +967,54 @@ async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
     );
     assert!(received.contains("off → on"));
     assert_shadow_actions(&received);
+}
+
+#[tokio::test]
+async fn bus_stream_re_renders_the_ring_when_a_verdict_settles() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let response = h.get("/bus/events", Some(&cookie)).await;
+    let mut stream = response.into_body().into_data_stream();
+    let mut received = String::new();
+    macro_rules! pump {
+        ($needle:expr) => {
+            while !received.contains($needle) {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("SSE event arrives")
+                    .expect("stream open")
+                    .expect("chunk");
+                received.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        };
+    }
+    pump!("event: reset");
+
+    let mut pending = verdict_decision();
+    pending.verdict = crate::action::Verdict::Pending;
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.push_back(pending.clone());
+    h.state
+        .publish(snapshot.clone(), [UiEvent::Decision(pending)]);
+    pump!("verdict-pending");
+    let before = received.len();
+
+    let settled = verdict_decision();
+    snapshot.decisions.back_mut().unwrap().verdict = settled.verdict;
+    snapshot.decisions.back_mut().unwrap().expectations = settled.expectations.clone();
+    h.state.publish(
+        snapshot,
+        [UiEvent::Verdict {
+            id: settled.id,
+            verdict: settled.verdict,
+            expectations: settled.expectations,
+        }],
+    );
+    pump!("verdict-partial");
+    assert!(
+        received[before..].contains("event: reset"),
+        "a settled verdict re-renders the ring rather than streaming a duplicate row"
+    );
 }
 
 #[tokio::test]

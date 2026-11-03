@@ -236,6 +236,14 @@ impl Feed {
                 let row = match self.events.recv().await {
                     Ok(UiEvent::Frame(frame)) => BusRow::Frame(frame),
                     Ok(UiEvent::Decision(decision)) => BusRow::Decision(decision),
+                    // The row was streamed before its verdict settled: re-render from the ring.
+                    Ok(UiEvent::Verdict { .. }) => {
+                        if self.filter.hide_decisions {
+                            continue;
+                        }
+                        self.resync = true;
+                        continue;
+                    }
                     Err(RecvError::Lagged(_)) => {
                         self.resync = true;
                         continue;

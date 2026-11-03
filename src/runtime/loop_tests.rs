@@ -338,6 +338,7 @@ struct Harness {
     state: AppState,
     config: Config,
     path: PathBuf,
+    inputs: mpsc::Sender<super::Input>,
     peer: MqttPeer,
     ha: HaFake,
     broker: Broker,
@@ -359,6 +360,7 @@ impl Harness {
         peer.wait_for(|view| view.connected && view.subscriptions > 0)
             .await;
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.tv.off = crate::config::TvOffConfig::Ha;
         if native {
             config.bridge = crate::config::BridgeConfig::Aether {
                 node: "cec-bridge".into(),
@@ -408,11 +410,12 @@ impl Harness {
             1,
         );
         tokio::fs::write(&path, &text).await.unwrap();
-        let (state, stop, task) = Self::start_runtime(&config, &path, text).await;
+        let (state, stop, task, inputs) = Self::start_runtime(&config, &path, text).await;
         let harness = Self {
             state,
             config,
             path,
+            inputs,
             peer,
             ha,
             broker,
@@ -455,10 +458,12 @@ impl Harness {
         AppState,
         oneshot::Sender<()>,
         JoinHandle<anyhow::Result<crate::engine::Engine>>,
+        mpsc::Sender<super::Input>,
     ) {
         let state = AppState::new(config.clone(), text);
         let (tx, mut rx) = mpsc::channel(256);
         state.attach(tx.clone());
+        let inputs = tx.clone();
         let adapters = Adapters::start(config, tx.clone(), &[]);
         let mut runtime = Runtime::new(
             state.clone(),
@@ -479,14 +484,15 @@ impl Harness {
             result?;
             Ok(runtime.engine)
         });
-        (state, stop, task)
+        (state, stop, task, inputs)
     }
 
     async fn restart_runtime(&mut self) {
         self.stop_runtime().await;
         let text = tokio::fs::read_to_string(&self.path).await.unwrap();
-        let (state, stop, task) = Self::start_runtime(&self.config, &self.path, text).await;
+        let (state, stop, task, inputs) = Self::start_runtime(&self.config, &self.path, text).await;
         self.state = state;
+        self.inputs = inputs;
         self.stop = Some(stop);
         self.task = Some(task);
     }
@@ -1368,12 +1374,9 @@ async fn native_retained_status_resync_and_id_correlated_outcomes_reach_the_engi
     let mut engine = harness.take_engine().await.unwrap();
     let now = std::time::Instant::now() + Duration::from_secs(60);
     engine.handle(crate::engine::Event::Tick, now, chrono::Utc::now());
-    assert!(
-        engine
-            .decisions
-            .iter()
-            .any(|d| d.reason == "standby_target_absent")
-    );
+    assert!(engine.verdicts.iter().flat_map(|update| &update.expectations).any(|expectation| {
+        expectation.subject == "role:streamer" && matches!(&expectation.outcome, crate::action::Outcome::Unknown { observed: Some(value) } if value == "absent")
+    }));
     harness.shutdown().await;
 }
 
@@ -1683,4 +1686,186 @@ async fn console_observation_windows_follow_wake_and_dispatched_stop() {
     adapters.worker.abort();
     adapters.mqtt_task.abort();
     adapters.ha_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verdict_settlement_mutates_persists_and_republishes_the_same_decision() {
+    use crate::{
+        action::{Outcome, Verdict, Via},
+        engine::Event,
+        state::UiEvent,
+    };
+    let mut harness = Harness::start().await;
+    harness.command(Command::SetMode(Mode::Active)).await;
+    let mut events = harness.state.subscribe();
+    harness.publish_wake().await;
+    let snapshot = wait_snapshot(&harness.state, |snapshot| {
+        snapshot.decisions.iter().any(|decision| {
+            decision.to == Some(RolePower::On) && decision.verdict == Verdict::Pending
+        })
+    })
+    .await;
+    let decision = snapshot
+        .decisions
+        .iter()
+        .rev()
+        .find(|decision| decision.to == Some(RolePower::On))
+        .unwrap();
+    let id = decision.id;
+    let role = decision.role.clone();
+    let reason = decision.reason.clone();
+    let at = decision.timestamp + chrono::Duration::milliseconds(50);
+    for entity in [&harness.config.tv.entity, &harness.config.receiver.entity] {
+        harness
+            .inputs
+            .send(super::Input::Event(Event::HaState {
+                entity: entity.clone(),
+                state: "on".into(),
+                attrs: Default::default(),
+                changed: Some(at),
+                updated: None,
+            }))
+            .await
+            .unwrap();
+    }
+    let snapshot = wait_snapshot(&harness.state, |snapshot| {
+        snapshot
+            .decisions
+            .iter()
+            .any(|decision| decision.id == id && decision.verdict == Verdict::Achieved)
+    })
+    .await;
+    assert_eq!(
+        snapshot
+            .decisions
+            .iter()
+            .filter(|decision| decision.id == id)
+            .count(),
+        1
+    );
+    let settled = snapshot
+        .decisions
+        .iter()
+        .find(|decision| decision.id == id)
+        .unwrap();
+    assert!(settled.expectations.iter().all(|expectation| matches!(
+        expectation.outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            latency_ms: 50,
+            ..
+        }
+    )));
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let UiEvent::Verdict {
+                id: settled,
+                verdict,
+                ..
+            } = events.recv().await.unwrap()
+                && settled == id
+            {
+                assert_eq!(verdict, Verdict::Achieved);
+                assert!(
+                    harness
+                        .state
+                        .snapshot()
+                        .decisions
+                        .iter()
+                        .any(|decision| decision.id == id && decision.verdict == Verdict::Achieved)
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    wait_persisted(
+        &harness.path.with_file_name("choregos.state.json"),
+        |saved| {
+            saved
+                .decisions
+                .iter()
+                .any(|decision| decision.id == id && decision.verdict == Verdict::Achieved)
+        },
+    )
+    .await;
+    harness
+        .peer
+        .wait_for(|view| {
+            view.publications.iter().any(|publish| {
+                publish.topic == "choregos/state/last_decision"
+                    && serde_json::from_slice::<Value>(&publish.payload)
+                        .is_ok_and(|value| value["id"] == id && value["verdict"] == "achieved")
+            })
+        })
+        .await;
+    let retained = harness.peer.retained("choregos/state/last_decision").await;
+    let value: Value = serde_json::from_slice(&retained.payload).unwrap();
+    assert_eq!(
+        value,
+        json!({"id":id, "verdict":"achieved", "role":role, "reason":reason, "latency_ms":50})
+    );
+    let discovery = harness
+        .peer
+        .retained("homeassistant/sensor/choregos/last_decision/config")
+        .await;
+    let value: Value = serde_json::from_slice(&discovery.payload).unwrap();
+    assert_eq!(value["default_entity_id"], "sensor.choregos_last_decision");
+    assert_eq!(value["value_template"], "{{ value_json.verdict }}");
+    assert_eq!(
+        value["json_attributes_topic"],
+        "choregos/state/last_decision"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_settles_interrupted_verification_instead_of_restoring_a_permanent_pending_row() {
+    use crate::action::{Outcome, Verdict};
+    let mut harness = Harness::start().await;
+    harness.command(Command::SetMode(Mode::Active)).await;
+    harness.publish_wake().await;
+    let snapshot = wait_snapshot(&harness.state, |snapshot| {
+        snapshot.decisions.iter().any(|decision| {
+            decision.to == Some(RolePower::On) && decision.verdict == Verdict::Pending
+        })
+    })
+    .await;
+    let id = snapshot
+        .decisions
+        .iter()
+        .rev()
+        .find(|decision| decision.to == Some(RolePower::On))
+        .unwrap()
+        .id;
+    harness.restart_runtime().await;
+    let snapshot = wait_snapshot(&harness.state, |snapshot| {
+        snapshot
+            .decisions
+            .iter()
+            .any(|decision| decision.id == id && decision.verdict == Verdict::Unknown)
+    })
+    .await;
+    let row = snapshot
+        .decisions
+        .iter()
+        .find(|decision| decision.id == id)
+        .unwrap();
+    assert!(
+        row.expectations
+            .iter()
+            .all(|expectation| expectation.outcome == Outcome::Unknown { observed: None })
+    );
+    wait_persisted(
+        &harness.path.with_file_name("choregos.state.json"),
+        |saved| {
+            saved
+                .decisions
+                .iter()
+                .any(|decision| decision.id == id && decision.verdict == Verdict::Unknown)
+        },
+    )
+    .await;
+    harness.shutdown().await;
 }

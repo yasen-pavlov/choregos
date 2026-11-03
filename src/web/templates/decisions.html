@@ -4,7 +4,7 @@
 <section class="panel scroll">
   <h2>decision log</h2>
   <table class="grid">
-    <thead><tr><th>#</th><th>time</th><th>role</th><th>change</th><th>reason</th><th>actions</th></tr></thead>
+    <thead><tr><th>#</th><th>time</th><th>role</th><th>change</th><th>reason</th><th>verdict</th><th>actions</th></tr></thead>
     <tbody>
       {% for decision in decisions %}
       <tr class="decision{% if decision.would %} would{% endif %}" id="d-{{ decision.id }}">
@@ -13,10 +13,11 @@
         <td class="mono">{{ view::opt(decision.role) }}</td>
         <td>{{ view::transition(decision.from, decision.to) }}</td>
         <td>{{ decision.reason }}</td>
+        <td>{% include "partials/verdict.html" %}</td>
         <td>{% for action in decision.actions %}<span class="action mono{% if action.starts_with("would: ") %} would{% endif %}">{{ action }}</span>{% else %}<span class="dim">none</span>{% endfor %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="empty">No decisions yet.</td></tr>
+      <tr><td colspan="7" class="empty">No decisions yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>

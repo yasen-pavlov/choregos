@@ -52,6 +52,7 @@ pub enum TraceEntry {
         state: String,
         attrs: Value,
         changed: Option<DateTime<Utc>>,
+        updated: Option<DateTime<Utc>>,
     },
     TvPower {
         state: TvState,
@@ -65,6 +66,7 @@ pub enum TraceEntry {
     Command(Command),
     /// Full decision row with structured actions (not UI display strings).
     Decision(Value),
+    Verdict(Value),
     Identities(Vec<LearnedIdentity>),
     Connection {
         mqtt: bool,
@@ -115,9 +117,10 @@ pub fn line(ts: DateTime<Utc>, entry: &TraceEntry) -> String {
             state,
             attrs,
             changed,
+            updated,
         } => (
             "ha/state".into(),
-            json!({"entity":entity,"state":state,"attrs":attrs,"changed":changed}),
+            json!({"entity":entity,"state":state,"attrs":attrs,"changed":changed,"updated":updated}),
         ),
         TraceEntry::TvPower { state, at } => ("tv/state".into(), json!({"state":state,"at":at})),
         TraceEntry::ConsolePower { role, state, at } => (
@@ -126,6 +129,7 @@ pub fn line(ts: DateTime<Utc>, entry: &TraceEntry) -> String {
         ),
         TraceEntry::Command(command) => ("choregos/command".into(), json!(command)),
         TraceEntry::Decision(payload) => ("choregos/decision".into(), payload.clone()),
+        TraceEntry::Verdict(payload) => ("choregos/verdict".into(), payload.clone()),
         TraceEntry::Identities(identities) => ("choregos/identities".into(), json!(identities)),
         TraceEntry::Connection { mqtt } => ("choregos/connection".into(), json!({"mqtt":mqtt})),
     };
@@ -145,7 +149,7 @@ pub fn parse_checked(line: &str) -> anyhow::Result<Option<(DateTime<Utc>, TraceE
     let Envelope { ts, topic, payload } =
         serde_json::from_str(line).context("invalid trace envelope")?;
     let known = known_topic(&topic);
-    let entry = parse_entry(&topic, payload);
+    let entry = parse_entry(&topic, payload, ts);
     anyhow::ensure!(
         !known || entry.is_some(),
         "invalid trace payload for {topic}"
@@ -160,6 +164,7 @@ fn known_topic(topic: &str) -> bool {
             | "choregos/command"
             | "choregos/connection"
             | "choregos/decision"
+            | "choregos/verdict"
             | "ha/state"
             | "tv/state"
             | "probe/state"
@@ -176,11 +181,12 @@ fn known_topic(topic: &str) -> bool {
     )
 }
 
-fn parse_entry(topic: &str, payload: Value) -> Option<TraceEntry> {
+fn parse_entry(topic: &str, payload: Value, ts: DateTime<Utc>) -> Option<TraceEntry> {
     Some(match topic {
         "choregos/identities" => TraceEntry::Identities(serde_json::from_value(payload).ok()?),
         "choregos/command" => TraceEntry::Command(serde_json::from_value(payload).ok()?),
         "choregos/decision" => TraceEntry::Decision(payload),
+        "choregos/verdict" => TraceEntry::Verdict(payload),
         "choregos/connection" => TraceEntry::Connection {
             mqtt: payload.get("mqtt")?.as_bool()?,
         },
@@ -189,6 +195,12 @@ fn parse_entry(topic: &str, payload: Value) -> Option<TraceEntry> {
             state: payload.get("state")?.as_str()?.into(),
             attrs: payload.get("attrs")?.clone(),
             changed: serde_json::from_value(payload.get("changed")?.clone()).ok()?,
+            updated: match payload.get("updated") {
+                Some(value) => serde_json::from_value::<Option<DateTime<Utc>>>(value.clone())
+                    .ok()?
+                    .or(Some(ts)),
+                None => Some(ts),
+            },
         },
         "tv/state" => TraceEntry::TvPower {
             state: serde_json::from_value(payload.get("state")?.clone()).ok()?,
@@ -518,12 +530,14 @@ mod tests {
                 state: "on".into(),
                 attrs: json!({"volume_level":0.5}),
                 changed: Some(ts),
+                updated: Some(ts),
             },
             TraceEntry::HaState {
                 entity: "media_player.receiver".into(),
                 state: "unknown".into(),
                 attrs: json!({}),
                 changed: None,
+                updated: Some(ts),
             },
             TraceEntry::Identities(vec![LearnedIdentity {
                 la: 4,
@@ -545,6 +559,39 @@ mod tests {
         assert!(
             parse(r#"{"ts":"2026-10-30T12:00:00Z","topic":"future/event","payload":{}}"#).is_none()
         );
+    }
+
+    #[test]
+    fn old_ha_attribute_observations_fall_back_to_the_trace_timestamp() {
+        let ts = at("2026-10-30T12:00:05Z");
+        let changed = at("2026-10-30T12:00:00Z");
+        for updated in [None, Some(json!("2026-10-30T12:00:04Z"))] {
+            let mut payload = json!({"entity":"media_player.receiver","state":"on","attrs":{"source":"Console B"},"changed":changed});
+            if let Some(updated) = &updated {
+                payload["updated"] = updated.clone();
+            }
+            let text = json!({"ts":ts,"topic":"ha/state","payload":payload}).to_string();
+            let (
+                _,
+                TraceEntry::HaState {
+                    changed: actual_changed,
+                    updated: actual_updated,
+                    ..
+                },
+            ) = parse(&text).unwrap()
+            else {
+                panic!("HA state expected");
+            };
+            assert_eq!(actual_changed, Some(changed));
+            assert_eq!(
+                actual_updated,
+                Some(if updated.is_some() {
+                    at("2026-10-30T12:00:04Z")
+                } else {
+                    ts
+                })
+            );
+        }
     }
 
     #[tokio::test]

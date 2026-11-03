@@ -9,7 +9,9 @@ changes with `UPDATE_GOLDEN=1 cargo test --locked --test golden` and explain the
 differences in the same PR. Configurations preserve the captured role policies,
 timing, presets and speaker settings; generic web settings satisfy the current
 configuration schema but are unused by replay. No test contacts real devices.
-Expected lines are ordered `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`, `reason`, `actions`; ids restart at 1 for each replay, and the decision-identity re-bless adds only `id`/`parent`/`trigger` without changing the existing fields.
+Creation lines retain `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`,
+`reason`, `actions`, then add `expectations` and `verdict`. Settlement lines
+carry `at`, `verdict_for`, `verdict`, `expectations`; IDs restart at 1 per replay.
 
 ## 2026-11-02 room-intent regression check
 
@@ -19,6 +21,88 @@ intent now starts Unknown: until the first decision establishes intent,
 only HA's observed cache governs wake suppression, preserving restart
 behavior. Known Off intent still forces power-on through post-off HA lag.
 The corpus must remain byte-identical; no re-bless is needed.
+
+## 2026-11-03 expectations/verdicts re-bless
+
+Re-blessed with `UPDATE_GOLDEN=1 cargo test --locked --test golden`. These
+fixtures have no `tv/state` or `probe/state` lines: no result is attributed
+to a direct source. TV/receiver power confirmation uses HA `changed` after
+the dispatched action; TV now has a 45-second observation window, allowing
+the captured HA reconnect lag while recording actual latency separately.
+Source confirmation uses HA `updated`; these older traces lack that field,
+so their line timestamps supply attribute freshness without altering power
+freshness. A takeover in an already-On room has no redundant power
+expectation. Opted-out standby roles without a probe contribute no
+expectation: CEC On is not a refutation of a console which sleeps silently
+after answering. `cec_only` still requires actual fresh standby evidence
+for roles which permit CEC verification. No drift rows are introduced.
+
+| Case | Previous decision rows | Removed rows | Retained decision rows | Added verdict lines |
+| --- | ---: | --- | ---: | ---: |
+| `aether-console-wake-and-streamer-takeover` | 11 | none | 11 | 6 |
+| `aether-streamer-to-console-pause-standby` | 11 | none | 11 | 7 |
+| `aether-restart-mid-takeover` | 13 | none | 13 | 6 |
+| `aether-standby-retry` | 8 | old id 6 retry follow-up | 7 | 3 |
+| `tasmota-console-and-kodi` | 8 | none | 8 | 5 |
+
+- **Console wake / streamer takeover:** source selections 2 and 9 achieve via
+  HA updates. Wakes 1 and 8 achieve: TV HA On arrives after 19.090 s and
+  32.331 s, both inside the 45 s window; receiver On also arrives in time.
+  Takeover 4 has verdict `none`: room power was already On and Console A
+  explicitly opted out of CEC verification without an independent probe.
+  That does not claim the console slept. Room-off 7 and 11 achieve via HA.
+- **Streamer / console pause-standby:** initial wake 1 achieves with TV HA On
+  after 17.894 s. Room-off 4 and 11, wake 5, and source selection 6 achieve.
+  Takeover 8 achieves through the streamer's fresh `cec_only` standby report.
+  Source-settle 9 now achieves `Console B` at 23:23:38.663, 72 ms after
+  selection: attribute freshness comes from the HA update's line timestamp,
+  not the unchanged HA power-state `last_changed`.
+- **Restart mid-takeover:** initial wake 1 has verdict `none` because room
+  power was already On. Takeover 4 also has `none`: Console A opted out and
+  has no probe. Room-off 7 and 11, wakes 8 and 12, and source selections 9
+  and 13 all achieve via HA. The identities header still does not restart replay.
+- **Standby retry:** old row 6 disappears; its resend is `attempts: 1` on
+  wake 4's streamer expectation. That wake achieves through `cec_only`;
+  the already-On TV has no power expectation. Initial wake 1 achieves after
+  TV HA On arrives at 29.756 s. Final room-off 7 (formerly 8) achieves via HA.
+  Removing the intermediate row renumbers later ids/parents without changing
+  any original actions, timestamps or trigger provenance.
+- **Tasmota console / Kodi:** source selection 2 achieves. Console wake 1
+  achieves with TV HA On after 30.046 s and receiver HA On after 2.059 s.
+  Kodi wake 5 and room-off 4 and 8 also achieve via HA. No standby follow-ups
+  existed in this window and no CEC/direct confirmation is invented.
+
+The fields-only invariant was checked against base `86f7d19`: remove old
+verification follow-ups, remove new verdict lines and `expectations`/`verdict`
+keys, and normalize the sequential id/parent numbering after the one removed
+row. All five remaining streams compare equal, including timestamps, roles,
+transitions, reasons, triggers, actions and parent links. Totals: 50 retained
+decision rows, 27 verdict lines, one removed retry follow-up. Normalization is
+unnecessary in four cases.
+
+The exact verdict-field distribution across creation and settlement lines is:
+
+```text
+27 "verdict":"achieved"
+23 "verdict":"none"
+27 "verdict":"pending"
+```
+
+All 27 settled verdicts achieve; negative outcomes remain covered by injected
+engine tests, rather than forcing real captured successes into false failures.
+The review fix preserves these counts and every original decision field. The
+corpus does not exercise transient Standby/On, delayed retry warm-up, or a Kodi
+takeover/all-off. Dedicated replay regressions cover those gaps: p12/p7/p10
+retain main's exact CEC send sequence, Kodi gets no fabricated CEC expectation,
+and a polling-role trace cannot generate presence/off actions in the reporting
+tail. Any allowed source may confirm despite a prior direct disagreement.
+The final checked-confirmation fix changes only two settlement times: pause-
+standby verdict 8 moves from 23:23:37.949 to its 23:23:38.591 verification check
+(after the same-tick source decision); retry verdict 4 moves from 11:43:49.441
+to its 11:43:50.960 check. Their `cec_only` outcomes, resend counts and all
+creation rows remain unchanged. These timing changes prevent transient CEC
+Standby/On chatter from being reported as success before verification checks it.
+
 
 ## Cases
 
@@ -41,9 +125,9 @@ active/inactive-source traffic, room-off, another Console A wake and presence
 timeout cover continuity through that header. The live ring has 14 decisions
 excluding service-start/mode rows; the differences are explained below.
 
-**`aether-standby-retry` — 8 decisions.**
+**`aether-standby-retry` — 7 decisions + 3 verdict lines.**
 2026-11-02 10:15–12:40 UTC: Streamer's initial wake precedes its takeover by
-Console B, including a real `standby_retry`, then Inactive Source and room-off.
+Console B, including a real resend folded into its parent expectation, then Inactive Source and room-off.
 The window begins at 10:15 rather than 11:40 so Streamer's On state is established
 from input traffic, not invented from the identities header. The source daily
 trace has no pre-window availability record to copy. The first wake reason
@@ -68,8 +152,8 @@ View On. Consequently:
   22:08:30.777 becomes replay `ActiveSource` at 22:08:33.254, when the physical
   address reply verifies Streamer. Remaining reasons match.
 - In `aether-standby-retry`, the first live `PowerOn` at 10:17:47.209 becomes
-  replay `ActiveSource` at 10:17:49.557 for the same reason. All remaining reasons,
-  including `standby_retry`, match.
+  replay `ActiveSource` at 10:17:49.557 for the same reason. Other retained
+  decision reasons match; the retry is now an expectation attempt, not a row.
 - In `aether-restart-mid-takeover`, live Console B `TextViewOn` at 09:20:14.043
   becomes replay `ActiveSource` at 09:20:15.473, after its physical address reply.
   The mid-window identities header intentionally does not restart the replay
@@ -79,8 +163,10 @@ View On. Consequently:
 Windowed replay and extraction share the last pre-window availability record,
 when present, at its original timestamp. Extracted fixtures retain it after the
 identities seed; both paths therefore share a warm-up clock and bridge availability,
-not device power. Both drain final timers through the last selected input plus
-five seconds, independently of the input-selection `--until` bound.
+not device power. Both run control timers through the last selected input plus
+five seconds. Outstanding expectation deadlines then settle in a reporting-only
+tail, with no presence/off/retry/source timers or actions, independently of
+the input-selection `--until` bound.
 Starting a fixture mid-session can still omit an already-running role and its
 later takeover/standby decisions. A richer trace snapshot is a documented,
 unimplemented follow-up, not synthetic state added to these expected files.

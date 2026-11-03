@@ -224,6 +224,10 @@ tv_poll_ms = 2000                 # 500–10000 ms
 tv_window_s = 45                  # 5–300 seconds
 probe_poll_ms = 2000              # 500–10000 ms
 probe_window_s = 45               # 5–300 seconds
+tv_s = 45                        # expectation window permits HA reconnect lag after TV wake
+receiver_s = 10
+speakers_s = 5
+source_s = 10
 
 [fake_tv]
 power_status = "always_on"        # reply <Report Power Status: On> to <Give Device Power Status>
@@ -273,7 +277,7 @@ source = "Console A"
 on = ["report_physical_address", "image_view_on", "active_source"]
 off = ["standby", "inactive_source"]
 takeover = "cec_standby"
-verify_standby = false  # default true; false: send stop/query once, no verification
+verify_standby = false  # no CEC verification/retries; optional probe is the only standby evidence
 presence = "poll"
 
 [web]
@@ -298,7 +302,7 @@ prints the resolved config with secrets redacted.
 
 ### 5.1 Bus model
 `BusModel` keeps one entry per logical address 0–14:
-`{physical: Option<u16>, device_type: Option<u8>, vendor: Option<u32>, osd: Option<String>, power: Unknown|On|Standby|Transition, last_seen: Option<Instant>, verified: bool, confirmed_at: Option<DateTime<Utc>>, identified: bool}`
+`{physical: Option<u16>, device_type: Option<u8>, vendor: Option<u32>, osd: Option<String>, power: Unknown|On|Standby|Transition, power_at: Option<Instant>, last_seen: Option<Instant>, verified: bool, confirmed_at: Option<DateTime<Utc>>, identified: bool}`
 with transient flags tracking vendor/OSD re-confirmation since restore,
 plus `active_source: Option<u16>` (physical address) and the bridge's own LA.
 Learning rules (all from received frames; sender = `From`):
@@ -344,9 +348,23 @@ Takeovers are idempotent: a repeated On for the same role with no state change d
 
 `cec_pause_standby` uses deck-control Play: Still rather than the user-control Pause key: keys sent by the TV can make the displaced source assert Active Source and briefly steal the input. Play: Still pauses without that activation side effect, allowing directed Standby to be honoured during playback.
 
-- Per-device `verify_standby` defaults to `true`. When `false`, send the complete CEC stop/query sequence once (also for all-off and manual standby), without scheduling verification, retries, or any `standby_*` decision. Treat `90 xx` replies exactly as for any LA not under verification: apply the configured `on`/`off` event lists. For CEC takeover policies, reject this opt-out if `on` includes `power_on`: the query's `90 00` reply could wake the role and undo the takeover. `taken_over` already marks the role Off; nothing confirms it actually slept.
+- Per-device `verify_standby` defaults to `true`. When false, send the complete CEC stop/query sequence once (including all-off/manual standby), without retries or CEC standby evidence. If a probe is configured, create `[ps5]` only; otherwise create no standby expectation for that role. A console can answer `36` with `90 00` and sleep silently later, so CEC On is not a refutation for an opted-out role. Apply normal configured `on`/`off` lists to its `90 xx` replies. Reject this opt-out for CEC policies if `on` includes `power_on`, since the query's On reply could undo takeover.
 
-In active mode, both CEC stop policies (including all-off and manual standby) with `verify_standby = true` are verified after `takeover_settle_ms`, confirmed only by observed Standby/Transition bus power from that LA. During pending verification, `90 xx` replies update bus power but are not role signals or buffered signals, so an unchanged On reply cannot take the room back. Unless confirmed, retry the complete original stop/query sequence up to `standby_retries` times: `36`, `8F` for `cec_standby`, or `41 25`, `36`, `8F` for `cec_pause_standby`. Silence or NACK is not confirmation and does not shorten retries. Each pending verification remembers its sequence and counts every outgoing frame in it to its LA (`sent`: two or three per round), correlated NACKs (`nacked`), and whether any ACK was observed (`acked`). Observed Standby/Transition confirms the stop even when the trailing `8F` NACKs because the device is already asleep; an ACKed `36` also prevents absence classification if no power report arrives. On exhaustion without confirmation, record `standby_target_absent` if `sent > 0 && !acked && nacked >= sent` (expected for devices that leave the bus in standby), otherwise `standby_unconfirmed` (ACKed frames or missing results without a confirming power report). Extra/late NACKs cannot override an observed ACK. ACK-based classification requires patched bridge firmware; stock firmware without ACK information can only produce `standby_unconfirmed`. Send results for other LAs or frame data outside the remembered sequence do not affect verification. A real role On event (including configured `04`, `0D`, or `82`) or blocked/remapped identity cancels verification; bridge-offline or a config reload clears pending verifications. No verification is registered in shadow mode, and entering shadow clears pending checks. Residual risk: a retry deadline can land between a waking device's non-on-event frames (`84`/`87`, depending on its configured on list) and its on-event.
+In active mode, CEC stops with `verify_standby = true` retain the original
+verification lifecycle independently of verdicts. At each due check, remove
+the slot if the role woke, its identity became blocked/remapped, or bus power
+is Standby/Transition. Otherwise resend the original sequence up to
+`standby_retries`, scheduling the next check at `now + takeover_settle_ms`;
+on exhaustion remove the slot. Until that check removes it, `90 xx` updates
+bus power but is neither a role signal nor a buffered signal. A transient
+Standby then On before the check must not take back the room. Reporting
+confirmation or deadline expiry never removes or extends the control slot.
+Cancellation supplies unknown to an unfinished expectation; exhaustion stores
+an unknown fallback with `observed: "absent"` only when
+`sent > 0 && !acked && nacked >= sent`. Fresh matching evidence still wins,
+and a fresh disagreement at the reporting deadline is missed. Sequence ACK/NACK
+accounting, address-move retargeting and cancellation on bridge offline/reload/
+shadow are unchanged; independent probe confirmation does not stop retries.
 
 ### 5.5 Release (role turns Off)
 Start/restart `off_delay_s` timer. On expiry, if no role is On: `TvOff` and `HaCall{media_player.turn_off, receiver}`. `TvOff` uses HA by default, or native webOS SSAP over TLS (default port 3001) with an environment-only pairing key. Native off has one five-second connect/register/request/close deadline per attempt, three attempts one second apart, and no HA fallback. If a role turned On meanwhile the timer is cancelled.
@@ -397,6 +415,66 @@ the role's separate, non-persisted `direct` observation; `RoleView` exposes
 `direct: Option<(ConsoleState, DateTime<Utc>)>` and `probe_configured: bool`.
 Remote Play must be enabled and UDP reachability provided by the operator.
 
+### 5.5.1 Expectations and verdicts
+
+Each active observable decision carries `expectations: Vec<Expectation>` and a
+`verdict`. `Expectation` has `subject` (`tv`, `receiver`, `speakers`,
+`role:<name>`), `field` (`power`, `source`, `playback`), string `expect`,
+`via` (ordered `tv_direct`, `ps5`, `ha`, `cec`), `deadline_ms` relative to
+the decision time, `attempts: u8` (standby resends), and tagged `outcome.kind`:
+`pending`, `met {via, observed, latency_ms}`, `missed {observed}`,
+`unknown {observed?}`, or `cec_only {observed}`. Values are strings.
+
+Wake transitions expect TV On only when `WakeTv` was sent (direct webOS then
+HA, or HA only), receiver On only when `turn_on` was sent, speakers stopped
+only when `media_stop` was sent, and standby for stopped CEC-policy roles with
+verification enabled or an independent probe. `cec_standby` and
+`cec_pause_standby` permit `[ps5, cec]` with a probe, otherwise `[cec]`.
+Opted-out roles and non-CEC policies permit `[ps5]` only when a probe exists;
+`ha_media_stop`/`none` never gain a CEC power expectation.
+All-off/manual standby rows use the same policy for dispatched stops.
+`takeover_settled` expects the selected receiver source only if selection
+was sent; presets have no observable. `off_timer_expired` expects TV Off only
+when `TvOff` was sent and receiver Off only when its `turn_off` was sent.
+Unchanged room power is not an observable effect to verify. All other rows,
+including shadow would-rows, have empty
+expectations and verdict `none`.
+
+Default deadlines under `[verify]` are TV 45 s, receiver power 10 s, speakers
+5 s, source 10 s. The TV deadline is an observation window accommodating
+20–33 s HA reconnect lag after wake, not a latency target. Standby uses
+`takeover_settle_ms × (standby_retries + 1)`, including probe-only roles.
+On every event, evaluate pending fields against observations newer than the
+decision: HA power/playback uses `changed`, source attributes use `updated`,
+direct observations use their timestamps. Independent sources settle a fresh
+match immediately with actual latency; a different source's disagreement cannot
+veto it. The CEC leg is confirmed only by the verification's due confirmed check,
+with fresh Standby/Transition still present, never by raw frame sampling.
+A brief Standby followed by On before that check is not success; exhaustion with
+fresh On is missed, and without usable evidence is unknown. With a probe, retain
+checked CEC confirmation until the deadline if no independent match arrives;
+later cancellation must not erase that checked success. Keep the last
+disagreement only for `missed.observed`. Unreachable/unavailable is not truth.
+All deadlines feed `next_deadline`, including during warm-up.
+
+When all expectations settle, verdict is `achieved` if all met/CEC-only,
+`partial` if some did and some missed/unknown, `unknown` if all unknown, and
+`missed` otherwise. Verdict latency is the slowest `met` expectation, or null.
+Settlements mutate the existing ring row and persist via the single-slot
+writer; `UiEvent::Verdict {id, verdict, expectations}` refreshes the live bus.
+After restart, unfinished persisted fields settle unknown through this same
+path, retaining completed evidence; old monotonic deadlines are not resumed.
+`choregos/verdict` traces `{id, verdict, expectations}`; replay ignores
+recorded verdicts and prints `{at, verdict_for, verdict, expectations}` on
+recomputed settlement. Replay runs control timers only through its existing
+last-input-plus-five-second drain, then settles reporting deadlines without
+running identification, presence, standby-retry, source-settle, or room-off timers.
+Verdicts are reporting-only; drift is a later step.
+Bridge offline cancels only pending all-`[cec]` expectations. Independent
+HA/TV/probe expectations continue. Reload cancels only fields whose relevant
+endpoint, policy, target/source, bridge or deadline configuration changed;
+unrelated edits do not abandon in-flight observations.
+
 
 
 ### 5.6 Startup / resync
@@ -408,17 +486,13 @@ Resync additionally sends `83` immediately to each unverified restored LA. This 
 The runtime loads versioned `choregos.state.json` from the config file's directory.
 Version 2 contains `next_decision_id`, learned identities (`la`, `physical`,
 `vendor`, `osd`, `device_type`, `confirmed_at`) and the newest 2000 `DecisionView`
-entries, newest last. Each decision has a monotonic `id`, a tagged `trigger`
-(`frame {from,to,data}` with hex data, `command {command}` with the complete
-tagged `Command`, `timer {name}` with `room_off`, `takeover_settle`, `presence`,
-`standby_verification`, or `warmup`, or `service {name}` with `started`
-or `migrated`), and an optional `parent`; no frame ring,
-credentials or live power state are persisted. Wake-settle rows link to the wake
-decision; standby verification follow-ups link to the decision registering their
-stop sequence, including across address moves. Only roles stopped by that
-transition inherit its parent; already-Off targets use the command fallback row
-if present, otherwise null. Timer-driven rows retain their
-timer trigger even when another input processes the due timer. Version 1 is
+entries, newest last. Each has a monotonic `id`, tagged input/timer/service
+`trigger`, optional `parent`, additive `expectations` (missing defaults empty),
+and `verdict` (missing defaults none). Source-settle rows link to their wake
+decision; standby mechanics and outcomes belong to the decision dispatching
+the stop, including across address moves. Timer rows retain their timer
+trigger even when another input processes the deadline.
+Version 1 is
 atomically migrated in place: ring-order ids start at 1, parents are null,
 triggers are `service {name:"migrated"}`, and the next counter is ring length
 plus one. The loader raises stale counters above retained ring ids and rejects
@@ -445,6 +519,8 @@ empty; corrupt or unknown versions warn and start empty without failing startup.
   The runtime also captures `choregos/decision` creation rows with the full view,
   `would`, and structured actions (not ring display strings); extraction retains
   them and replay ignores them, recomputing from inputs with ids starting at 1.
+  Settlement traces use `choregos/verdict` with id, verdict and expectations;
+  extraction retains them and replay ignores the recorded outcomes.
   Direct observations are `tv/state` with `{state, at}` and `probe/state`
   with `{role, state, at}`; replay consumes these known topics and extraction
   retains them. Older versions ignore them.
@@ -493,9 +569,12 @@ Everything else: no reply (Feature Abort is a firmware concern).
 
 ### 5.11 HA exposure (MQTT discovery, retained)
 Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT). Entities: `binary_sensor.choregos_<role>` (power, per role), `sensor.choregos_active_source` (role name or `none`), `select.choregos_mode` (shadow/active), `button.choregos_all_off`, `binary_sensor.choregos_bridge` (bridge LWT), `sensor.choregos_conflicts` (count). Commands arrive on `choregos/cmd/<entity>`. State topics `choregos/state/<name>` retained.
+`sensor.choregos_last_decision` publishes the newest settled observable ring
+row's verdict with id, role, reason and latency_ms attributes. No drift entity
+is implemented in this step.
 
 ### 5.12 Events into the engine
-`Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>, updated: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
 `TvPower{state: On|Off|Unreachable, at: DateTime<Utc>}` is a direct observation
 only, independent of the HA cache and room intent.
 `ConsolePower{role, state: Awake|Standby|Unreachable, at: DateTime<Utc>}`
@@ -504,7 +583,7 @@ updates only the role's direct observation, never its CEC-derived logical power.
 `None` on Tasmota; the engine never reads them — the aether adapter already reduced a NACK-cut directed `rx` to header-only before the engine sees it (§1).
 `SendResult.status: SendStatus = Ack | Nack | ArbLost | LineError | Busy`,
 `attempts: Option<u8>`. Only `Ack` marks a standby verification acknowledged and
-only `Nack` counts toward `standby_target_absent`; `ArbLost`, `LineError` and
+only `Nack` counts toward absent-target evidence; `ArbLost`, `LineError` and
 `Busy` are neither (the target was never asked). Tasmota `{"Ack":true|false}`
 maps to `Ack`/`Nack` with `attempts: None` (its `false` conflates NACK with
 transmit aborts; unchanged behaviour).
@@ -518,6 +597,9 @@ The raw-send byte limit is a `BridgeConfig` property (14 Tasmota, 15 aether),
 enforced by the engine's `SendRaw` validation and the UI form.
 HA's parsed `last_changed` takes precedence; absent/invalid timestamps use injected
 wall time on state-string changes, otherwise retain the cached timestamp.
+HA `last_updated` independently timestamps attribute freshness; absent/invalid
+values use injected observation wall time. Trace `ha/state` retains `updated`;
+replay falls back to the line timestamp for older traces without that field.
 The HA cache contains observed state only: sending a command never changes
 its value or establishes when the device actually changed state.
 
@@ -556,7 +638,7 @@ impl AppState {
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }
 pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub intent: RoomIntent, pub tv_direct: Option<(TvState, DateTime<Utc>)>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
-pub enum UiEvent { Frame(FrameView), Decision(DecisionView) }   // snapshots are pulled via snapshot(), never broadcast
+pub enum UiEvent { Frame(FrameView), Decision(DecisionView), Verdict { id: u64, verdict: Verdict, expectations: Vec<Expectation> } } // publish updated snapshot before events
 pub enum Command { AllOff, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
 
 // src/web/mod.rs  (ui owns; core mounts)

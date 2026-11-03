@@ -33,6 +33,7 @@ pub struct BusEntry {
     pub vendor: Option<u32>,
     pub osd: Option<String>,
     pub power: BusPower,
+    pub power_at: Option<Instant>,
     pub last_seen: Option<Instant>,
     pub verified: bool,
     pub confirmed_at: Option<DateTime<Utc>>,
@@ -53,6 +54,7 @@ impl BusEntry {
             vendor: None,
             osd: None,
             power: BusPower::Unknown,
+            power_at: None,
             last_seen: None,
             verified: true,
             confirmed_at: None,
@@ -73,6 +75,7 @@ impl BusEntry {
         self.osd = moved.osd;
         self.device_type = moved.device_type;
         self.power = moved.power;
+        self.power_at = moved.power_at;
         self.verified = moved.verified;
         self.confirmed_at = moved.confirmed_at;
         // Scheduling stays LA-local, but inherited keys need fresh replies here.
@@ -362,6 +365,7 @@ impl BusModel {
     fn apply_report(
         entry: &mut BusEntry,
         frame: &Frame,
+        now: Instant,
         wall: DateTime<Utc>,
         change: IdentityChange,
         bridge: u8,
@@ -393,29 +397,34 @@ impl BusModel {
                 }
                 *active_source = frame.physical();
                 entry.power = BusPower::On;
+                entry.power_at = Some(now);
             }
             Some(INACTIVE_SOURCE) if frame.params.len() == 2 && frame.to == bridge => {
                 if *active_source == frame.physical() {
                     *active_source = None;
                 }
                 entry.power = BusPower::Standby;
+                entry.power_at = Some(now);
             }
             Some(STANDBY) if frame.from != bridge && (frame.to == bridge || frame.to == 15) => {
                 entry.power = BusPower::Standby;
+                entry.power_at = Some(now);
                 if *active_source == entry.physical {
                     *active_source = None;
                 }
             }
-            Some(REPORT_POWER_STATUS) => {
+            Some(REPORT_POWER_STATUS) if matches!(frame.params.first(), Some(0..=3)) => {
                 entry.power = match frame.params.first() {
                     Some(0) => BusPower::On,
                     Some(1) => BusPower::Standby,
                     Some(2 | 3) => BusPower::Transition,
                     _ => entry.power,
                 };
+                entry.power_at = Some(now);
             }
             Some(IMAGE_VIEW_ON | TEXT_VIEW_ON) if frame.to == bridge => {
                 entry.power = BusPower::On;
+                entry.power_at = Some(now);
             }
             _ => {}
         }
@@ -471,6 +480,7 @@ impl BusModel {
         Self::apply_report(
             entry,
             frame,
+            now,
             wall,
             change,
             self.bridge,

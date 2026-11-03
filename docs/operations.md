@@ -137,21 +137,53 @@ not executed effects (`would` marks suppression).
 | `taken_over` | Another role displaced this one; its logical state is already Off, independently of physical standby confirmation. |
 | `off_timer_expired` | The last-role-off delay expired with no unblocked role On; request TV and receiver off. |
 | `presence_timeout` | An On role with polling enabled missed the configured number of polls; mark it Off and its bus power Unknown. |
-| `standby_retry` | No observed Standby/Transition report yet; repeat the original stop/query sequence within the retry limit. |
-| `standby_unconfirmed` | Verification exhausted without Standby/Transition evidence; this does not establish that the device remained awake. |
-| `standby_target_absent` | Verification exhausted, at least one frame was sent, none ACKed, and correlated target NACKs cover every sent frame. |
 | `identity_lost` | An On role lost its identity binding; it becomes Off and may start the room-off timer. Investigate identity/address traffic. |
 | `service_started` | Runtime startup marker appended after the restored ring. |
 | `resync_complete` | A buffered role power transition was applied when startup/bridge resync warming finished. |
 
-For silent sleepers or devices that leave the CEC bus in standby,
-`standby_unconfirmed`/`standby_target_absent` can be structural, not a room-state
-failure: `taken_over` already set the role Off. Per-role `verify_standby = false`
-sends the initial stop/query sequence but omits verification, retries and
-`standby_*` decisions. For CEC takeover policies this requires removing
-`power_on` from that role's `on` list, or a query reply could undo the takeover.
-Keep verification for devices that need retries. `presence_timeout` is the
-normal silent-disappearance path only for roles configured with polling.
+Standby retries are folded into the parent decision's expectation. Expand the
+row to inspect its expected value, evidence, latency and `attempts` (resends,
+excluding the initial sequence). Logical `taken_over` still marks the role Off
+immediately; it is not independent proof that the device slept.
+The control verification slot has its own lifecycle: it remains until its due
+check observes confirmation/cancellation or exhausts retries. Neither a verdict
+nor a probe result ends that slot. After a delayed check, the next retry waits a
+full settle interval. While the slot exists, power-query replies cannot wake a role.
+Only CEC stop policies can create a CEC standby expectation; HA media-stop roles
+need an independent configured probe or contribute none.
+
+| Verdict / outcome | Meaning |
+| --- | --- |
+| `pending` | At least one observable effect is still within its deadline. |
+| `achieved` | Every expectation was met, including explicitly marked `cec_only` evidence. |
+| `partial` | Some expectations met; others missed or had no fresh evidence. |
+| `missed` | None met, and at least one fresh observation disagreed at its deadline. |
+| `unknown` | No expectation could be confirmed or contradicted by fresh evidence. |
+| `none` | No observable effect: identity, service, logical displacement, or shadow rows. |
+| `met` | An independent allowed source agreed; the expectation records source and latency. |
+| `cec_only` | CEC observed Standby/Transition, without independent confirmation. Counts as met. |
+
+An expectation's `unknown` may carry `observed: "absent"` when at least one
+frame was sent, none ACKed, and correlated NACKs cover every sent frame. This
+does not prove standby. A fresh On report instead yields `missed {observed: "on"}`.
+Per-role `verify_standby = false` opts out of CEC verification and retries:
+a console can answer `36` with `90 00` and then sleep silently, so CEC On is
+not a refutation. If a probe is configured, its expectation uses `[ps5]`
+only; otherwise no standby expectation is created for that role. For CEC
+takeover policies, remove `power_on` from its `on` list so the query reply
+cannot undo takeover. `presence_timeout` remains the separate disappearance
+path for roles configured with polling.
+
+The default TV expectation window is 45 seconds to accommodate HA reconnect
+lag after wake; latency records when confirmation actually arrived.
+Power expectations require HA `last_changed` after the decision. Receiver
+source expectations instead use `last_updated`, since changing an attribute
+does not change HA's state string. Traces retain both; old replay traces
+without `updated` use the line timestamp for attribute freshness only.
+Any allowed source can confirm a field; an earlier direct disagreement does not
+override fresh HA confirmation. Bridge offline cancels only all-CEC pending
+fields. Unrelated reloads preserve expectations; relevant endpoint, policy,
+target/source and deadline changes cancel only their affected fields.
 
 ## Incident replay
 
@@ -159,7 +191,13 @@ Copy the day's trace before retention removes it. Traces can contain private
 names and entities even though HA attributes are filtered: keep raw copies
 private. For a window spanning midnight, copy both files and pass them in
 chronological order. Replay is offline and never executes device actions.
-The `choregos/decision` trace topic preserves each creation row, including id, parent, trigger, structured actions and `would`; extraction keeps these rows, while replay ignores them and assigns fresh per-run ids to recomputed decisions.
+The `choregos/decision` trace topic preserves each creation row; `choregos/verdict`
+captures `{id, verdict, expectations}` at settlement. Extraction keeps both.
+Replay ignores recorded decisions/verdicts, recomputes them with per-run ids,
+and emits `{"at", "verdict_for", "verdict", "expectations"}` settlement lines.
+Control timers drain only through five seconds after the last selected input.
+Pending expectations then settle in a reporting-only tail; it cannot invent
+presence timeouts, retries, source selections or room-off actions.
 
 ```sh
 docker cp choregos:/config/cec-bus.2026-11-01.jsonl ./incident-private.jsonl
