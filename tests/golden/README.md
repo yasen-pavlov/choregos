@@ -104,6 +104,13 @@ creation rows remain unchanged. These timing changes prevent transient CEC
 Standby/On chatter from being reported as success before verification checks it.
 
 
+## 2026-11-05 receiver off deadline re-bless
+
+`[verify] receiver_off_s` (default 20) replaced the shared 10 s deadline on the
+receiver's off expectation after a live room-off whose receiver reported off at
+10.17 s settled `unknown`/`partial`. Every receiver `power = off` row now carries
+`deadline_ms: 20000`; no outcome, verdict, timestamp or action changed.
+
 ## Cases
 
 **`aether-receiver-off-first` — 4 decisions + 2 verdict lines.**

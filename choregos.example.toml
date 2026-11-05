@@ -67,7 +67,8 @@ tv_window_s = 45                  # stop at target or this deadline, 5–300 sec
 probe_poll_ms = 2000              # configured console probes, 500–10000 ms
 probe_window_s = 45               # stop at target or deadline, 5–300 seconds
 tv_s = 45                        # TV observation window allows HA reconnect lag; latency is recorded separately
-receiver_s = 10
+receiver_s = 10                  # receiver on after turn_on (observed ~2 s)
+receiver_off_s = 20              # receiver off after turn_off: its integration reports off late (observed 0.2–10.2 s)
 speakers_s = 5
 source_s = 10
 

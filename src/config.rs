@@ -259,6 +259,7 @@ pub struct VerifyConfig {
     pub probe_window_s: u64,
     pub tv_s: u64,
     pub receiver_s: u64,
+    pub receiver_off_s: u64,
     pub speakers_s: u64,
     pub source_s: u64,
 }
@@ -272,6 +273,7 @@ impl Default for VerifyConfig {
             probe_window_s: 45,
             tv_s: 45,
             receiver_s: 10,
+            receiver_off_s: 20,
             speakers_s: 5,
             source_s: 10,
         }
@@ -478,6 +480,7 @@ impl Config {
         if [
             self.verify.tv_s,
             self.verify.receiver_s,
+            self.verify.receiver_off_s,
             self.verify.speakers_s,
             self.verify.source_s,
         ]
