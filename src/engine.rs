@@ -1,6 +1,7 @@
 use crate::{
     action::{
-        Action, Decision, IdentifyQueries, ServiceKind, TimerKind, Trigger, Verdict, VerdictUpdate,
+        Action, Decision, DriftDetail, Field, IdentifyQueries, Outcome, ServiceKind, TimerKind,
+        Trigger, Verdict, VerdictUpdate, Via,
     },
     cec::{
         bus::{BusModel, LearnedIdentity},
@@ -140,6 +141,7 @@ enum DecisionTrigger {
     Command(Command),
     Timer(TimerKind),
     Service(ServiceKind),
+    Observation(Via),
 }
 
 impl DecisionTrigger {
@@ -189,9 +191,86 @@ impl DecisionTrigger {
             },
             Self::Timer(name) => Trigger::Timer { name: *name },
             Self::Service(name) => Trigger::Service { name: *name },
+            Self::Observation(source) => Trigger::Observation { source: *source },
         }
     }
 }
+
+#[derive(Default)]
+struct DriftTrack {
+    since: Option<(Instant, DateTime<Utc>)>,
+    intended: Option<String>,
+    sample: Option<(DateTime<Utc>, String)>,
+    open: Option<DriftDetail>,
+}
+
+impl DriftTrack {
+    fn disagreement_since(
+        &mut self,
+        now: Instant,
+        wall: DateTime<Utc>,
+        at: DateTime<Utc>,
+        observed: &str,
+    ) -> (Instant, DateTime<Utc>) {
+        let changed = self
+            .sample
+            .as_ref()
+            .is_none_or(|(previous_at, value)| *previous_at != at || value != observed);
+        if self.since.is_none() || changed {
+            self.since = Some((now, wall));
+            match &mut self.sample {
+                Some((previous_at, value)) => {
+                    *previous_at = at;
+                    if value != observed {
+                        value.clear();
+                        value.push_str(observed);
+                    }
+                }
+                sample => *sample = Some((at, observed.into())),
+            }
+        }
+        *self.since.get_or_insert((now, wall))
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct DriftInput {
+    tv_direct: bool,
+    tv_ha: bool,
+    receiver_ha: bool,
+}
+
+impl DriftInput {
+    fn from_event(event: &Event, config: &Config) -> Self {
+        match event {
+            Event::TvPower { .. } => Self {
+                tv_direct: true,
+                ..Self::default()
+            },
+            Event::HaState { entity, .. } => Self {
+                tv_ha: entity == &config.tv.entity,
+                receiver_ha: entity == &config.receiver.entity,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
+    fn is_sample(self, subject: &str, via: Via) -> bool {
+        match (subject, via) {
+            ("tv", Via::TvDirect) => self.tv_direct,
+            ("tv", Via::Ha) => self.tv_ha,
+            ("receiver", Via::Ha) => self.receiver_ha,
+            _ => false,
+        }
+    }
+}
+
+const DRIFT_FIELDS: [(&str, Field, &[Via]); 3] = [
+    ("tv", Field::Power, &[Via::TvDirect, Via::Ha]),
+    ("receiver", Field::Power, &[Via::Ha]),
+    ("receiver", Field::Source, &[Via::Ha]),
+];
 
 pub struct Engine {
     pub config: Arc<Config>,
@@ -207,6 +286,7 @@ pub struct Engine {
     pub next_decision_id: u64,
     pub verdicts: Vec<VerdictUpdate>,
     pending_decisions: BTreeMap<u64, PendingDecision>,
+    drift_tracks: [DriftTrack; 3],
     stopped_roles: Vec<String>,
     now: Instant,
     wall: DateTime<Utc>,
@@ -251,6 +331,7 @@ impl Engine {
             trigger: None,
             verdicts: vec![],
             pending_decisions: BTreeMap::new(),
+            drift_tracks: std::array::from_fn(|_| DriftTrack::default()),
             stopped_roles: vec![],
             now,
             wall: DateTime::<Utc>::UNIX_EPOCH,
@@ -308,6 +389,7 @@ impl Engine {
                     .values()
                     .flat_map(|pending| pending.deadlines()),
             )
+            .chain(self.drift_deadlines())
             .min()
     }
     pub fn handle(&mut self, event: Event, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
@@ -317,6 +399,7 @@ impl Engine {
         self.now = now;
         self.wall = wall;
         self.trigger = DecisionTrigger::from_event(&event);
+        let drift_input = DriftInput::from_event(&event, &self.config);
         self.settle_due_independent(now);
         let was_warming = self.warming;
         if self.warming && now >= self.warm_until {
@@ -421,6 +504,7 @@ impl Engine {
             }
         }
         self.evaluate_expectations(now);
+        self.evaluate_drift(now, drift_input);
         actions
     }
 
@@ -468,6 +552,9 @@ impl Engine {
         self.config = config;
         self.intent.receiver_source = None;
         self.tv_direct = None;
+        for track in &mut self.drift_tracks {
+            track.since = None;
+        }
         self.standby_verifications.clear();
         self.roles
             .retain(|role, _| self.config.device.iter().any(|d| &d.role == role));
@@ -744,6 +831,7 @@ impl Engine {
             Command::SetMode(mode) => {
                 Arc::make_mut(&mut self.config).mode = mode;
                 if mode == Mode::Shadow {
+                    self.close_drifts();
                     self.cancel_expectations();
                     self.standby_verifications.clear();
                 }
@@ -1320,6 +1408,179 @@ impl Engine {
         vec![]
     }
 
+    /// The open set is live reporting state, never restored from the decision ring.
+    pub fn drift(&self) -> Vec<DriftDetail> {
+        self.drift_tracks
+            .iter()
+            .filter_map(|track| track.open.clone())
+            .collect()
+    }
+
+    fn drift_deadlines(&self) -> impl Iterator<Item = Instant> + '_ {
+        self.drift_tracks
+            .iter()
+            .filter_map(|track| track.since)
+            .map(|(since, _)| since + Duration::from_secs(self.config.verify.drift_grace_s))
+    }
+
+    fn drift_intended(&self, subject: &str, field: Field) -> Option<&str> {
+        let entity = match subject {
+            "tv" => &self.config.tv.entity,
+            _ => &self.config.receiver.entity,
+        };
+        if entity.is_empty() {
+            return None;
+        }
+        match (field, self.intent.power) {
+            (Field::Power, RoomPower::On) => Some("on"),
+            (Field::Power, RoomPower::Off) => Some("off"),
+            (Field::Source, RoomPower::On) => self.intent.receiver_source.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn evaluate_drift(&mut self, now: Instant, input: DriftInput) {
+        if self.mode() == Mode::Shadow {
+            self.close_drifts();
+            return;
+        }
+        if self.warming {
+            return;
+        }
+        for index in 0..DRIFT_FIELDS.len() {
+            let mut track = std::mem::take(&mut self.drift_tracks[index]);
+            self.evaluate_drift_field(&mut track, index, now, input);
+            self.drift_tracks[index] = track;
+        }
+    }
+
+    fn evaluate_drift_field(
+        &mut self,
+        track: &mut DriftTrack,
+        index: usize,
+        now: Instant,
+        input: DriftInput,
+    ) {
+        let (subject, field, sources) = DRIFT_FIELDS[index];
+        let intended = self.drift_intended(subject, field);
+        if track.intended.as_deref() != intended {
+            track.since = None;
+            track.intended = intended.map(str::to_owned);
+            self.close_drift_field(track, index);
+        }
+        let Some(intended) = self.drift_intended(subject, field) else {
+            track.since = None;
+            return;
+        };
+        let sample = self.newest_independent_sample(subject, field, sources, None);
+        let Some(sample) = sample else {
+            track.since = None;
+            return;
+        };
+        let (_, observed, _) = sample;
+        if self.drift_field_pending(subject, field) {
+            track.since = None;
+            return;
+        }
+        if observed == intended {
+            track.since = None;
+            self.close_drift_field(track, index);
+        } else if let Some((detail, trigger)) =
+            self.drift_onset(track, index, now, input, (intended, sample))
+        {
+            track.open = Some(detail.clone());
+            track.since = None;
+            self.record_drift("drift", detail, trigger);
+        }
+    }
+
+    fn drift_onset(
+        &self,
+        track: &mut DriftTrack,
+        index: usize,
+        now: Instant,
+        input: DriftInput,
+        comparison: (&str, (Via, &str, DateTime<Utc>)),
+    ) -> Option<(DriftDetail, DecisionTrigger)> {
+        if track.open.is_some() {
+            return None;
+        }
+        let (subject, field, _) = DRIFT_FIELDS[index];
+        let (intended, (via, observed, at)) = comparison;
+        let (since, since_wall) = track.disagreement_since(now, self.wall, at, observed);
+        if now.duration_since(since) < Duration::from_secs(self.config.verify.drift_grace_s) {
+            return None;
+        }
+        let detail = DriftDetail {
+            subject: subject.into(),
+            field,
+            intended: intended.into(),
+            observed: observed.into(),
+            via,
+            since: since_wall,
+        };
+        let trigger = if input.is_sample(subject, via) {
+            DecisionTrigger::Observation(via)
+        } else {
+            DecisionTrigger::Timer(TimerKind::DriftGrace)
+        };
+        Some((detail, trigger))
+    }
+
+    fn close_drift_field(&mut self, track: &mut DriftTrack, index: usize) {
+        if track.open.is_none() {
+            return;
+        }
+        let (subject, field, sources) = DRIFT_FIELDS[index];
+        let observed = self
+            .newest_independent_sample(subject, field, sources, None)
+            .map(|(via, value, _)| (via, value));
+        if let Some(detail) = Self::resolved_drift(track, observed) {
+            let via = detail.via;
+            self.record_drift("drift_resolved", detail, DecisionTrigger::Observation(via));
+        }
+    }
+
+    fn close_drifts(&mut self) {
+        for index in 0..DRIFT_FIELDS.len() {
+            let mut track = std::mem::take(&mut self.drift_tracks[index]);
+            track.since = None;
+            self.close_drift_field(&mut track, index);
+            self.drift_tracks[index] = track;
+        }
+    }
+
+    fn drift_field_pending(&self, subject: &str, field: Field) -> bool {
+        if subject == "receiver" && field == Field::Source && self.settle.is_some() {
+            return true;
+        }
+        self.pending_decisions.values().any(|pending| {
+            pending.expectations.iter().any(|expectation| {
+                expectation.outcome == Outcome::Pending
+                    && expectation.subject == subject
+                    && expectation.field == field
+            })
+        })
+    }
+
+    fn resolved_drift(
+        track: &mut DriftTrack,
+        observed: Option<(Via, &str)>,
+    ) -> Option<DriftDetail> {
+        let mut detail = track.open.take()?;
+        let (via, value) = observed.unwrap_or((detail.via, "unknown"));
+        detail.observed = value.into();
+        detail.via = via;
+        Some(detail)
+    }
+
+    fn record_drift(&mut self, reason: &str, detail: DriftDetail, trigger: DecisionTrigger) {
+        let previous = self.trigger.replace(trigger);
+        self.record(None, None, None, reason, vec![], None);
+        self.decisions.last_mut().expect("recorded drift").drift = Some(detail);
+        self.trigger = previous;
+    }
+
     fn record(
         &mut self,
         role: Option<String>,
@@ -1355,6 +1616,7 @@ impl Engine {
             actions,
             expectations,
             verdict,
+            drift: None,
         });
         id
     }

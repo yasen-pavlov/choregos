@@ -71,6 +71,7 @@ pub enum TimerKind {
     Presence,
     StandbyVerification,
     Warmup,
+    DriftGrace,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -88,6 +89,18 @@ pub enum Trigger {
     Command { command: Command },
     Timer { name: TimerKind },
     Service { name: ServiceKind },
+    Observation { source: Via },
+}
+
+/// Reporting-only disagreement with room intent, paired by its onset time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DriftDetail {
+    pub subject: String,
+    pub field: Field,
+    pub intended: String,
+    pub observed: String,
+    pub via: Via,
+    pub since: chrono::DateTime<chrono::Utc>,
 }
 
 /// One observable effect of a decision. Values stay strings across adapters.
@@ -205,6 +218,8 @@ pub struct Decision {
     pub actions: Vec<Action>,
     pub expectations: Vec<Expectation>,
     pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<DriftDetail>,
 }
 
 #[cfg(test)]
