@@ -262,6 +262,7 @@ pub struct VerifyConfig {
     pub receiver_off_s: u64,
     pub speakers_s: u64,
     pub source_s: u64,
+    pub drift_grace_s: u64,
 }
 
 impl Default for VerifyConfig {
@@ -276,6 +277,7 @@ impl Default for VerifyConfig {
             receiver_off_s: 20,
             speakers_s: 5,
             source_s: 10,
+            drift_grace_s: 30,
         }
     }
 }
@@ -476,6 +478,9 @@ impl Config {
         }
         if !(5..=300).contains(&self.verify.probe_window_s) {
             return invalid("verify probe_window_s must be in 5..=300 seconds");
+        }
+        if !(5..=600).contains(&self.verify.drift_grace_s) {
+            return invalid("verify drift_grace_s must be in 5..=600 seconds");
         }
         if [
             self.verify.tv_s,

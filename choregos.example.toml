@@ -71,6 +71,7 @@ receiver_s = 10                  # receiver on after turn_on (observed ~2 s)
 receiver_off_s = 20              # receiver off after turn_off: its integration reports off late (observed 0.2–10.2 s)
 speakers_s = 5
 source_s = 10
+drift_grace_s = 30               # reporting-only room intent disagreement grace, 5–600 seconds
 
 [fake_tv]
 replies = true                  # false if bridge firmware owns directed TV replies; never answers Request Active Source

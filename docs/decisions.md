@@ -2,6 +2,43 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-05 — Reporting-only room drift
+
+- Compare configured TV/receiver power and intended receiver source after
+  expectation evaluation, using the shared newest usable independent sample
+  lookup. No CEC evidence: role power is the wake input, not desired state;
+  speakers stop is one-shot and supplies no playback intent.
+- A same-field pending expectation owns reporting until settlement. First
+  disagreement then starts a monotonic grace clock (default 30 s, 5–600 s),
+  independent of historical HA timestamps. Intent changes/reload reset grace.
+  Unusable evidence clears grace but retains open drift, preventing expired
+  deadlines from causing a Tick busy loop. A new disagreeing timestamp or
+  value restarts grace; identical redelivery preserves it. Both rules reject
+  the observed HA webOS reconnect flap: after an achieved wake, HA reported
+  off, unavailable, then off/on one millisecond apart while the TV stayed on.
+  Neither a gap without evidence nor two different off samples establish a
+  continuously held disagreement.
+- One actionless onset and one resolution share onset wall time in structured
+  `drift` detail. Tick onset uses `timer/drift_grace`; sample onset and
+  resolution use `observation` with the selected source.
+- Review: entering Shadow closes all open drift and clears grace in the mode
+  command pass before cancelling expectations. A changed field intent likewise
+  closes its previous pair immediately, then starts a fresh comparison. Open
+  drift must never refer to obsolete intent or survive disabled monitoring.
+- HA media-player power treats playing/paused/idle/buffering as On and standby
+  as Off, sharing normalization with expectation verification rather than
+  reporting false disagreements for normal playback states.
+- Receiver source awaiting takeover settle counts as pending even before
+  `select_source` creates its expectation. Onset observation provenance belongs
+  only to an input supplying the selected sample; unrelated inputs use the
+  grace timer. Onset construction is extracted from field evaluation.
+- Keep monotonic and wall onset together in one optional tuple, preventing
+  mismatched clocks without runtime assertions.
+- Keep the open set in memory and expose `Snapshot.drift`; historical rows
+  persist additively in v2, but do not restore current drift. Reporting must
+  not become control or resume stale observations after restart. Dedicated
+  HA/UI surfaces and their publication fingerprint belong to PR B.
+
 ## 2026-11-05 — Separate receiver off deadline
 
 - The receiver reports `on` a steady 2 s after `turn_on` but `off` anywhere from

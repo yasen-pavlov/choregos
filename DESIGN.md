@@ -229,6 +229,7 @@ receiver_s = 10
 receiver_off_s = 20
 speakers_s = 5
 source_s = 10
+drift_grace_s = 30                # reporting-only drift grace, 5–600 seconds
 
 [fake_tv]
 power_status = "always_on"        # reply <Report Power Status: On> to <Give Device Power Status>
@@ -481,11 +482,63 @@ recorded verdicts and prints `{at, verdict_for, verdict, expectations}` on
 recomputed settlement. Replay runs control timers only through its existing
 last-input-plus-five-second drain, then settles reporting deadlines without
 running identification, presence, standby-retry, source-settle, or room-off timers.
-Verdicts are reporting-only; drift is a later step.
+Verdicts and drift are reporting-only; neither sends corrective actions.
 Bridge offline cancels only pending all-`[cec]` expectations. Independent
 HA/TV/probe expectations continue. Reload cancels only fields whose relevant
 endpoint, policy, target/source, bridge or deadline configuration changed;
 unrelated edits do not abandon in-flight observations.
+
+#### Drift
+
+In active mode outside warm-up, compare `RoomIntent` to `tv.power` and
+`receiver.power` when intended power is On/Off and the entity is configured;
+also compare `receiver.source` when power is On and a source is intended.
+Unknown intent checks nothing. Speakers playback has no persistent intent,
+and role power is the CEC-derived wake input, so neither is monitored.
+Use the shared newest usable independent sample lookup: HA power uses
+`changed`, source uses `updated`, TV direct uses `at`; unknown/unavailable
+and direct Unreachable supply no evidence. Never use CEC evidence for drift.
+HA media-player power normalizes `on|playing|paused|idle|buffering` to `on`,
+and `off|standby` to `off` for both drift and expectations; other usable
+states stay raw. Playback normalization remains separate.
+
+Evaluate after expectations, on every event including Tick. Undefined intent
+clears grace and resolves any open drift (observed current usable value or
+`unknown`); unusable evidence otherwise clears grace, retaining open drift. A pending
+expectation for the same subject/field clears grace, retaining an open drift;
+another field's pending expectation does not block. Receiver source selection
+awaiting the takeover-settle timer also counts as pending for `receiver.source`,
+before its expectation exists. Agreement clears grace and resolves an open drift.
+Disagreement starts grace at first observation
+using injected monotonic time, not the sample's historical timestamp.
+Changing the selected disagreement's timestamp or value restarts grace;
+identical redelivery preserves it. Thus HA reconnect off/unavailable/off/on
+flaps do not accumulate a false disagreement clock.
+At `[verify].drift_grace_s` (default 30, bounds 5–600), emit one `drift`
+per onset; further disagreement emits nothing until resolution.
+Intent changes close the old drift immediately and reset grace before comparing
+the new intent. Reload resets all grace clocks, retains the open set until
+re-evaluation, and delays evaluation through the existing three-second warm-up.
+Entering Shadow resolves every open drift using the current usable observation
+or `unknown`, and clears grace in the command pass before cancelling expectations.
+Shadow never starts drift. Grace deadlines join `next_deadline`; clearing
+grace on unusable evidence also prevents expired-deadline Tick loops.
+
+Both rows have no role/transition/actions/expectations and verdict `none`.
+Optional `Decision.drift` / `DecisionView.drift` carries
+`DriftDetail { subject: String, field: Field, intended: String, observed: String,
+via: Via, since: DateTime<Utc> }`; absent keys default to None and are omitted
+on serialization. The resolved row retains the original intended value and
+onset wall time (`since`), updating observed/via; its duration is row time
+minus since. Onset uses `{"kind":"observation","source":"ha"}` (or `tv_direct`)
+only when the handled event supplies the selected observation; unrelated events
+and Tick use `{"kind":"timer","name":"drift_grace"}`. Every resolution uses
+observation provenance with its selected source (or the original via if unknown).
+Rows use the ordinary ring/trace/replay paths without a state version bump.
+`Snapshot.drift: Vec<DriftDetail>` exposes the in-memory open set; it is not
+persisted or included in the entity-state fingerprint until exposure work.
+Drift participates in replay's five-second control drain, not its
+expectation-only tail.
 
 
 
@@ -500,7 +553,8 @@ Version 2 contains `next_decision_id`, learned identities (`la`, `physical`,
 `vendor`, `osd`, `device_type`, `confirmed_at`) and the newest 2000 `DecisionView`
 entries, newest last. Each has a monotonic `id`, tagged input/timer/service
 `trigger`, optional `parent`, additive `expectations` (missing defaults empty),
-and `verdict` (missing defaults none). Source-settle rows link to their wake
+`verdict` (missing defaults none), and optional `drift` detail (missing defaults
+None). Source-settle rows link to their wake
 decision; standby mechanics and outcomes belong to the decision dispatching
 the stop, including across address moves. Timer rows retain their timer
 trigger even when another input processes the deadline.

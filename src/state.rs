@@ -93,6 +93,7 @@ impl AppState {
             active_role: None,
             intent: RoomIntent::default(),
             tv_direct: None,
+            drift: Vec::new(),
             conflicts: Vec::new(),
             recent_frames: VecDeque::new(),
             decisions: VecDeque::new(),
@@ -244,6 +245,7 @@ pub struct Snapshot {
     pub active_role: Option<String>,
     pub intent: RoomIntent,
     pub tv_direct: Option<(TvState, DateTime<Utc>)>,
+    pub drift: Vec<crate::action::DriftDetail>,
     pub conflicts: Vec<Conflict>,
     pub recent_frames: VecDeque<FrameView>,
     pub decisions: VecDeque<DecisionView>,
@@ -523,6 +525,8 @@ pub struct DecisionView {
     pub expectations: Vec<crate::action::Expectation>,
     #[serde(default)]
     pub verdict: crate::action::Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<crate::action::DriftDetail>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

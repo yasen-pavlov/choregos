@@ -1,4 +1,4 @@
-# Expectations and verdicts (phase 1, steps 1–3 implemented)
+# Expectations, verdicts and drift (phase 1, steps 1–3 and step 4 detection implemented)
 
 A decision today ends when the engine has emitted its actions. CEC sends come
 back as ack/nack and feed only standby verification; HA calls, webOS off and
@@ -40,11 +40,14 @@ Decision
   role / from / to / reason / actions / would   unchanged
   trigger       {"kind":"frame","from":u8,"to":u8,"data":"HEX"}
               | {"kind":"command","command":<Command with kind and optional data>}
-              | {"kind":"timer","name":"room_off"|"takeover_settle"|"presence"|"standby_verification"|"warmup"}
+              | {"kind":"timer","name":"room_off"|"takeover_settle"|"presence"|"standby_verification"|"warmup"|"drift_grace"}
               | {"kind":"service","name":"started"|"migrated"}
+              | {"kind":"observation","source":"ha"|"tv_direct"}
   parent        Option<id>   for takeover_settled follow-ups
   expectations  [Expectation]   empty for rows with no observable effect
   verdict       pending | achieved | partial | missed | unknown | none
+  drift         optional DriftDetail {subject, field, intended, observed, via, since: RFC3339}
+                omitted when absent; since joins onset/resolution rows
 
 Expectation
   subject   tv | receiver | speakers | role:<name>
@@ -159,22 +162,54 @@ New:
 
 ## Room intent and drift
 
-The engine gets an explicit `RoomIntent { power: unknown|on|off, active_role,
-receiver_source }`, derived from the same transitions that create decisions.
-It is what the verifier compares against once all decisions have settled:
+`RoomIntent { power: unknown|on|off, active_role, receiver_source }` is derived
+from the transitions creating decisions. Drift detection is implemented;
+dedicated HA/UI exposure is PR B.
 
-- A `drift` row (`reason = drift`, `subject.field`, intended, observed) is
-  recorded when an observed field disagrees with the intent for longer than
-  `verify.drift_grace_s` (default 30 s) with no decision pending; one row per
-  onset, a `drift_resolved` row when it agrees again. Examples: receiver turned
-  off by hand while the room is on; TV turned on by its remote while the room
-  is off.
-- Drift rows carry no actions. Remediation is out of scope for this phase.
+Monitor TV and receiver power for configured entities when intended power is
+On/Off, and receiver source when power is On with a defined source. Startup
+Unknown checks nothing. Do not monitor speakers playback (stop is one-shot,
+no intent field), or `role:<name>.power` (CEC-derived input; On is a wake trigger).
+Newest usable independent sample wins by its own timestamp: HA `changed`
+for power, `updated` for source, direct TV `at`. The shared verifier lookup
+excludes HA unknown/unavailable and direct Unreachable; no CEC evidence.
+For power, HA `on|playing|paused|idle|buffering` normalize to `on` and
+`off|standby` to `off`; other usable values stay raw. Expectations use the
+same normalization; source/playback semantics are unchanged.
 
-Intent, direct observations and verdict comparison are implemented in steps 1–3;
-drift remains step 4. A per-device `ps5` discovery probe
-provides Awake/Standby/Unreachable over unicast UDP; it requires Remote Play
-and a reachable UDP path from the Choregos host. Its trace topic is `probe/state`.
+Evaluate after expectations on every handle, including Tick, but not during
+warm-up or Shadow. For each field, in order:
+1. Undefined intent clears grace and resolves any open drift, with current
+   usable observation or `unknown`.
+2. Unusable observation clears grace, leaving an open drift untouched.
+3. A pending expectation on this subject/field clears grace but keeps an open
+   drift; receiver source awaiting takeover settle counts as pending too.
+   Other fields' expectations do not block.
+4. Agreement clears grace and resolves any open drift.
+5. Disagreement starts grace on first observation, restarting when the selected
+   sample's timestamp or value changes (identical redelivery retains grace);
+   once grace elapses, emit one `drift` row and keep it open until resolution.
+
+`verify.drift_grace_s` defaults to 30 s, validated in 5–600 s. Injected monotonic
+time measures grace from first disagreement, not historical HA sample time.
+Intent changes close the old drift immediately and reset grace before comparing
+the new intent. Entering Shadow resolves open drift with current usable evidence
+or `unknown` and clears grace before cancelling expectations in that command pass.
+Reload resets every grace clock, keeps the open set until re-evaluation,
+and delays evaluation through three-second warm-up. Grace edits apply on
+the next evaluation. Deadlines wake Tick exactly at the boundary. Clearing grace
+on unusable evidence prevents expired-deadline Tick loops; restarting for new
+samples rejects HA reconnect off/unavailable/off/on flaps.
+
+Rows have reason `drift` / `drift_resolved`, no role/transition/actions or
+expectations, and verdict `none`. Optional `drift` carries subject, field,
+intended, observed, via and onset wall time `since`. Resolution retains the
+original intended and since so pairs can be joined. Onset uses observation
+only when the handled event supplies the selected sample (matching HA entity
+or direct TV); unrelated inputs and Tick use timer `drift_grace`. Resolutions
+use observation with the selected source. No corrective actions or extra polling.
+The per-field open set is in-memory only, exposed as `Snapshot.drift`, never
+restored from historical ring rows; state remains version 2.
 
 
 ## Persistence, trace, replay
@@ -200,11 +235,11 @@ and a reachable UDP path from the Choregos host. Its trace topic is `probe/state
 - Ring/UI: `/decisions` rows show a verdict chip; a row expands to its
   expectations (expected / observed / via / latency). Minimal; the real
   surfaces come with the phase-2 redesign.
-- Snapshot: the existing mutable decision ring exposes verdicts; the newest
-  settled observable row supplies the last-decision sensor. Per-role stats
-  and a dedicated drift snapshot are deferred with their future surfaces.
+- Snapshot: the mutable decision ring exposes verdicts and `drift` details;
+  `Snapshot.drift` contains currently open drifts. Per-role stats remain deferred.
 - Home Assistant: `sensor.choregos_last_decision` (state = verdict; attributes
-  id, role, reason, latency_ms). The drift binary sensor is step 4.
+  id, role, reason, latency_ms). It ignores actionless drift rows. Dedicated
+  binary-sensor and UI drift exposure remain PR B.
 
 ## Not in this phase
 
@@ -221,7 +256,8 @@ richer identities header for mid-session replay (separate follow-up noted in
 3. **Implemented:** expectations + verdicts + `[verify]` deadlines; mutable
    persisted ring, verdict trace/replay lines and final drain; UI chip/details;
    HA last-decision sensor. Golden output updated with case explanations.
-4. **Not implemented:** drift rows/sensor (intentionally out of this task).
+4. **Detection implemented (PR A):** drift rows, grace configuration, trace/replay,
+   open-set snapshot. Dedicated sensor/UI exposure is PR B.
 
 Each step is its own PR with Opus engine review and Luna test/doc review; 1–3
 can ship as one release, 4 after a few days of verdicts.
@@ -252,7 +288,7 @@ can ship as one release, 4 after a few days of verdicts.
   Opted-out roles without a probe contribute no expectation; with a probe they
   accept only independent evidence. CEC On is not a refutation for them.
 - No redundant `Snapshot.last_verdict`: derive the latest settled observable
-  decision from the ring. Statistics and drift exposure remain later work.
+  decision from the ring. Statistics and dedicated drift surfaces remain later work.
 - Persisted pending rows interrupted by restart settle their unfinished fields
   unknown, preserving already completed evidence; old monotonic deadlines and
   effects are not resumed.

@@ -422,7 +422,8 @@ impl Engine {
 
     fn independent_sample<'a>(
         &'a self,
-        expectation: &Expectation,
+        subject: &str,
+        field: Field,
         via: Via,
     ) -> Option<(&'a str, DateTime<Utc>)> {
         match via {
@@ -431,8 +432,7 @@ impl Engine {
                 TvState::Off => Some(("off", at)),
                 TvState::Unreachable => None,
             }),
-            Via::Ps5 => expectation
-                .subject
+            Via::Ps5 => subject
                 .strip_prefix("role:")
                 .and_then(|role| self.roles.get(role))
                 .and_then(|role| role.direct)
@@ -442,7 +442,7 @@ impl Engine {
                     ConsoleState::Unreachable => None,
                 }),
             Via::Ha => {
-                let entity = match expectation.subject.as_str() {
+                let entity = match subject {
                     "tv" => Some(&self.config.tv.entity),
                     "receiver" => Some(&self.config.receiver.entity),
                     "speakers" => Some(&self.config.sonos.entity),
@@ -454,8 +454,13 @@ impl Engine {
                         if matches!(state.state.as_str(), "unknown" | "unavailable") {
                             return None;
                         }
-                        let value = match expectation.field {
+                        let value = match field {
                             Field::Source => state.attrs.get("source")?.as_str()?,
+                            Field::Power => match state.state.as_str() {
+                                "on" | "playing" | "paused" | "idle" | "buffering" => "on",
+                                "off" | "standby" => "off",
+                                other => other,
+                            },
                             Field::Playback
                                 if matches!(
                                     state.state.as_str(),
@@ -468,7 +473,7 @@ impl Engine {
                         };
                         Some((
                             value,
-                            match expectation.field {
+                            match field {
                                 Field::Source => state.updated?,
                                 Field::Power | Field::Playback => state.changed?,
                             },
@@ -479,13 +484,33 @@ impl Engine {
         }
     }
 
+    /// Select by the sample's timestamp, not adapter preference or arrival time.
+    /// The optional upper bound preserves verifier creation-time semantics.
+    pub(super) fn newest_independent_sample<'a>(
+        &'a self,
+        subject: &str,
+        field: Field,
+        sources: &[Via],
+        before: Option<DateTime<Utc>>,
+    ) -> Option<(Via, &'a str, DateTime<Utc>)> {
+        sources
+            .iter()
+            .filter_map(|&via| {
+                self.independent_sample(subject, field, via)
+                    .map(|(value, at)| (via, value, at))
+            })
+            .filter(|(_, _, at)| before.is_none_or(|before| *at < before))
+            .max_by_key(|(_, _, at)| *at)
+    }
+
     fn observation<'a>(
         &'a self,
         wall: DateTime<Utc>,
         expectation: &Expectation,
         via: Via,
     ) -> Option<Observation<'a>> {
-        let (value, observed_at) = self.independent_sample(expectation, via)?;
+        let (value, observed_at) =
+            self.independent_sample(&expectation.subject, expectation.field, via)?;
         if observed_at <= wall
             || observed_at > wall + chrono::Duration::milliseconds(expectation.deadline_ms as i64)
         {
@@ -569,15 +594,12 @@ impl Engine {
     /// Creation alone may use a recent matching independent observation.
     /// CEC still requires its fresh, due verification check.
     fn settle_already_satisfied(&self, expectation: &mut Expectation) {
-        let newest = expectation
-            .via
-            .iter()
-            .filter_map(|&via| {
-                self.independent_sample(expectation, via)
-                    .map(|(value, at)| (via, value, at))
-            })
-            .filter(|(_, _, at)| *at < self.wall)
-            .max_by_key(|(_, _, at)| *at);
+        let newest = self.newest_independent_sample(
+            &expectation.subject,
+            expectation.field,
+            &expectation.via,
+            Some(self.wall),
+        );
         let Some((via, value, at)) = newest else {
             return;
         };

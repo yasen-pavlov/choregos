@@ -175,7 +175,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries (`from`, `to` as `HH:MM`, HA `script`). Slots must cover exactly 24 hours; `24:00` is valid only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` role IDs whose volume keys are forwarded while Sonos is `playing` |
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
-| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV window allows HA reconnect lag; observed latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Active-mode observation only; live-reloadable. |
+| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV window allows HA reconnect lag; observed latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
 | `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302}` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
@@ -292,6 +292,10 @@ CEC-only confirmation counts toward achievement but remains visibly `cec_only`.
 Verdicts report what happened; they never send corrective actions.
 Creation and settlement are captured as `choregos/decision` and
 `choregos/verdict` trace entries; offline replay recomputes both.
+In active mode, sustained TV/receiver power or receiver-source disagreement with
+room intent adds actionless `drift` / `drift_resolved` rows after the configured
+grace. These do not replace the last-decision sensor; dedicated UI and HA drift
+exposure are separate work.
 
 ![Decision log](docs/decisions.png)
 

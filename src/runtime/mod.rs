@@ -692,6 +692,7 @@ impl Runtime {
                 would: self.engine.mode() == Mode::Shadow && decision.reason != "service_started",
                 expectations: decision.expectations.clone(),
                 verdict: decision.verdict,
+                drift: decision.drift.clone(),
             };
             if self.engine.config.trace.keep_days != 0 && self.trace.is_some() {
                 let mut payload = serde_json::to_value(decision).expect("serializable decision");
@@ -1094,6 +1095,7 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     snapshot.active_role = engine.intent.active_role.clone();
     snapshot.intent = engine.intent.clone();
     snapshot.tv_direct = engine.tv_direct;
+    snapshot.drift = engine.drift();
     snapshot.conflicts = engine.identity.conflicts.clone();
     snapshot.connections.bridge_online = engine.bridge_online;
     snapshot.connections.mode = engine.mode();
@@ -1214,6 +1216,74 @@ mod loop_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn drift_snapshot_tracks_open_set_and_last_decision_sensor_ignores_drift_rows() {
+        use crate::action::Verdict;
+        let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        config.mode = Mode::Active;
+        let mut snapshot = AppState::new(config.clone(), String::new()).snapshot();
+        let now = Instant::now();
+        let wall = DateTime::<Utc>::UNIX_EPOCH;
+        let receiver = config.receiver.entity.clone();
+        let mut engine = Engine::new(config, now, vec![], 1);
+        engine.intent.power = crate::state::RoomPower::On;
+        let input = |state: &str, seconds| Event::HaState {
+            entity: receiver.clone(),
+            state: state.into(),
+            attrs: Default::default(),
+            changed: Some(wall + chrono::Duration::seconds(seconds)),
+            updated: None,
+        };
+        engine.handle(
+            input("off", 4),
+            now + Duration::from_secs(4),
+            wall + chrono::Duration::seconds(4),
+        );
+        engine.handle(
+            Event::Tick,
+            now + Duration::from_secs(34),
+            wall + chrono::Duration::seconds(34),
+        );
+        update_snapshot(&mut snapshot, &engine, now + Duration::from_secs(34), wall);
+        assert_eq!(snapshot.drift.len(), 1);
+        let settled: DecisionView = serde_json::from_value(serde_json::json!({
+            "id":99,"trigger":{"kind":"timer","name":"room_off"},"parent":null,
+            "timestamp":wall,"role":null,"from":null,"to":null,"reason":"off_timer_expired",
+            "actions":[],"would":false,"verdict":"achieved"
+        }))
+        .unwrap();
+        snapshot.decisions.push_back(settled);
+        let mut drift = serde_json::to_value(&engine.decisions[0]).unwrap();
+        drift["timestamp"] = serde_json::json!(wall);
+        drift["would"] = serde_json::json!(false);
+        snapshot
+            .decisions
+            .push_back(serde_json::from_value(drift).unwrap());
+        assert_eq!(snapshot.decisions.back().unwrap().verdict, Verdict::None);
+        let (mqtt, mut events) = mqtt::Mqtt::test_transport(true, 32);
+        mqtt.states(&snapshot);
+        events.clean();
+        let payload = events
+            .pending
+            .iter()
+            .find_map(|request| match request {
+                rumqttc::Request::Publish(p) if p.topic == "choregos/state/last_decision" => {
+                    Some(serde_json::from_slice::<serde_json::Value>(&p.payload).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(payload["id"], 99);
+        assert_eq!(payload["verdict"], "achieved");
+        engine.handle(
+            input("on", 35),
+            now + Duration::from_secs(35),
+            wall + chrono::Duration::seconds(35),
+        );
+        update_snapshot(&mut snapshot, &engine, now + Duration::from_secs(35), wall);
+        assert!(snapshot.drift.is_empty());
+        assert_eq!(engine.decisions[0].reason, "drift_resolved");
+    }
     #[tokio::test]
     async fn atomic_persistence_roundtrips_and_failed_edits_preserve_original() {
         let directory = tempfile::tempdir().unwrap();
@@ -1692,6 +1762,31 @@ mod persistence_tests {
     }
 
     #[tokio::test]
+    async fn v2_state_without_drift_loads_the_existing_decision_ring() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.state.json");
+        let wall = DateTime::<Utc>::UNIX_EPOCH;
+        let state = serde_json::json!({
+            "version": 2, "next_decision_id": 2, "identities": [],
+            "decisions": [{
+                "id": 1, "parent": null, "trigger": {"kind":"service","name":"started"},
+                "timestamp": wall, "role": null, "from": null, "to": null,
+                "reason": "service_started", "actions": [], "would": false,
+                "expectations": [], "verdict": "none"
+            }]
+        });
+        tokio::fs::write(&path, serde_json::to_vec(&state).unwrap())
+            .await
+            .unwrap();
+        let loaded = PersistedState::load(&path, wall).await.unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.next_decision_id, 2);
+        assert_eq!(loaded.decisions.len(), 1);
+        assert_eq!(loaded.decisions[0].reason, "service_started");
+        assert_eq!(loaded.decisions[0].drift, None);
+    }
+
+    #[tokio::test]
     async fn v1_migration_is_durable_and_restart_continues_the_counter() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("choregos.state.json");
@@ -1771,6 +1866,7 @@ mod persistence_tests {
             would: false,
             expectations: vec![],
             verdict: crate::action::Verdict::None,
+            drift: None,
         });
         let saved = PersistedState::capture(&engine, &ring);
         persist_bytes(&path, &serde_json::to_vec(&saved).unwrap())

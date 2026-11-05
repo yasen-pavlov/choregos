@@ -12,6 +12,21 @@ configuration schema but are unused by replay. No test contacts real devices.
 Creation lines retain `at`, `id`, `parent`, `trigger`, `role`, `from`, `to`,
 `reason`, `actions`, then add `expectations` and `verdict`. Settlement lines
 carry `at`, `verdict_for`, `verdict`, `expectations`; IDs restart at 1 per replay.
+Drift onset/resolution creation rows additionally carry optional `drift` detail;
+other rows omit that key. Drift evaluation participates in the existing
+last-input-plus-five-second control drain, never the expectation-only tail.
+
+## 2026-11-05 drift detection regression check
+
+All seven expected streams remain byte-identical; no re-bless. In
+`aether-console-wake-and-streamer-takeover`, wake 8 at 18:01:25.295 settles TV
+On via HA at 18:01:57.635. HA then reports Off at 18:02:51.559, unavailable
+at 18:03:03.796, Off at 18:03:26.528 and On at 18:03:26.536 (the final two
+sample timestamps differ by about 1 ms). This reconnect flap must not add
+drift: unavailable clears grace and the new Off sample starts a fresh clock
+which On immediately cancels. Identical sample redelivery, unlike a new
+timestamp/value, preserves grace. Injected replay tests cover both rules,
+the flap and unusable evidence arriving at/after a grace deadline.
 
 ## 2026-11-02 room-intent regression check
 

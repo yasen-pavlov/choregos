@@ -814,6 +814,7 @@ fn shadow_decision() -> DecisionView {
         would: true,
         expectations: vec![],
         verdict: crate::action::Verdict::None,
+        drift: None,
     }
 }
 

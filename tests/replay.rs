@@ -6164,3 +6164,721 @@ fn cancellation_preserves_checked_cec_evidence_while_waiting_for_the_probe() {
         }
     }
 }
+
+fn drift_receiver(engine: &mut Engine, start: Instant, ms: u64, state: &str, source: &str) {
+    verdict_event(
+        engine,
+        start,
+        ms,
+        Event::HaState {
+            entity: engine.config.receiver.entity.clone(),
+            state: state.into(),
+            attrs: BTreeMap::from([("source".into(), Value::String(source.into()))]),
+            changed: Some(wall() + chrono::Duration::milliseconds(ms as i64)),
+            updated: Some(wall() + chrono::Duration::milliseconds(ms as i64)),
+        },
+    );
+}
+
+fn drift_ready() -> (Engine, Instant) {
+    let (mut engine, start, _) = verdict_wake();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv, "on");
+    drift_receiver(&mut engine, start, 300, "on", "Streamer");
+    verdict_event(&mut engine, start, 2200, Event::Tick);
+    (engine, start)
+}
+
+fn assert_no_drift_rows(engine: &Engine) {
+    assert!(engine.decisions.iter().all(|row| row.drift.is_none()));
+}
+
+#[test]
+fn drift_receiver_manual_off_reports_once_and_resolves_with_same_onset() {
+    use choregos::action::Field;
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    verdict_event(&mut engine, start, 32999, Event::Tick);
+    assert_no_drift_rows(&engine);
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    let row = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "drift")
+        .unwrap();
+    assert_eq!(
+        row.trigger,
+        Trigger::Timer {
+            name: TimerKind::DriftGrace
+        }
+    );
+    assert!(row.actions.is_empty() && row.expectations.is_empty());
+    assert_eq!(row.verdict, Verdict::None);
+    assert!(row.role.is_none() && row.from.is_none() && row.to.is_none());
+    let detail = row.drift.clone().unwrap();
+    assert_eq!(
+        (
+            &*detail.subject,
+            detail.field,
+            &*detail.intended,
+            &*detail.observed,
+            detail.via
+        ),
+        ("receiver", Field::Power, "on", "off", Via::Ha)
+    );
+    assert_eq!(detail.since, wall() + chrono::Duration::seconds(3));
+    assert_eq!(engine.drift(), vec![detail.clone()]);
+    verdict_event(&mut engine, start, 34000, Event::Tick);
+    assert_no_drift_rows(&engine);
+    drift_receiver(&mut engine, start, 35000, "off", "Streamer");
+    assert_no_drift_rows(&engine);
+    drift_receiver(&mut engine, start, 36000, "on", "Streamer");
+    let resolved = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "drift_resolved")
+        .unwrap();
+    assert_eq!(resolved.trigger, Trigger::Observation { source: Via::Ha });
+    assert_eq!(resolved.drift.as_ref().unwrap().since, detail.since);
+    assert_eq!(resolved.drift.as_ref().unwrap().observed, "on");
+    assert!(engine.drift().is_empty());
+}
+
+fn drift_room_off(engine: &mut Engine, start: Instant) {
+    verdict_event(engine, start, 3000, Event::Command(Command::AllOff));
+    verdict_event(engine, start, 6000, Event::Tick);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(engine, start, 6100, tv, "off");
+    drift_receiver(engine, start, 6200, "off", "Streamer");
+    assert_eq!(engine.intent.power, RoomPower::Off);
+}
+
+#[test]
+fn drift_tv_remote_on_uses_newest_usable_sample_not_arrival_order() {
+    let (mut engine, start) = drift_ready();
+    drift_room_off(&mut engine, start);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 7000, tv, "on");
+    verdict_event(
+        &mut engine,
+        start,
+        8000,
+        Event::TvPower {
+            state: TvState::Off,
+            at: wall() + chrono::Duration::seconds(6),
+        },
+    );
+    verdict_event(&mut engine, start, 37000, Event::Tick);
+    assert_eq!(engine.drift()[0].subject, "tv");
+    assert_eq!(engine.drift()[0].observed, "on");
+    verdict_event(
+        &mut engine,
+        start,
+        38000,
+        Event::TvPower {
+            state: TvState::Off,
+            at: wall() + chrono::Duration::seconds(38),
+        },
+    );
+    assert!(engine.drift().is_empty());
+    let row = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "drift_resolved")
+        .unwrap();
+    assert_eq!(row.drift.as_ref().unwrap().via, Via::TvDirect);
+}
+
+#[test]
+fn drift_pending_field_blocks_until_settlement_but_other_fields_do_not() {
+    let (mut engine, start, id) = verdict_wake();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv, "off");
+    drift_receiver(&mut engine, start, 300, "on", "Streamer");
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert_eq!(engine.drift().len(), 1);
+    assert_eq!(engine.drift()[0].subject, "receiver");
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    verdict_event(&mut engine, start, 45100, Event::Tick);
+    assert!(matches!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Missed { .. }
+    ));
+    verdict_event(&mut engine, start, 75099, Event::Tick);
+    assert_no_drift_rows(&engine);
+    verdict_event(&mut engine, start, 75100, Event::Tick);
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .filter(|row| row.reason == "drift")
+            .count(),
+        1
+    );
+    assert_eq!(
+        engine
+            .decisions
+            .last()
+            .unwrap()
+            .drift
+            .as_ref()
+            .unwrap()
+            .subject,
+        "tv"
+    );
+
+    // A separate TV power expectation must not suppress receiver power drift.
+    let (mut engine, start, id) = verdict_wake();
+    std::sync::Arc::make_mut(&mut engine.config)
+        .verify
+        .drift_grace_s = 5;
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv, "off");
+    drift_receiver(&mut engine, start, 300, "on", "Streamer");
+    verdict_event(&mut engine, start, 2200, Event::Tick);
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    assert_eq!(engine.next_deadline(), Some(start + Duration::from_secs(8)));
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    verdict_event(&mut engine, start, 8000, Event::Tick);
+    assert_eq!(engine.drift()[0].subject, "receiver");
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+}
+
+#[test]
+fn drift_unusable_samples_neither_start_nor_resolve_and_do_not_spin_deadlines() {
+    let (mut engine, start) = drift_ready();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 3000, tv.clone(), "unavailable");
+    verdict_event(
+        &mut engine,
+        start,
+        4000,
+        Event::TvPower {
+            state: TvState::Unreachable,
+            at: wall(),
+        },
+    );
+    verdict_event(&mut engine, start, 40000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    verdict_ha(&mut engine, start, 41000, tv.clone(), "off");
+    verdict_ha(&mut engine, start, 71000, tv.clone(), "unknown");
+    verdict_event(&mut engine, start, 71000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    assert!(
+        engine
+            .next_deadline()
+            .is_none_or(|at| at > start + Duration::from_secs(71))
+    );
+    verdict_ha(&mut engine, start, 72000, tv.clone(), "off");
+    assert!(engine.drift().is_empty());
+    verdict_event(&mut engine, start, 102000, Event::Tick);
+    assert_eq!(engine.drift().len(), 1);
+    verdict_ha(&mut engine, start, 103000, tv.clone(), "unavailable");
+    verdict_event(
+        &mut engine,
+        start,
+        104000,
+        Event::TvPower {
+            state: TvState::Unreachable,
+            at: wall(),
+        },
+    );
+    assert_eq!(engine.drift().len(), 1);
+    verdict_ha(&mut engine, start, 105000, tv, "on");
+    assert!(engine.drift().is_empty());
+}
+
+#[test]
+fn drift_intent_changes_resolve_power_and_reload_undefined_source() {
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert_eq!(engine.drift().len(), 1);
+    verdict_event(&mut engine, start, 34000, Event::Command(Command::AllOff));
+    verdict_event(&mut engine, start, 37000, Event::Tick);
+    // An intent change closes the old drift immediately, even while the new
+    // power-off command is still awaiting its own expectation.
+    assert!(engine.drift().is_empty());
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "drift_resolved")
+    );
+
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "on", "Other");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    let onset = engine.drift()[0].since;
+    let config = engine.config.clone();
+    verdict_event(&mut engine, start, 34000, Event::ConfigReloaded(config));
+    assert_eq!(engine.drift().len(), 1);
+    // Undefined intent closes even when current observation is unusable.
+    drift_receiver(&mut engine, start, 35000, "unavailable", "Other");
+    verdict_event(&mut engine, start, 37000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    let detail = engine
+        .decisions
+        .iter()
+        .find_map(|row| row.drift.as_ref())
+        .unwrap();
+    assert_eq!(detail.since, onset);
+    assert_eq!(detail.observed, "unknown");
+    assert_eq!(detail.intended, "Streamer");
+}
+
+#[test]
+fn drift_sample_after_grace_records_observation_trigger_and_original_wall_onset() {
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    drift_redeliver_receiver(&mut engine, start, 34000);
+    let row = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "drift")
+        .unwrap();
+    assert_eq!(row.trigger, Trigger::Observation { source: Via::Ha });
+    assert_eq!(
+        serde_json::to_value(&row.trigger).unwrap(),
+        serde_json::json!({"kind":"observation","source":"ha"})
+    );
+    assert_eq!(
+        row.drift.as_ref().unwrap().since,
+        wall() + chrono::Duration::seconds(3)
+    );
+}
+
+#[test]
+fn drift_shadow_and_reload_warmup_do_not_accumulate_grace() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(
+        &mut engine,
+        start,
+        3000,
+        Event::Command(Command::SetMode(Mode::Shadow)),
+    );
+    drift_receiver(&mut engine, start, 4000, "off", "Streamer");
+    verdict_event(&mut engine, start, 40000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    verdict_event(
+        &mut engine,
+        start,
+        41000,
+        Event::Command(Command::SetMode(Mode::Active)),
+    );
+    let config = engine.config.clone();
+    verdict_event(&mut engine, start, 42000, Event::ConfigReloaded(config));
+    verdict_event(&mut engine, start, 44000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    verdict_event(&mut engine, start, 45000, Event::Tick);
+    verdict_event(&mut engine, start, 74999, Event::Tick);
+    assert_no_drift_rows(&engine);
+    verdict_event(&mut engine, start, 75000, Event::Tick);
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(45)
+    );
+}
+
+#[test]
+fn drift_next_deadline_and_agreement_clear_the_grace_and_intent_changes_reset_it() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(33))
+    );
+    drift_receiver(&mut engine, start, 4000, "on", "Streamer");
+    assert_eq!(engine.next_deadline(), None);
+    drift_receiver(&mut engine, start, 5000, "on", "Other");
+    // A source intent change starts a new disagreement clock, rather than
+    // inheriting the original source's onset.
+    engine.intent.receiver_source = Some("New source".into());
+    verdict_event(&mut engine, start, 6000, Event::Tick);
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(36))
+    );
+    let mut config = (*engine.config).clone();
+    config.verify.drift_grace_s = 5;
+    verdict_event(
+        &mut engine,
+        start,
+        7000,
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+    );
+    verdict_event(&mut engine, start, 10000, Event::Tick);
+    assert_eq!(engine.next_deadline(), None); // reload made source undefined
+}
+
+#[test]
+fn drift_unknown_startup_and_unconfigured_entities_are_not_monitored() {
+    let (mut engine, start) = setup();
+    verdict_event(
+        &mut engine,
+        start,
+        4000,
+        Event::Command(Command::SetMode(Mode::Active)),
+    );
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 5000, tv, "on");
+    verdict_event(&mut engine, start, 40000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    engine.intent.power = RoomPower::Off;
+    let mut config = (*engine.config).clone();
+    config.tv.entity.clear();
+    config.receiver.entity.clear();
+    verdict_event(
+        &mut engine,
+        start,
+        41000,
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+    );
+    verdict_event(&mut engine, start, 80000, Event::Tick);
+    assert!(engine.drift().is_empty());
+}
+
+#[test]
+fn drift_config_defaults_bounds_and_legacy_rows_remain_compatible() {
+    let old = include_str!("../choregos.example.toml")
+        .lines()
+        .filter(|line| !line.starts_with("drift_grace_s"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut config = Config::parse(&old).unwrap();
+    assert_eq!(config.verify.drift_grace_s, 30);
+    for seconds in [4, 601] {
+        config.verify.drift_grace_s = seconds;
+        assert!(config.validate().is_err());
+    }
+    for seconds in [5, 600] {
+        config.verify.drift_grace_s = seconds;
+        config.validate().unwrap();
+    }
+    let legacy: choregos::state::DecisionView = serde_json::from_value(serde_json::json!({
+        "id":1,"trigger":{"kind":"service","name":"started"},"parent":null,
+        "timestamp":wall(),"role":null,"from":null,"to":null,"reason":"service_started",
+        "actions":[],"would":false
+    }))
+    .unwrap();
+    assert!(legacy.drift.is_none());
+    assert!(serde_json::to_value(legacy).unwrap().get("drift").is_none());
+}
+
+fn drift_redeliver_receiver(engine: &mut Engine, start: Instant, ms: u64) {
+    let entity = engine.config.receiver.entity.clone();
+    let cached = engine.ha[&entity].clone();
+    verdict_event(
+        engine,
+        start,
+        ms,
+        Event::HaState {
+            entity,
+            state: cached.state,
+            attrs: cached.attrs,
+            changed: cached.changed,
+            updated: cached.updated,
+        },
+    );
+}
+
+#[test]
+fn drift_same_timestamp_and_value_redelivery_keeps_original_grace() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    drift_receiver(&mut engine, start, 3000, "on", "Other");
+    drift_redeliver_receiver(&mut engine, start, 20000);
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(33))
+    );
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(3)
+    );
+}
+
+fn drift_replacement_source(engine: &mut Engine, start: Instant, updated_s: i64, source: &str) {
+    let entity = engine.config.receiver.entity.clone();
+    verdict_event(
+        engine,
+        start,
+        10000,
+        Event::HaState {
+            entity,
+            state: "on".into(),
+            attrs: BTreeMap::from([("source".into(), Value::String(source.into()))]),
+            changed: Some(wall() + chrono::Duration::milliseconds(300)),
+            updated: Some(wall() + chrono::Duration::seconds(updated_s)),
+        },
+    );
+}
+
+fn assert_restarted_source_grace(engine: &mut Engine, start: Instant) {
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(40))
+    );
+    drift_redeliver_receiver(engine, start, 20000);
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(40))
+    );
+    verdict_event(engine, start, 39999, Event::Tick);
+    assert_no_drift_rows(engine);
+    verdict_event(engine, start, 40000, Event::Tick);
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(10)
+    );
+}
+
+#[test]
+fn drift_new_timestamp_with_same_value_restarts_grace() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    drift_receiver(&mut engine, start, 3000, "on", "Other");
+    drift_replacement_source(&mut engine, start, 10, "Other");
+    assert_restarted_source_grace(&mut engine, start);
+}
+
+#[test]
+fn drift_new_value_with_same_timestamp_restarts_grace() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    drift_receiver(&mut engine, start, 3000, "on", "Other");
+    drift_replacement_source(&mut engine, start, 3, "Another");
+    assert_restarted_source_grace(&mut engine, start);
+}
+
+#[test]
+fn drift_ha_reconnect_off_unavailable_off_on_flap_does_not_report() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 3000, tv.clone(), "off");
+    verdict_ha(&mut engine, start, 15000, tv.clone(), "unavailable");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert_no_drift_rows(&engine);
+    verdict_ha(&mut engine, start, 40000, tv.clone(), "off");
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(70))
+    );
+    assert_no_drift_rows(&engine);
+    verdict_ha(&mut engine, start, 40001, tv, "on");
+    verdict_event(&mut engine, start, 70000, Event::Tick);
+    assert_no_drift_rows(&engine);
+    assert!(engine.drift().is_empty());
+}
+
+#[test]
+fn drift_unusable_at_or_after_grace_cancels_deadline_and_later_sample_starts_fresh() {
+    for unavailable_at in [33000, 34000] {
+        let (mut engine, start) = drift_ready();
+        verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+        drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+        assert_eq!(
+            engine.next_deadline(),
+            Some(start + Duration::from_secs(33))
+        );
+        drift_receiver(
+            &mut engine,
+            start,
+            unavailable_at,
+            "unavailable",
+            "Streamer",
+        );
+        assert_no_drift_rows(&engine);
+        assert_eq!(engine.next_deadline(), None);
+        drift_receiver(&mut engine, start, 35000, "off", "Streamer");
+        assert_eq!(
+            engine.next_deadline(),
+            Some(start + Duration::from_secs(65))
+        );
+        verdict_event(&mut engine, start, 64999, Event::Tick);
+        assert_no_drift_rows(&engine);
+        verdict_event(&mut engine, start, 65000, Event::Tick);
+        assert_eq!(
+            engine.drift()[0].since,
+            wall() + chrono::Duration::seconds(35)
+        );
+    }
+}
+
+#[test]
+fn drift_shadow_transition_closes_open_drifts_in_the_command_pass() {
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    let onset = engine.drift()[0].since;
+    drift_receiver(&mut engine, start, 34000, "unavailable", "Streamer");
+    verdict_event(
+        &mut engine,
+        start,
+        35000,
+        Event::Command(Command::SetMode(Mode::Shadow)),
+    );
+    assert!(engine.drift().is_empty());
+    let detail = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "drift_resolved")
+        .unwrap()
+        .drift
+        .as_ref()
+        .unwrap();
+    assert_eq!(detail.since, onset);
+    assert_eq!(detail.observed, "unknown");
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "command_set_mode")
+    );
+}
+
+#[test]
+fn drift_source_intent_change_closes_old_pair_and_opens_new_pair_after_grace() {
+    let (mut engine, start) = drift_ready();
+    verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
+    drift_receiver(&mut engine, start, 3000, "on", "Other");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    let old = engine.drift()[0].clone();
+    engine.intent.receiver_source = Some("New source".into());
+    verdict_event(&mut engine, start, 34000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    let detail = engine.decisions[0].drift.as_ref().unwrap();
+    assert_eq!(engine.decisions[0].reason, "drift_resolved");
+    assert_eq!(detail.since, old.since);
+    assert_eq!(detail.intended, "Streamer");
+    assert_eq!(detail.observed, "Other");
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(64))
+    );
+    verdict_event(&mut engine, start, 64000, Event::Tick);
+    assert_eq!(engine.drift()[0].intended, "New source");
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(34)
+    );
+}
+
+#[test]
+fn drift_receiver_playing_is_power_on_for_verification_and_intent() {
+    use choregos::action::Field;
+    let (mut engine, start, id) = verdict_wake();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv, "on");
+    drift_receiver(&mut engine, start, 300, "playing", "Streamer");
+    let receiver = engine
+        .expectations(id)
+        .unwrap()
+        .iter()
+        .find(|expectation| expectation.subject == "receiver" && expectation.field == Field::Power)
+        .unwrap();
+    assert!(
+        matches!(&receiver.outcome, Outcome::Met { observed, via: Via::Ha, .. } if observed == "on")
+    );
+    verdict_event(&mut engine, start, 40000, Event::Tick);
+    assert_no_drift_rows(&engine);
+    assert!(engine.drift().is_empty());
+}
+
+#[test]
+fn drift_source_grace_waits_for_delayed_takeover_selection_and_its_expectation() {
+    let (mut engine, start) = setup();
+    identify_atv(&mut engine, start);
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.mode = Mode::Active;
+    config.timing.takeover_settle_ms = 40000;
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 10, tv, "on");
+    drift_receiver(&mut engine, start, 20, "on", "Other");
+    verdict_event(
+        &mut engine,
+        start,
+        100,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    verdict_event(&mut engine, start, 30100, Event::Tick);
+    assert_no_drift_rows(&engine);
+    assert!(engine.drift().is_empty());
+    verdict_event(&mut engine, start, 40100, Event::Tick);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "takeover_settled")
+    );
+    verdict_event(&mut engine, start, 50100, Event::Tick);
+    assert_no_drift_rows(&engine);
+    verdict_event(&mut engine, start, 80099, Event::Tick);
+    assert_no_drift_rows(&engine);
+    verdict_event(&mut engine, start, 80100, Event::Tick);
+    assert_eq!(engine.drift()[0].field, choregos::action::Field::Source);
+}
+
+#[test]
+fn drift_onset_trigger_requires_the_event_to_supply_the_selected_sample() {
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    let sonos = engine.config.sonos.entity.clone();
+    verdict_ha(&mut engine, start, 34000, sonos, "on");
+    assert_eq!(
+        engine.decisions[0].trigger,
+        Trigger::Timer {
+            name: TimerKind::DriftGrace
+        }
+    );
+
+    let (mut engine, start) = drift_ready();
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 3000, tv.clone(), "off");
+    verdict_event(
+        &mut engine,
+        start,
+        4000,
+        Event::TvPower {
+            state: TvState::Off,
+            at: wall() + chrono::Duration::seconds(4),
+        },
+    );
+    // A TV HA redelivery is not provenance for the newer selected direct sample.
+    verdict_event(
+        &mut engine,
+        start,
+        35000,
+        Event::HaState {
+            entity: tv,
+            state: "off".into(),
+            attrs: BTreeMap::new(),
+            changed: Some(wall() + chrono::Duration::seconds(3)),
+            updated: None,
+        },
+    );
+    assert_eq!(
+        engine.decisions[0].trigger,
+        Trigger::Timer {
+            name: TimerKind::DriftGrace
+        }
+    );
+    assert_eq!(
+        engine.decisions[0].drift.as_ref().unwrap().via,
+        Via::TvDirect
+    );
+}
