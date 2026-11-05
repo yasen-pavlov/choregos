@@ -226,6 +226,7 @@ probe_poll_ms = 2000              # 500–10000 ms
 probe_window_s = 45               # 5–300 seconds
 tv_s = 45                        # expectation window permits HA reconnect lag after TV wake
 receiver_s = 10
+receiver_off_s = 20
 speakers_s = 5
 source_s = 10
 

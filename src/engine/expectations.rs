@@ -266,7 +266,7 @@ impl Engine {
                             Field::Power,
                             "off",
                             vec![Via::Ha],
-                            self.config.verify.receiver_s * 1000,
+                            self.config.verify.receiver_off_s * 1000,
                         )),
                         "select_source" if reason == "takeover_settled" => {
                             data.get("source").and_then(Value::as_str).map(|source| {
@@ -726,8 +726,12 @@ fn expectation_config_changed(old: &Config, new: &Config, expectation: &Expectat
                     })
         }
         "receiver" => {
-            old.receiver.entity != new.receiver.entity
-                || old.verify.receiver_s != new.verify.receiver_s
+            let deadline_changed = if expectation.expect == "off" {
+                old.verify.receiver_off_s != new.verify.receiver_off_s
+            } else {
+                old.verify.receiver_s != new.verify.receiver_s
+            };
+            old.receiver.entity != new.receiver.entity || deadline_changed
         }
         "speakers" => {
             old.sonos.entity != new.sonos.entity || old.verify.speakers_s != new.verify.speakers_s

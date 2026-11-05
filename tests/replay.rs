@@ -4511,6 +4511,41 @@ fn room_off_verdict_reports_achieved_and_missed_without_changing_intent() {
     }
 }
 
+/// The receiver reports off 0.2–10 s after `turn_off` (its integration polls), so its
+/// off expectation has its own, longer deadline than the 2 s turn-on.
+#[test]
+fn receiver_off_uses_its_own_deadline_longer_than_receiver_on() {
+    let (mut engine, start, _) = verdict_wake();
+    assert!(engine.config.verify.receiver_off_s > engine.config.verify.receiver_s);
+    verdict_event(
+        &mut engine,
+        start,
+        200,
+        Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+    );
+    verdict_event(&mut engine, start, 3200, Event::Tick);
+    let id = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "off_timer_expired")
+        .unwrap()
+        .id;
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 4000, tv, "off");
+    // Past the on-deadline, inside the off-deadline: the live 10.17 s case.
+    let late = 3200 + engine.config.verify.receiver_s * 1000 + 170;
+    verdict_event(&mut engine, start, late - 10, Event::Tick);
+    assert!(!engine.verdicts.iter().any(|update| update.id == id));
+    verdict_ha(&mut engine, start, late, receiver, "off");
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Achieved);
+}
+
 fn room_off_after_confirmed_ha_on() -> (Engine, Instant, u64) {
     let (mut engine, start, _) = verdict_wake();
     std::sync::Arc::make_mut(&mut engine.config).tv.off = choregos::config::TvOffConfig::Webos {
@@ -4572,7 +4607,7 @@ fn quick_rewake_uses_newer_direct_off_instead_of_older_matching_ha_on() {
             at: wall() + chrono::Duration::milliseconds(9000),
         },
     );
-    engine.settle_expectations(start + Duration::from_millis(18000));
+    engine.settle_expectations(start + Duration::from_millis(30000));
     assert_eq!(
         engine
             .verdicts
@@ -4585,7 +4620,7 @@ fn quick_rewake_uses_newer_direct_off_instead_of_older_matching_ha_on() {
     let actions = verdict_event(
         &mut engine,
         start,
-        20000,
+        31000,
         Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
     );
     assert!(actions.contains(&Action::WakeTv));
@@ -4700,7 +4735,8 @@ fn all_off_keeps_creation_met_rows_when_attaching_an_already_off_role() {
 
 #[test]
 fn room_off_accepts_only_recent_already_off_receiver_samples_at_creation() {
-    for age_ms in [1200, 10_000, 10_001] {
+    let window_ms = choregos::config::VerifyConfig::default().receiver_off_s * 1000;
+    for age_ms in [1200, window_ms, window_ms + 1] {
         let (mut engine, start, _) = verdict_wake();
         let tv = engine.config.tv.entity.clone();
         let receiver = engine.config.receiver.entity.clone();
@@ -4709,30 +4745,31 @@ fn room_off_accepts_only_recent_already_off_receiver_samples_at_creation() {
         verdict_event(
             &mut engine,
             start,
-            17000,
+            37000,
             Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
         );
         let receiver = engine.config.receiver.entity.clone();
         verdict_event(
             &mut engine,
             start,
-            19000,
+            39000,
             Event::HaState {
                 entity: receiver,
                 state: "off".into(),
                 attrs: BTreeMap::new(),
-                changed: Some(wall() + chrono::Duration::milliseconds(20000 - age_ms)),
-                updated: Some(wall() + chrono::Duration::milliseconds(19000)),
+                changed: Some(wall() + chrono::Duration::milliseconds((40000 - age_ms) as i64)),
+                updated: Some(wall() + chrono::Duration::milliseconds(39000)),
             },
         );
-        verdict_event(&mut engine, start, 20000, Event::Tick);
+        verdict_event(&mut engine, start, 40000, Event::Tick);
         let decision = engine
             .decisions
             .iter()
             .find(|decision| decision.reason == "off_timer_expired")
             .unwrap();
         let id = decision.id;
-        let expected = if age_ms <= 10_000 {
+        let fresh = age_ms <= window_ms;
+        let expected = if fresh {
             Outcome::Met {
                 via: Via::Ha,
                 observed: "off".into(),
@@ -4743,13 +4780,13 @@ fn room_off_accepts_only_recent_already_off_receiver_samples_at_creation() {
         };
         assert_eq!(decision.expectations[1].outcome, expected, "age {age_ms}");
         let tv = engine.config.tv.entity.clone();
-        verdict_ha(&mut engine, start, 21000, tv, "off");
-        if age_ms > 10_000 {
+        verdict_ha(&mut engine, start, 41000, tv, "off");
+        if !fresh {
             assert_eq!(
                 engine.expectations(id).unwrap()[1].outcome,
                 Outcome::Pending
             );
-            engine.settle_expectations(start + Duration::from_millis(30_000));
+            engine.settle_expectations(start + Duration::from_millis(40000 + window_ms + 1));
         }
         let update = engine
             .verdicts
@@ -4758,7 +4795,7 @@ fn room_off_accepts_only_recent_already_off_receiver_samples_at_creation() {
             .unwrap();
         assert_eq!(
             update.verdict,
-            if age_ms <= 10_000 {
+            if fresh {
                 Verdict::Achieved
             } else {
                 Verdict::Partial
@@ -4766,7 +4803,7 @@ fn room_off_accepts_only_recent_already_off_receiver_samples_at_creation() {
         );
         assert_eq!(
             update.expectations[1].outcome,
-            if age_ms <= 10_000 {
+            if fresh {
                 expected
             } else {
                 Outcome::Unknown { observed: None }
@@ -5507,6 +5544,63 @@ fn reload_cancels_only_expectations_whose_relevant_configuration_changed() {
             }
         );
     }
+}
+
+#[test]
+fn reload_of_the_other_receiver_deadline_preserves_a_pending_receiver_expectation() {
+    // A pending receiver *on* expectation survives a `receiver_off_s` edit and vice versa.
+    let (mut engine, start, id) = verdict_wake();
+    let mut config = (*engine.config).clone();
+    config.verify.receiver_off_s += 5;
+    verdict_event(
+        &mut engine,
+        start,
+        500,
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+    );
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 600, tv, "on");
+    verdict_ha(&mut engine, start, 700, receiver, "on");
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Achieved);
+
+    let (mut engine, start, _) = verdict_wake();
+    verdict_event(
+        &mut engine,
+        start,
+        200,
+        Event::Frame(Frame::from_hex(4, 0, "36").unwrap()),
+    );
+    verdict_event(&mut engine, start, 3200, Event::Tick);
+    let id = engine
+        .decisions
+        .iter()
+        .find(|decision| decision.reason == "off_timer_expired")
+        .unwrap()
+        .id;
+    let mut config = (*engine.config).clone();
+    config.verify.receiver_s += 5;
+    verdict_event(
+        &mut engine,
+        start,
+        3300,
+        Event::ConfigReloaded(std::sync::Arc::new(config)),
+    );
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 4000, tv, "off");
+    verdict_ha(&mut engine, start, 4100, receiver, "off");
+    let update = engine
+        .verdicts
+        .iter()
+        .find(|update| update.id == id)
+        .unwrap();
+    assert_eq!(update.verdict, Verdict::Achieved);
 }
 
 #[test]

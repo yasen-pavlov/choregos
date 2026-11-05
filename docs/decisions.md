@@ -2,6 +2,16 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-05 — Separate receiver off deadline
+
+- The receiver reports `on` a steady 2 s after `turn_on` but `off` anywhere from
+  0.2 s (when CEC Standby reached it first) to 10.2 s after `turn_off`, because
+  its integration learns power-off by polling. One shared `receiver_s = 10`
+  produced an `unknown` leg and a `partial` verdict for a room-off that took
+  10.17 s. `[verify] receiver_off_s` (default 20) now bounds the off
+  expectation; `receiver_s` keeps bounding the on expectation. Existing files
+  parse unchanged (`[verify]` keys default).
+
 ## 2026-11-03 — Already-satisfied expectations
 
 - At expectation creation, accept a matching current independent observation

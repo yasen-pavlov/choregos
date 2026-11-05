@@ -77,7 +77,7 @@ Latency on the verdict = the slowest `met` expectation.
 | --- | --- |
 | off→on transition (wake) | `tv.power = on` only if `WakeTv` was sent (tv_direct, ha; 45 s) · `receiver.power = on` only if `turn_on` was sent (ha; 10 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` only for stopped CEC policies with verification enabled or any stopped role with a probe (CEC retry window, probe poll window, or their maximum; source policy below) |
 | `takeover_settled` | `receiver.source = <role source>` if `select_source` was sent (ha; 10 s). Preset scripts have no observable → no expectation. |
-| `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct, ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (ha; 10 s) |
+| `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct, ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (ha; 20 s — the receiver integration reports off 0.2–10 s after the command, on in a steady 2 s) |
 | `all_off`, `manual_standby` | Same standby eligibility: CEC policies with verification enabled, or probe-only for a stopped role with a probe; no CEC expectation for HA media-stop/none policies |
 | everything else | none |
 
