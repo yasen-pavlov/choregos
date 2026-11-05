@@ -792,28 +792,7 @@ impl Runtime {
         ui_events: Vec<UiEvent>,
     ) {
         update_snapshot(&mut self.snapshot, &self.engine, now, wall);
-        let entity_states = format!(
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
-            self.snapshot.mode,
-            self.snapshot.bridge_online,
-            self.snapshot.active_role,
-            self.snapshot.conflicts.len(),
-            self.snapshot.bridge_telemetry,
-            self.snapshot
-                .roles
-                .iter()
-                .map(|role| role.power)
-                .collect::<Vec<_>>(),
-            self.snapshot
-                .decisions
-                .iter()
-                .rev()
-                .find(|decision| !matches!(
-                    decision.verdict,
-                    crate::action::Verdict::None | crate::action::Verdict::Pending
-                ))
-                .map(|decision| (decision.id, decision.verdict)),
-        );
+        let entity_states = entity_states(&self.snapshot);
         if self.snapshot.connections.mqtt_connected && entity_states != self.last_states {
             self.adapters().executor.mqtt.states(&self.snapshot);
             self.last_states = entity_states;
@@ -1086,6 +1065,32 @@ async fn persist_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     }
     result.map_err(ConfigError::from)
 }
+fn entity_states(snapshot: &Snapshot) -> String {
+    format!(
+        "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+        snapshot.mode,
+        snapshot.bridge_online,
+        snapshot.active_role,
+        snapshot.conflicts.len(),
+        snapshot.bridge_telemetry,
+        snapshot
+            .roles
+            .iter()
+            .map(|role| role.power)
+            .collect::<Vec<_>>(),
+        snapshot
+            .decisions
+            .iter()
+            .rev()
+            .find(|decision| !matches!(
+                decision.verdict,
+                crate::action::Verdict::None | crate::action::Verdict::Pending
+            ))
+            .map(|decision| (decision.id, decision.verdict)),
+        snapshot.drift,
+    )
+}
+
 fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall: DateTime<Utc>) {
     snapshot.mode = engine.mode();
     snapshot.warming = engine.warming;
@@ -1215,6 +1220,34 @@ mod loop_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_states_fingerprint_tracks_drift_only_changes_and_is_stable_otherwise() {
+        use crate::action::{DriftDetail, Field, Via};
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let mut snapshot = AppState::new(config, String::new()).snapshot();
+        let empty = entity_states(&snapshot);
+        assert_eq!(empty, entity_states(&snapshot.clone()));
+        snapshot.drift.push(DriftDetail {
+            subject: "receiver".into(),
+            field: Field::Power,
+            intended: "on".into(),
+            observed: "off".into(),
+            via: Via::Ha,
+            since: DateTime::<Utc>::UNIX_EPOCH,
+        });
+        let open = entity_states(&snapshot);
+        assert_ne!(empty, open);
+        assert_eq!(open, entity_states(&snapshot.clone()));
+        snapshot.drift[0].observed = "idle".into();
+        assert_ne!(open, entity_states(&snapshot));
+        snapshot.drift[0].observed = "off".into();
+        assert_eq!(open, entity_states(&snapshot));
+        snapshot.drift[0].since += chrono::Duration::seconds(1);
+        assert_ne!(open, entity_states(&snapshot));
+        snapshot.drift.clear();
+        assert_eq!(empty, entity_states(&snapshot));
+    }
 
     #[test]
     fn drift_snapshot_tracks_open_set_and_last_decision_sensor_ignores_drift_rows() {

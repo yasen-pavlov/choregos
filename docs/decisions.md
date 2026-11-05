@@ -36,8 +36,17 @@ Deviations from DESIGN.md agreed in review. Newest first.
   mismatched clocks without runtime assertions.
 - Keep the open set in memory and expose `Snapshot.drift`; historical rows
   persist additively in v2, but do not restore current drift. Reporting must
-  not become control or resume stale observations after restart. Dedicated
-  HA/UI surfaces and their publication fingerprint belong to PR B.
+  not become control or resume stale observations after restart.
+- PR B exposes the open set as `binary_sensor.choregos_drift` (problem), with
+  retained JSON state and `fields`, oldest `since`, and complete `details`
+  attributes on `choregos/state/drift`. Include the complete open set in the
+  entity-state fingerprint so drift-only changes publish, independently of the
+  last settled decision sensor. Empty drift clears attributes and reports OFF.
+  The dashboard shows one reporting-only amber pill per open drift next to
+  room intent: `subject.field: observed, intended X, for <duration>`.
+  `drift`/`drift_resolved` decision rows show
+  `subject.field intended → observed via <source>` without a verdict chip;
+  resolved rows also show how long the drift lasted.
 
 ## 2026-11-05 — Separate receiver off deadline
 

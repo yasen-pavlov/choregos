@@ -163,8 +163,7 @@ New:
 ## Room intent and drift
 
 `RoomIntent { power: unknown|on|off, active_role, receiver_source }` is derived
-from the transitions creating decisions. Drift detection is implemented;
-dedicated HA/UI exposure is PR B.
+from the transitions creating decisions.
 
 Monitor TV and receiver power for configured entities when intended power is
 On/Off, and receiver source when power is On with a defined source. Startup
@@ -232,14 +231,25 @@ restored from historical ring rows; state remains version 2.
 
 ## Exposure
 
-- Ring/UI: `/decisions` rows show a verdict chip; a row expands to its
-  expectations (expected / observed / via / latency). Minimal; the real
-  surfaces come with the phase-2 redesign.
+- Ring/UI: `/decisions` rows show a verdict chip and expand to their
+  expectations (expected / observed / via / latency). `drift`/`drift_resolved`
+  rows instead show `subject.field intended → observed via <source>`, plus
+  how long it lasted on resolution, with no verdict chip. The dashboard shows
+  one amber pill per open drift next to room intent:
+  `subject.field: observed, intended X, for <duration>`. These are reporting
+  only; the broader surfaces come with the phase-2 redesign.
 - Snapshot: the mutable decision ring exposes verdicts and `drift` details;
   `Snapshot.drift` contains currently open drifts. Per-role stats remain deferred.
 - Home Assistant: `sensor.choregos_last_decision` (state = verdict; attributes
-  id, role, reason, latency_ms). It ignores actionless drift rows. Dedicated
-  binary-sensor and UI drift exposure remain PR B.
+  id, role, reason, latency_ms). It ignores actionless drift rows.
+  `binary_sensor.choregos_drift` (device class `problem`) uses retained
+  `choregos/state/drift` JSON for its value and attributes: `state` is `ON`
+  when `Snapshot.drift` is non-empty, otherwise `OFF`; `fields` lists
+  `subject.field`, `since` is the oldest open onset (RFC3339, or null), and
+  `details` contains the complete open drift records. Empty means
+  `fields: []`, `since: null`, `details: []`. Availability follows
+  `choregos/status`; the entity-state fingerprint includes the open set so
+  drift-only changes publish.
 
 ## Not in this phase
 
@@ -256,8 +266,10 @@ richer identities header for mid-session replay (separate follow-up noted in
 3. **Implemented:** expectations + verdicts + `[verify]` deadlines; mutable
    persisted ring, verdict trace/replay lines and final drain; UI chip/details;
    HA last-decision sensor. Golden output updated with case explanations.
-4. **Detection implemented (PR A):** drift rows, grace configuration, trace/replay,
-   open-set snapshot. Dedicated sensor/UI exposure is PR B.
+4. **Detection and HA/UI exposure implemented:** drift rows, grace configuration,
+   trace/replay, open-set snapshot (PR A); dedicated HA problem sensor,
+   open-set publication fingerprint, dashboard open-drift pills and
+   decision-row detail/duration without verdict chips (PR B).
 
 Each step is its own PR with Opus engine review and Luna test/doc review; 1–3
 can ship as one release, 4 after a few days of verdicts.

@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 
 use super::auth::{Ctx, SessionUser};
 use crate::state::{
-    BridgeTelemetry, BusPower, FrameDirection, HaEntityView, Health, Mode, RolePower, Snapshot,
+    BridgeTelemetry, BusPower, DecisionView, FrameDirection, HaEntityView, Health, Mode, RolePower,
+    Snapshot,
 };
 
 /// Bridge Wi-Fi signal below this (dBm) is flagged on the dashboard.
@@ -242,6 +243,51 @@ pub(crate) fn outcome_detail(outcome: &crate::action::Outcome) -> Option<String>
     }
 }
 
+/// The drift detail of a `drift` / `drift_resolved` row; `None` for any other reason, so a
+/// stray detail never replaces an ordinary row's reason.
+pub(crate) fn drift_row(decision: &DecisionView) -> Option<&crate::action::DriftDetail> {
+    decision
+        .drift
+        .as_ref()
+        .filter(|_| matches!(decision.reason.as_str(), "drift" | "drift_resolved"))
+}
+
+/// Pill tone for a drift row's reason: `resolved` for `drift_resolved`, else `open`.
+pub(crate) fn drift_tone(reason: &str) -> &'static str {
+    if reason == "drift_resolved" {
+        "resolved"
+    } else {
+        "open"
+    }
+}
+
+/// How long a resolved drift lasted (row time minus onset); `None` for an onset row.
+pub(crate) fn drift_lasted(decision: &DecisionView) -> Option<String> {
+    decision
+        .drift
+        .as_ref()
+        .filter(|_| decision.reason == "drift_resolved")
+        .map(|drift| duration(decision.timestamp - drift.since))
+}
+
+/// How long an open drift has held so far.
+pub(crate) fn open_for(since: &DateTime<Utc>) -> String {
+    duration(Utc::now() - *since)
+}
+
+/// Tenths of a second under a minute (like expectation latency, truncated so it never reads
+/// `60.0 s`), then minutes and seconds, then the two most significant units. Negative spans
+/// clamp to zero.
+fn duration(span: chrono::TimeDelta) -> String {
+    let millis = u64::try_from(span.num_milliseconds()).unwrap_or(0);
+    let seconds = millis / 1000;
+    match seconds {
+        0..60 => format!("{seconds}.{} s", millis % 1000 / 100),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => uptime(&seconds),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -309,5 +355,18 @@ mod tests {
         let week = 7 * 86_400;
         assert!(!degraded(-50, week, 0));
         assert!(degraded(-80, week, 0));
+    }
+
+    #[test]
+    fn duration_switches_units_at_the_minute_and_hour() {
+        let ms = chrono::TimeDelta::milliseconds;
+        assert_eq!(duration(ms(0)), "0.0 s");
+        assert_eq!(duration(ms(3_480)), "3.4 s");
+        assert_eq!(duration(ms(59_999)), "59.9 s");
+        assert_eq!(duration(ms(60_000)), "1m 0s");
+        assert_eq!(duration(ms(3_599_999)), "59m 59s");
+        assert_eq!(duration(ms(3_600_000)), "1h 0m");
+        assert_eq!(duration(ms(90_061_000)), "1d 1h");
+        assert_eq!(duration(ms(-5_000)), "0.0 s");
     }
 }

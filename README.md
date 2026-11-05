@@ -192,7 +192,9 @@ learned identity: `osd` (trimmed exact name), `vendor` (six hex digits),
 `physical` (dotted, e.g. `2.1.0.0`). One role matching several logical addresses,
 or several roles matching one address, is a conflict: Choregos shows it and
 withholds power actions for the roles involved. Role IDs match `[a-z0-9_]+` and
-may not be `bridge`, `mode`, `conflicts`, `active_source` or `all_off`.
+may not be `bridge`, `bridge_signal`, `bridge_link_count`, `bridge_uptime`,
+`drift`, `mode`, `conflicts`, `active_source`, `all_off` or `last_decision`,
+which are reserved for built-in entities.
 
 | Setting | Values |
 | --- | --- |
@@ -255,13 +257,20 @@ proxy tokens, titles or application names.
 | `aether/<bridge.node>/status`, `aether/<bridge.node>/bus` | in | Native availability/boot/version and ordered RX, ID-correlated TX outcomes, local replies and line health |
 | `aether/<bridge.node>/telemetry`, `aether/<bridge.node>/cfg` | in | Native Wi-Fi/uptime telemetry (stale after 3 × configured period) and effective config; warns about LA or local-reply overlap |
 | `aether/<bridge.node>/tx` | out | Native CEC send request with process-wide `s-<n>` correlation IDs (unique across config reloads); firmware-default retries |
-| `homeassistant/…/config` (retained) | out | HA discovery: role power sensors, active source, conflicts, mode select, all-off button, bridge sensor |
+| `homeassistant/…/config` (retained) | out | HA discovery: role power sensors, active source, conflicts, mode select, all-off button, bridge sensor, last-decision sensor, drift problem sensor |
 | `choregos/status` | out | `online`/`offline` (last will) |
 | `choregos/state/<name>` (retained) | out | Entity states |
 | `choregos/state/last_decision` (retained) | out | `sensor.choregos_last_decision`: verdict state; attributes `id`, `role`, `reason`, `latency_ms` (slowest independently met expectation, or null) |
+| `choregos/state/drift` (retained) | out | `binary_sensor.choregos_drift` (problem): JSON `state` = `ON` when drift is open, else `OFF`; attributes `fields` (`subject.field` list), `since` (oldest onset, RFC3339 or null), `details` (full open drift records) |
 | `choregos/cmd/mode`, `choregos/cmd/all_off` | in | `shadow`/`active`; any payload triggers all-off |
 
 One instance per broker namespace.
+
+The drift sensor uses the same JSON topic for its value and attributes.
+Each detail contains `subject`, `field`, `intended`, `observed`, `via` and
+RFC3339 `since`. No open drift publishes
+`{"state":"OFF","fields":[],"since":null,"details":[]}`. Drift-only changes
+publish immediately; availability follows `choregos/status`, like other entities.
 
 ## Shadow mode
 
@@ -277,10 +286,10 @@ while you check the decisions against what actually happened.
 
 | Page | Shows |
 | --- | --- |
-| `/` | Mode switch, bridge/MQTT/HA status, TV/receiver/Sonos, each role's power with takeover/standby buttons, active source, all-off |
+| `/` | Mode switch, bridge/MQTT/HA status, TV/receiver/Sonos, each role's power with takeover/standby buttons, active source, all-off; one reporting-only amber pill per open drift next to room intent: `subject.field: observed, intended X, for <duration>` |
 | `/bus` | Live frame stream (SSE) with decoded opcodes and operands |
 | `/devices` | Bus table (addresses, identity keys, power, last seen, matched role) with manual identify; roles; raw frame send |
-| `/decisions` | The decision ring with reasons, actions, verdict chips and expandable expectations |
+| `/decisions` | The decision ring with reasons, actions, verdict chips and expandable expectations; `drift`/`drift_resolved` rows instead show `subject.field intended → observed via <source>`, plus elapsed duration on resolution, without a verdict chip |
 | `/config` | Validate-and-save editor for the TOML file |
 
 Every decision records its id, trigger, parent, role, transition, reason and exact
@@ -294,8 +303,8 @@ Creation and settlement are captured as `choregos/decision` and
 `choregos/verdict` trace entries; offline replay recomputes both.
 In active mode, sustained TV/receiver power or receiver-source disagreement with
 room intent adds actionless `drift` / `drift_resolved` rows after the configured
-grace. These do not replace the last-decision sensor; dedicated UI and HA drift
-exposure are separate work.
+grace. These do not replace the last-decision sensor; the dedicated HA problem
+sensor reports the current open set, separately from settled decision verdicts.
 
 ![Decision log](docs/decisions.png)
 

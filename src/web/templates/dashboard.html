@@ -44,10 +44,13 @@
       <span class="bridge-detail">· last frame {{ view::ago(snapshot.last_frame_at) }}</span>
       {% endif %}
     </div>
-    <div class="group">
+    <div class="group room">
       <span class="label">active source</span>
       <strong>{% if let Some(name) = active_name %}{{ name }}{% else %}<span class="dim">none</span>{% endif %}</strong>
       <span class="bridge-detail" title="What Choregos intends the room to be; observations are compared against it">· intent {{ snapshot.intent.power }}{% if let Some(role) = snapshot.intent.active_role %} / {{ role }}{% endif %}</span>
+      {% for drift in snapshot.drift %}
+      <span class="pill drift-open" title="Drift (reporting only, nothing is sent): {{ drift.via }} has reported {{ drift.observed }} while the room intends {{ drift.intended }}, since {{ view::iso(drift.since) }}">{{ drift.subject }}.{{ drift.field }}: {{ drift.observed }}, intended {{ drift.intended }}, for {{ view::open_for(drift.since) }}</span>
+      {% endfor %}
       {% if let Some((state, at)) = snapshot.tv_direct %}
       <span class="bridge-detail" title="Answered by the TV's own webOS service, the earliest LAN signal after a wake (Home Assistant follows ~10 s later)">· tv (webOS) {{ state }} {{ view::since(at) }}</span>
       {% endif %}

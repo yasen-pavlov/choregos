@@ -13,6 +13,7 @@ use tower::ServiceExt;
 
 use super::router;
 use crate::{
+    action::DriftDetail,
     config::Config,
     state::{
         AppState, BridgeTelemetry, BusEntryView, BusPower, Command, CommandError, DecisionView,
@@ -914,6 +915,141 @@ async fn decisions_page_shows_the_runtime_would_prefix_once() {
     h.state.publish(snapshot, []);
     let page = body(h.get("/decisions", Some(&cookie)).await).await;
     assert_shadow_actions(&page);
+}
+
+/// A drift as the engine records it: Home Assistant reports the receiver `observed` while
+/// the room intends it on.
+fn drift_detail(observed: &str, since: chrono::DateTime<chrono::Utc>) -> DriftDetail {
+    DriftDetail {
+        subject: "receiver".to_owned(),
+        field: crate::action::Field::Power,
+        intended: "on".to_owned(),
+        observed: observed.to_owned(),
+        via: crate::action::Via::Ha,
+        since,
+    }
+}
+
+/// An actionless drift row: no role, transition, actions, expectations or verdict.
+fn drift_decision(
+    id: u64,
+    reason: &str,
+    at: chrono::TimeDelta,
+    detail: DriftDetail,
+) -> DecisionView {
+    DecisionView {
+        id,
+        trigger: crate::action::Trigger::Observation {
+            source: crate::action::Via::Ha,
+        },
+        timestamp: detail.since + at,
+        role: None,
+        from: None,
+        to: None,
+        reason: reason.to_owned(),
+        actions: vec![],
+        would: false,
+        drift: Some(detail),
+        ..shadow_decision()
+    }
+}
+
+#[tokio::test]
+async fn decisions_page_renders_drift_detail_and_resolved_duration_without_a_verdict() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let since = chrono::Utc::now() - chrono::TimeDelta::minutes(5);
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend([
+        verdict_decision(),
+        drift_decision(
+            11,
+            "drift",
+            chrono::TimeDelta::seconds(30),
+            drift_detail("off", since),
+        ),
+        drift_decision(
+            12,
+            "drift_resolved",
+            chrono::TimeDelta::milliseconds(95_500),
+            drift_detail("on", since),
+        ),
+        // A detail on a row whose reason is not drift does not take over the row.
+        DecisionView {
+            id: 13,
+            drift: Some(drift_detail("off", since)),
+            ..verdict_decision()
+        },
+    ]);
+    h.state.publish(snapshot, []);
+    let page = body(h.get("/decisions", Some(&cookie)).await).await;
+
+    let onset = row_containing(&page, "id=\"d-11\"");
+    assert!(classes_around(onset, "drift</span>").contains(&"drift-open"));
+    assert!(onset.contains("<span class=\"mono\">receiver.power</span> on → off"));
+    assert!(onset.contains("via ha</span>"), "{onset}");
+    assert!(!onset.contains("lasted"), "an open onset has no duration");
+    assert!(!onset.contains("pill verdict-"), "{onset}");
+
+    let resolved = row_containing(&page, "id=\"d-12\"");
+    assert!(classes_around(resolved, "drift_resolved</span>").contains(&"drift-resolved"));
+    assert!(resolved.contains("receiver.power</span> on → on"));
+    assert!(
+        resolved.contains("via ha · lasted 1m 35s</span>"),
+        "{resolved}"
+    );
+    assert!(!resolved.contains("pill verdict-"), "{resolved}");
+
+    // Ordinary rows keep their plain reason and verdict chip.
+    let ordinary = row_containing(&page, "id=\"d-9\"");
+    assert!(ordinary.contains("<td>PowerOn</td>"), "{ordinary}");
+    assert!(ordinary.contains("pill verdict-partial"));
+    let mismatched = row_containing(&page, "id=\"d-13\"");
+    assert!(mismatched.contains("<td>PowerOn</td>"), "{mismatched}");
+    assert!(mismatched.contains("pill verdict-partial"), "{mismatched}");
+    assert!(!mismatched.contains("drift"), "{mismatched}");
+}
+
+#[tokio::test]
+async fn dashboard_shows_one_pill_per_open_drift_and_none_without() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let quiet = body(h.get("/", Some(&cookie)).await).await;
+    assert!(!quiet.contains("drift-open"));
+
+    let mut snapshot = h.state.snapshot();
+    let since = chrono::Utc::now() - chrono::TimeDelta::seconds(125);
+    snapshot.drift = vec![
+        drift_detail("off", since),
+        DriftDetail {
+            subject: "tv".to_owned(),
+            intended: "off".to_owned(),
+            observed: "on".to_owned(),
+            via: crate::action::Via::TvDirect,
+            ..drift_detail("on", since)
+        },
+    ];
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/", Some(&cookie)).await).await;
+    let group = between(
+        &html,
+        "<span class=\"label\">active source</span>",
+        "</div>",
+    );
+    assert_eq!(
+        group.matches("class=\"pill drift-open\"").count(),
+        2,
+        "{group}"
+    );
+    assert!(
+        group.contains(">receiver.power: off, intended on, for 2m "),
+        "{group}"
+    );
+    assert!(
+        group.contains(">tv.power: on, intended off, for 2m "),
+        "{group}"
+    );
+    assert!(group.contains("tv_direct has reported on while the room intends off"));
 }
 
 #[tokio::test]

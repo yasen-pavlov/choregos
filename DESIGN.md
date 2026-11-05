@@ -299,6 +299,9 @@ Validation: unique roles, unique sources, at least one `match` key per device,
 `presence = "poll"` requires `kind = "playback"`, time slots must cover 24 h
 without overlap, `broadcast` is an IPv4, MAC parses. `choregos check-config`
 prints the resolved config with secrets redacted.
+Role IDs use `[a-z0-9_]+` and cannot use built-in entity names: `bridge`,
+`bridge_signal`, `bridge_link_count`, `bridge_uptime`, `drift`, `mode`,
+`conflicts`, `active_source`, `all_off`, `last_decision`.
 
 ## 5. Behaviour
 
@@ -536,7 +539,8 @@ and Tick use `{"kind":"timer","name":"drift_grace"}`. Every resolution uses
 observation provenance with its selected source (or the original via if unknown).
 Rows use the ordinary ring/trace/replay paths without a state version bump.
 `Snapshot.drift: Vec<DriftDetail>` exposes the in-memory open set; it is not
-persisted or included in the entity-state fingerprint until exposure work.
+persisted. It participates in the entity-state fingerprint so drift-only
+changes publish retained HA state.
 Drift participates in replay's five-second control drain, not its
 expectation-only tail.
 
@@ -636,8 +640,13 @@ Everything else: no reply (Feature Abort is a firmware concern).
 ### 5.11 HA exposure (MQTT discovery, retained)
 Node id `choregos`, availability topic `choregos/status` (`online`/`offline` LWT). Entities: `binary_sensor.choregos_<role>` (power, per role), `sensor.choregos_active_source` (role name or `none`), `select.choregos_mode` (shadow/active), `button.choregos_all_off`, `binary_sensor.choregos_bridge` (bridge LWT), `sensor.choregos_conflicts` (count). Commands arrive on `choregos/cmd/<entity>`. State topics `choregos/state/<name>` retained.
 `sensor.choregos_last_decision` publishes the newest settled observable ring
-row's verdict with id, role, reason and latency_ms attributes. No drift entity
-is implemented in this step.
+row's verdict with id, role, reason and latency_ms attributes.
+`binary_sensor.choregos_drift` (device class `problem`) publishes retained JSON
+on `choregos/state/drift`: `state` is `ON` for a non-empty open set, otherwise
+`OFF`. Value and attribute templates expose `state` and attributes `fields`
+(`subject.field` strings), `since` (oldest onset in RFC3339, or null), and
+`details` (the complete open `DriftDetail` set). No open drift yields empty
+`fields`/`details` arrays and null `since`; availability uses `choregos/status`.
 
 ### 5.12 Events into the engine
 `Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>, updated: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
@@ -673,9 +682,13 @@ its value or establishes when the device actually changed state.
 
 Pages (all behind auth): 
 - `/` Dashboard: mode switch (confirm when going active), bridge status, role cards (name, power, LA/PA, vendor/OSD, last event, "takeover" and "standby" buttons), TV/receiver/Sonos/Kodi HA states, active source, conflicts banner, "all off".
+  Next to room intent, one amber pill per open drift shows
+  `subject.field: observed, intended X, for <duration>`; reporting only.
 - `/bus` Live bus: SSE stream of frames (decoded: from/to names, opcode name, operands) interleaved with decisions; filters by LA/opcode; last 2000 kept in memory (ring buffer in `AppState`).
 - `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "identify" and confirmed "forget" controls per non-bridge LA.
 - `/decisions` Decision log with stable `d-<id>` anchors, parent links, reasons and resulting actions (and `would:` entries in shadow mode).
+  `drift`/`drift_resolved` rows show `subject.field intended → observed via <source>`
+  without a verdict chip; a resolved row also shows how long the drift lasted.
 - `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
 Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; local username/password break-glass form at `/login/local`; signed session cookie (`tower-sessions` or axum-extra signed cookies); CSRF for POSTs via same-site cookie + hidden token. Visual design: dark, dense, monospace for bus data; mocked before implementation (see `docs/ui.md` once written).
