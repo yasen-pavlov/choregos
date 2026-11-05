@@ -264,6 +264,15 @@ impl Mqtt {
             true,
             payload.to_string(),
         );
+        let drift = json!({
+            "state": if snapshot.drift.is_empty() { "OFF" } else { "ON" },
+            "fields": snapshot.drift.iter()
+                .map(|detail| format!("{}.{}", detail.subject, detail.field))
+                .collect::<Vec<_>>(),
+            "since": snapshot.drift.iter().map(|detail| detail.since).min(),
+            "details": snapshot.drift,
+        });
+        self.publish("choregos/state/drift".into(), true, drift.to_string());
         for (name, value) in states {
             self.publish(format!("choregos/state/{name}"), true, value);
         }
@@ -366,6 +375,7 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
             ("sensor", "bridge_link_count", "Bridge link count"),
             ("sensor", "bridge_uptime", "Bridge uptime"),
             ("sensor", "last_decision", "Last decision"),
+            ("binary_sensor", "drift", "Drift"),
         ]
         .map(|(a, b, c)| (a.into(), b.into(), c.into())),
     );
@@ -379,6 +389,12 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
                 payload["value_template"] = json!("{{ value_json.verdict }}");
                 payload["json_attributes_topic"] = json!("choregos/state/last_decision");
                 payload["json_attributes_template"] = json!("{{ {'id': value_json.id, 'role': value_json.role, 'reason': value_json.reason, 'latency_ms': value_json.latency_ms} | tojson }}");
+            }
+            "drift" => {
+                payload["device_class"] = json!("problem");
+                payload["value_template"] = json!("{{ value_json.state }}");
+                payload["json_attributes_topic"] = json!("choregos/state/drift");
+                payload["json_attributes_template"] = json!("{{ {'fields': value_json.fields, 'since': value_json.since, 'details': value_json.details} | tojson }}");
             }
             "bridge_signal" => {
                 payload["unit_of_measurement"] = json!("dBm");
@@ -400,6 +416,111 @@ pub fn discovery(config: &Config) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drift_discovery_exposes_problem_state_and_structured_attributes() {
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let (_, payload) = discovery(&config)
+            .into_iter()
+            .find(|(topic, _)| topic == "homeassistant/binary_sensor/choregos/drift/config")
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "name": "Drift",
+                "unique_id": "choregos_drift",
+                "default_entity_id": "binary_sensor.choregos_drift",
+                "availability_topic": "choregos/status",
+                "device": {
+                    "identifiers": ["choregos"],
+                    "name": "Choregos",
+                    "manufacturer": "Choregos",
+                },
+                "device_class": "problem",
+                "state_topic": "choregos/state/drift",
+                "value_template": "{{ value_json.state }}",
+                "json_attributes_topic": "choregos/state/drift",
+                "json_attributes_template": "{{ {'fields': value_json.fields, 'since': value_json.since, 'details': value_json.details} | tojson }}",
+            })
+        );
+    }
+
+    #[test]
+    fn drift_states_retain_open_details_oldest_onset_and_empty_resolution() {
+        use crate::{
+            action::{DriftDetail, Field, Via},
+            state::AppState,
+        };
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let mut snapshot = AppState::new(config, String::new()).snapshot();
+        let detail = DriftDetail {
+            subject: "receiver".into(),
+            field: Field::Power,
+            intended: "on".into(),
+            observed: "off".into(),
+            via: Via::Ha,
+            since: "2026-11-05T12:00:00Z".parse().unwrap(),
+        };
+        snapshot.drift.push(detail.clone());
+        let (mqtt, mut events) = Mqtt::test_transport(true, 32);
+        let mut publish = |snapshot: &Snapshot| {
+            mqtt.states(snapshot);
+            events.clean();
+            let payload = events
+                .pending
+                .iter()
+                .find_map(|request| match request {
+                    rumqttc::Request::Publish(p) if p.topic == "choregos/state/drift" => {
+                        assert!(p.retain);
+                        assert_eq!(p.qos, QoS::AtLeastOnce);
+                        Some(serde_json::from_slice::<Value>(&p.payload).unwrap())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            events.pending.clear();
+            payload
+        };
+        assert_eq!(
+            publish(&snapshot),
+            json!({
+                "state": "ON",
+                "fields": ["receiver.power"],
+                "since": "2026-11-05T12:00:00Z",
+                "details": [{
+                    "subject": "receiver",
+                    "field": "power",
+                    "intended": "on",
+                    "observed": "off",
+                    "via": "ha",
+                    "since": "2026-11-05T12:00:00Z",
+                }],
+            })
+        );
+        let earlier = DriftDetail {
+            subject: "tv".into(),
+            intended: "off".into(),
+            observed: "on".into(),
+            via: Via::TvDirect,
+            since: detail.since - chrono::Duration::seconds(5),
+            ..detail.clone()
+        };
+        snapshot.drift.push(earlier.clone());
+        assert_eq!(
+            publish(&snapshot),
+            json!({
+                "state": "ON",
+                "fields": ["receiver.power", "tv.power"],
+                "since": "2026-11-05T11:59:55Z",
+                "details": [detail, earlier],
+            })
+        );
+        snapshot.drift.clear();
+        assert_eq!(
+            publish(&snapshot),
+            json!({"state": "OFF", "fields": [], "since": null, "details": []})
+        );
+    }
 
     fn start_broker() -> std::net::SocketAddr {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -554,7 +675,7 @@ mod tests {
                 .subscribe("cmnd/test_bridge/HdmiSend", QoS::AtLeastOnce)
                 .await
                 .unwrap();
-            assert_retained_discovery(&mut received, config.device.len() + 9).await;
+            assert_retained_discovery(&mut received, config.device.len() + 10).await;
             observer
                 .publish(
                     "tele/test_bridge/SENSOR",

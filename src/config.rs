@@ -553,6 +553,10 @@ impl Config {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
                 || [
                     "bridge",
+                    "bridge_signal",
+                    "bridge_link_count",
+                    "bridge_uptime",
+                    "drift",
                     "mode",
                     "conflicts",
                     "active_source",
@@ -1026,10 +1030,15 @@ mod review_tests {
     fn rejects_reserved_and_non_entity_role_ids() {
         for role in [
             "bridge",
+            "bridge_signal",
+            "bridge_link_count",
+            "bridge_uptime",
+            "drift",
             "mode",
             "conflicts",
             "active_source",
             "all_off",
+            "last_decision",
             "TV",
             "a/b",
             "a+",
