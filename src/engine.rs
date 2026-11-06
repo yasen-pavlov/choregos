@@ -441,66 +441,50 @@ impl Engine {
             Event::Command(command) => Some(Self::command_reason(command)),
             _ => None,
         };
-        let mut actions =
-            match event {
-                Event::BridgeOnline => self.handle_bridge_online(now),
-                Event::ServiceStarted => {
-                    self.record(None, None, None, "service_started", vec![], None);
-                    vec![]
+        let mut actions = match event {
+            Event::BridgeOnline => self.handle_bridge_online(now),
+            Event::ServiceStarted => {
+                self.record(None, None, None, "service_started", vec![], None);
+                vec![]
+            }
+            Event::BridgeOffline => self.handle_bridge_offline(),
+            Event::TvPower { state, at } => {
+                self.observe_tv_power(state, at);
+                vec![]
+            }
+            Event::TvDirectUnavailable => {
+                self.handle_tv_direct_unavailable();
+                vec![]
+            }
+            Event::ReceiverPower { state, at, .. } => {
+                self.observe_receiver_power(state, at);
+                vec![]
+            }
+            Event::ConsolePower { role, state, at } => {
+                if let Some(role) = self.roles.get_mut(&role) {
+                    role.direct = Some((state, at));
                 }
-                Event::BridgeOffline => self.handle_bridge_offline(),
-                Event::TvPower { state, at } => {
-                    self.observe_tv_power(state, at);
-                    vec![]
-                }
-                Event::TvDirectUnavailable => {
-                    self.tv_direct = None;
-                    self.tv_last_usable = None;
-                    self.tv_unreachable_streak = 0;
-                    self.tv_direct_unavailable = true;
-                    self.refresh_tv_sources();
-                    vec![]
-                }
-                Event::ReceiverPower { state, at, .. } => {
-                    self.receiver_direct = Some((state, at));
-                    if state != DirectPower::Unreachable {
-                        Self::remember_direct(&mut self.receiver_last_usable, state, at);
-                    }
-                    vec![]
-                }
-                Event::ConsolePower { role, state, at } => {
-                    if let Some(role) = self.roles.get_mut(&role) {
-                        role.direct = Some((state, at));
-                    }
-                    vec![]
-                }
-                Event::HaState {
-                    entity,
-                    state,
-                    attrs,
-                    changed,
-                    updated,
-                } => self.handle_ha_state(entity, state, attrs, changed, updated, wall),
-                Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
-                Event::Frame(frame) => self.handle_frame(frame, now, wall),
-                Event::SendResult {
-                    to, data, status, ..
-                } => {
-                    if let Some(pending) = self.standby_verifications.iter_mut().find(|pending| {
-                        pending.la == to && pending.frames.contains(&data.as_slice())
-                    }) {
-                        match status {
-                            SendStatus::Ack => pending.acked = true,
-                            SendStatus::Nack => pending.nacked = pending.nacked.saturating_add(1),
-                            _ => {}
-                        }
-                    }
-                    vec![]
-                }
-                Event::Command(command) => self.handle_command(command, now),
-                Event::Tick if self.bridge_online => self.bus.retry_identification(now),
-                Event::Tick => vec![],
-            };
+                vec![]
+            }
+            Event::HaState {
+                entity,
+                state,
+                attrs,
+                changed,
+                updated,
+            } => self.handle_ha_state(entity, state, attrs, changed, updated, wall),
+            Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
+            Event::Frame(frame) => self.handle_frame(frame, now, wall),
+            Event::SendResult {
+                to, data, status, ..
+            } => {
+                self.note_send_result(to, &data, status);
+                vec![]
+            }
+            Event::Command(command) => self.handle_command(command, now),
+            Event::Tick if self.bridge_online => self.bus.retry_identification(now),
+            Event::Tick => vec![],
+        };
         let command_stops = matches!(
             self.trigger,
             Some(DecisionTrigger::Command(
@@ -553,6 +537,35 @@ impl Engine {
         self.evaluate_expectations(now);
         self.evaluate_drift(now, drift_input);
         actions
+    }
+
+    fn handle_tv_direct_unavailable(&mut self) {
+        self.tv_direct = None;
+        self.tv_last_usable = None;
+        self.tv_unreachable_streak = 0;
+        self.tv_direct_unavailable = true;
+        self.refresh_tv_sources();
+    }
+
+    fn observe_receiver_power(&mut self, state: DirectPower, at: DateTime<Utc>) {
+        self.receiver_direct = Some((state, at));
+        if state != DirectPower::Unreachable {
+            Self::remember_direct(&mut self.receiver_last_usable, state, at);
+        }
+    }
+
+    fn note_send_result(&mut self, to: u8, data: &[u8], status: SendStatus) {
+        if let Some(pending) = self
+            .standby_verifications
+            .iter_mut()
+            .find(|pending| pending.la == to && pending.frames.contains(&data))
+        {
+            match status {
+                SendStatus::Ack => pending.acked = true,
+                SendStatus::Nack => pending.nacked = pending.nacked.saturating_add(1),
+                _ => {}
+            }
+        }
     }
 
     fn handle_bridge_online(&mut self, now: Instant) -> Vec<Action> {
