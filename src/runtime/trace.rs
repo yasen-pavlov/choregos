@@ -1,7 +1,7 @@
 //! Shared replay codec and best-effort, append-only runtime capture.
 use crate::{
     cec::{Frame, bus::LearnedIdentity},
-    state::{Command, ConsoleState, TvState},
+    state::{Command, ConsoleState, DirectPower},
 };
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -55,8 +55,14 @@ pub enum TraceEntry {
         updated: Option<DateTime<Utc>>,
     },
     TvPower {
-        state: TvState,
+        state: DirectPower,
         at: DateTime<Utc>,
+    },
+    TvDirectUnavailable,
+    ReceiverPower {
+        state: DirectPower,
+        at: DateTime<Utc>,
+        source_code: Option<String>,
     },
     ConsolePower {
         role: String,
@@ -123,6 +129,15 @@ pub fn line(ts: DateTime<Utc>, entry: &TraceEntry) -> String {
             json!({"entity":entity,"state":state,"attrs":attrs,"changed":changed,"updated":updated}),
         ),
         TraceEntry::TvPower { state, at } => ("tv/state".into(), json!({"state":state,"at":at})),
+        TraceEntry::TvDirectUnavailable => ("tv/unavailable".into(), json!({})),
+        TraceEntry::ReceiverPower {
+            state,
+            at,
+            source_code,
+        } => (
+            "receiver/state".into(),
+            json!({"state":state,"at":at,"source_code":source_code}),
+        ),
         TraceEntry::ConsolePower { role, state, at } => (
             "probe/state".into(),
             json!({"role":role,"state":state,"at":at}),
@@ -167,6 +182,8 @@ fn known_topic(topic: &str) -> bool {
             | "choregos/verdict"
             | "ha/state"
             | "tv/state"
+            | "tv/unavailable"
+            | "receiver/state"
             | "probe/state"
     ) {
         return true;
@@ -205,6 +222,15 @@ fn parse_entry(topic: &str, payload: Value, ts: DateTime<Utc>) -> Option<TraceEn
         "tv/state" => TraceEntry::TvPower {
             state: serde_json::from_value(payload.get("state")?.clone()).ok()?,
             at: serde_json::from_value(payload.get("at")?.clone()).ok()?,
+        },
+        "tv/unavailable" if payload.is_object() => TraceEntry::TvDirectUnavailable,
+        "receiver/state" => TraceEntry::ReceiverPower {
+            state: serde_json::from_value(payload.get("state")?.clone()).ok()?,
+            at: serde_json::from_value(payload.get("at")?.clone()).ok()?,
+            source_code: payload
+                .get("source_code")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         },
         "probe/state" => TraceEntry::ConsolePower {
             role: payload.get("role")?.as_str()?.into(),

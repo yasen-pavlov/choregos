@@ -1,5 +1,46 @@
 # Golden replay corpus
 
+## 2026-11-06 — Direct TV truth source
+
+All seven configs use webOS: TV legs now list only `tv_direct`. HA remains
+unchanged for receiver power/source and speakers. None configures receiver
+`observe`, so direct receiver support must not change any receiver leg.
+Five captures contain no `tv/state`: their formerly HA-met TV legs become
+unknown at the 45-second deadline. Verdict settlement timestamps therefore
+move to that deadline (and can reorder relative to other rows); action and
+decision timestamps never change.
+
+- `aether-console-swap-probe`: decision 1 still achieves via direct On,
+  19101 ms, unchanged. Only its TV allowed-source list changes.
+- `aether-receiver-off-first`: wake 1 remains unknown. Off 4 remains achieved,
+  but TV changes from HA Off (3244 ms) to direct `unreachable` (6147 ms),
+  sampled at 14:13:17.067 UTC: the second consecutive failure. Review tightened
+  first-failure acceptance (4150 ms at 14:13:15.070) to require that second
+  sample. Verdict remains achieved and receiver pre-settlement stays met/0.
+- `aether-console-wake-and-streamer-takeover`: TV legs 1/7/8/11 change
+  HA met → unknown; achieved → partial. Former TV latencies were respectively
+  19090/3213/32331/3157 ms.
+- `aether-restart-mid-takeover`: TV legs 7/8/11/12 change HA met → unknown;
+  achieved → partial; former latencies 3190/3396/3395/3433 ms.
+- `aether-standby-retry`: TV legs 1/7 change HA met → unknown (former
+  latencies 29756/3299 ms); verdict 1 achieved → unknown (TV-only),
+  verdict 7 achieved → partial.
+- `aether-streamer-to-console-pause-standby`: TV legs 1/4/5/11 change
+  HA met → unknown (17894/3147/3379/3170 ms); verdict 1 achieved → unknown,
+  the other three achieved → partial.
+- `tasmota-console-and-kodi`: TV legs 1/4/5/8 change HA met → unknown
+  (30046/3716/3374/3175 ms); achieved → partial.
+
+No new decisions, drift rows or verdict rows are introduced. The invariant
+compares rows by `(decision id | verdict_for)` after removing TV expectations,
+the aggregate verdict, and only TV-bearing verdict settlement timestamps;
+every remaining field, including receiver outcomes/latencies, must match.
+Row-key comparison permits the explained deadline-driven settlement reordering.
+The review round changes only `aether-receiver-off-first` verdict 4's TV
+latency (4150 → 6147 ms) and settlement time (14:13:15.070 → 14:13:17.067).
+All six other cases are byte-identical to the first implementation's blessing.
+
+
 These anonymized real-use windows freeze the current offline replay output, not
 an idealized reconstruction of the live controller. Each directory contains
 `trace.jsonl`, its behavioural `config.toml`, and timestamped `expected.jsonl`.

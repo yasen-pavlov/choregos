@@ -130,13 +130,24 @@ service still receive `turnOff`. Pairing-required errors are never retried.
 For containers, also pass the configured key environment variable (for example
 `-e CHOREGOS_TV_KEY`). Omit `tv.off` or select `kind = "ha"` for HA power-off.
 
-With native webOS configured, each active TV wake/off dispatch starts a bounded
-direct `getPowerState` polling window. The dashboard shows `direct: on`, `off`
-or `unreachable` and its age alongside the unchanged HA state. Polling stops at
-the requested state or `[verify].tv_window_s`; it never sends corrective actions.
+With native webOS and its key configured, active mode continuously observes
+`getPowerState`: idle every `[verify].tv_idle_poll_s` (default 15 seconds), with
+faster action windows for the full `[verify].tv_window_s`, then back to idle.
+The dashboard shows `direct: on`, `off` or `unreachable` alongside unchanged HA
+state. Direct webOS supplies TV verdict/drift evidence while available; HA supplies
+it without webOS or after pairing loss. TV `unreachable` becomes evidence only
+after two consecutive failures, agreeing with Off and refuting On. A single
+failure and receiver/probe Unreachable are unusable. Pairing loss clears the
+frozen cache; reload restores direct observation and resets the failure streak.
+Polling never sends corrective actions and is disabled in shadow mode.
 Room intent is separate from observations: an Off intent always sends the next
 TV/receiver wake even if HA still reports On from before the off request.
 Intent and direct observations are not persisted.
+Optional `[receiver] observe = { kind = "denon", host = "receiver.lan", port = 8080 }`
+selects direct HTTP main-zone power observations instead of HA power. Idle and
+action-window scheduling match the TV; receiver `unreachable` supplies no
+evidence because its HTTP service remains reachable in standby. Receiver
+control and source observation stay on HA; raw function codes are traced only.
 An optional per-device `probe = { kind = "ps5", host = "console.lan", port = 9302 }`
 adds a read-only Sony console power source. Remote Play must be enabled and UDP
 9302 reachable from the Choregos host. After its wake or dispatched CEC stop,
@@ -171,14 +182,27 @@ accepted **only through environment variables**, never as TOML keys:
 | `trace` | Optional `keep_days` (default 30, 0–365): UTC daily bus traces beside the state file; 0 disables capture. Live-reloadable. |
 | `home_assistant` | HTTP(S) base `url`; the websocket is `/api/websocket` |
 | `tv` | HA `entity`; `wake` is `{kind="wol", mac, broadcast, port}` or `{kind="http", url, header, token_env}` (POST, header value from the environment); `off` defaults to `{kind="ha"}` or uses `{kind="webos", host, port=3001, key_env}` |
-| `receiver` | HA `entity`, `select_source` boolean |
+| `receiver` | HA `entity`, `select_source` boolean; optional `observe = {kind="denon", host, port=8080}` (non-empty host, no secrets) observes power directly; source and all control stay on HA |
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries (`from`, `to` as `HH:MM`, HA `script`). Slots must cover exactly 24 hours; `24:00` is valid only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` role IDs whose volume keys are forwarded while Sonos is `playing` |
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
-| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV window allows HA reconnect lag; observed latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
+| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV deadline covers boot-to-service (observed 17–30 s), not HA reconnect lag; latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Continuous TV idle cadence: `tv_idle_poll_s = 15` (5–120 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
 | `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302}` |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
+
+Direct receiver cadence is `receiver_poll_ms = 1000` (500–10000 ms),
+`receiver_window_s = 30` (5–300 s), `receiver_idle_poll_s = 15` (5–120 s).
+Direct action windows keep polling after reaching a target. Configuration requires
+`tv_window_s >= tv_s` and `receiver_window_s >= max(receiver_s, receiver_off_s)`,
+so fresh evidence continues throughout contested expectations regardless of idle cadence.
+The unchanged 10 s On / 20 s Off deadlines now bound device latency with direct
+observation, not HA polling. Same-value samples retain drift grace regardless
+of timestamp; changed values restart it and unusable evidence clears it.
+Native observation hosts omit scheme/path/whitespace/embedded ports; ports must
+be nonzero and IPv6 literals bracketed. Receiver input codes are optional;
+Power alone supplies its direct state.
+Unbracketed native observation hosts allow only `[A-Za-z0-9._-]`.
 
 `web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` changes require a restart and are
 rejected by the in-app editor, so an authenticated user cannot redirect
@@ -305,6 +329,14 @@ In active mode, sustained TV/receiver power or receiver-source disagreement with
 room intent adds actionless `drift` / `drift_resolved` rows after the configured
 grace. These do not replace the last-decision sensor; the dedicated HA problem
 sensor reports the current open set, separately from settled decision verdicts.
+Direct-sourced fields cannot pre-settle while a same-field expectation is pending.
+An opposite-value pending expectation makes the new direct expectation contested:
+it waits until its deadline even on a matching fresh read. HA fields retain the
+sample-must-postdate-pending-decision rule. Drift resolves only on agreeing evidence
+newer than its opening disagreement; stale agreement or lost evidence cannot close it.
+Expired contested expectations retain the last usable direct sample across
+transient unusable reads; this retained evidence is not used by ordinary
+expectations, pre-settlement, drift or the dashboard.
 
 ![Decision log](docs/decisions.png)
 

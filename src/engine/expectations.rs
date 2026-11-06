@@ -5,7 +5,7 @@ use crate::{
     action::{Action, Expectation, Field, Outcome, Verdict, VerdictUpdate, Via},
     cec::opcode::STANDBY,
     config::{Config, Takeover, TvOffConfig},
-    state::{BusPower, Command, ConsoleState, Mode, RolePower, TvState},
+    state::{BusPower, Command, ConsoleState, DirectPower, Mode, RolePower},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -19,9 +19,18 @@ pub(super) struct PendingDecision {
 }
 
 impl PendingDecision {
-    pub fn new(at: Instant, wall: DateTime<Utc>, expectations: Vec<Expectation>) -> Self {
-        let progress = (0..expectations.len())
-            .map(|_| ExpectationProgress::default())
+    pub fn new(
+        at: Instant,
+        wall: DateTime<Utc>,
+        expectations: Vec<Expectation>,
+        contested: impl Fn(&Expectation) -> bool,
+    ) -> Self {
+        let progress = expectations
+            .iter()
+            .map(|expectation| ExpectationProgress {
+                contested: contested(expectation),
+                ..ExpectationProgress::default()
+            })
             .collect();
         Self {
             at,
@@ -60,6 +69,7 @@ struct ExpectationProgress {
     cec_disagreement_at: Option<u64>,
     cec_met: bool,
     absent: bool,
+    contested: bool,
 }
 
 impl ExpectationProgress {
@@ -76,6 +86,39 @@ impl ExpectationProgress {
     }
 }
 
+pub(super) fn tv_sources(config: &Config, direct_available: bool) -> &[Via] {
+    if direct_available && matches!(config.tv.off, TvOffConfig::Webos { .. }) {
+        &[Via::TvDirect]
+    } else {
+        &[Via::Ha]
+    }
+}
+
+pub(super) fn receiver_power_sources(config: &Config) -> &[Via] {
+    if config.receiver.observe.is_some() {
+        &[Via::Denon]
+    } else {
+        &[Via::Ha]
+    }
+}
+
+pub(super) fn sample_agrees(via: Via, observed: &str, expected: &str) -> bool {
+    observed == expected || (via == Via::TvDirect && observed == "unreachable" && expected == "off")
+}
+
+fn direct_sample(
+    cache: Option<(DirectPower, DateTime<Utc>)>,
+    unreachable_is_evidence: bool,
+) -> Option<(&'static str, DateTime<Utc>)> {
+    let (state, at) = cache?;
+    let value = match state {
+        DirectPower::On => "on",
+        DirectPower::Off => "off",
+        DirectPower::Unreachable if unreachable_is_evidence => "unreachable",
+        DirectPower::Unreachable => return None,
+    };
+    Some((value, at))
+}
 impl Engine {
     pub fn next_expectation_deadline(&self) -> Option<Instant> {
         self.pending_decisions
@@ -175,11 +218,7 @@ impl Engine {
     }
 
     fn tv_expectation(&self, value: &str) -> Expectation {
-        let via = if matches!(self.config.tv.off, TvOffConfig::Webos { .. }) {
-            vec![Via::TvDirect, Via::Ha]
-        } else {
-            vec![Via::Ha]
-        };
+        let via = tv_sources(&self.config, !self.tv_direct_unavailable).to_vec();
         self.expectation(
             "tv",
             Field::Power,
@@ -258,14 +297,14 @@ impl Engine {
                             "receiver",
                             Field::Power,
                             "on",
-                            vec![Via::Ha],
+                            receiver_power_sources(&self.config).to_vec(),
                             self.config.verify.receiver_s * 1000,
                         )),
                         "turn_off" if reason == "off_timer_expired" => Some(self.expectation(
                             "receiver",
                             Field::Power,
                             "off",
-                            vec![Via::Ha],
+                            receiver_power_sources(&self.config).to_vec(),
                             self.config.verify.receiver_off_s * 1000,
                         )),
                         "select_source" if reason == "takeover_settled" => {
@@ -408,6 +447,7 @@ impl Engine {
                                 self.now,
                                 self.wall,
                                 self.decisions[index].expectations.clone(),
+                                |_| false,
                             )
                         });
                 }
@@ -427,11 +467,8 @@ impl Engine {
         via: Via,
     ) -> Option<(&'a str, DateTime<Utc>)> {
         match via {
-            Via::TvDirect => self.tv_direct.and_then(|(state, at)| match state {
-                TvState::On => Some(("on", at)),
-                TvState::Off => Some(("off", at)),
-                TvState::Unreachable => None,
-            }),
+            Via::TvDirect => direct_sample(self.tv_direct, self.tv_unreachable_streak >= 2),
+            Via::Denon => direct_sample(self.receiver_direct, false),
             Via::Ps5 => subject
                 .strip_prefix("role:")
                 .and_then(|role| self.roles.get(role))
@@ -508,9 +545,14 @@ impl Engine {
         wall: DateTime<Utc>,
         expectation: &Expectation,
         via: Via,
+        last_usable: bool,
     ) -> Option<Observation<'a>> {
-        let (value, observed_at) =
-            self.independent_sample(&expectation.subject, expectation.field, via)?;
+        let sample = match (via, last_usable) {
+            (Via::TvDirect, true) => direct_sample(self.tv_last_usable, true),
+            (Via::Denon, true) => direct_sample(self.receiver_last_usable, false),
+            _ => self.independent_sample(&expectation.subject, expectation.field, via),
+        };
+        let (value, observed_at) = sample?;
         if observed_at <= wall
             || observed_at > wall + chrono::Duration::milliseconds(expectation.deadline_ms as i64)
         {
@@ -594,6 +636,11 @@ impl Engine {
     /// Creation alone may use a recent matching independent observation.
     /// CEC still requires its fresh, due verification check.
     fn settle_already_satisfied(&self, expectation: &mut Expectation) {
+        if self.direct_field(expectation)
+            && self.field_expectation_pending(&expectation.subject, expectation.field)
+        {
+            return;
+        }
         let newest = self.newest_independent_sample(
             &expectation.subject,
             expectation.field,
@@ -604,15 +651,9 @@ impl Engine {
             return;
         };
         let oldest = self.wall - chrono::Duration::milliseconds(expectation.deadline_ms as i64);
-        if value != expectation.expect
+        if !sample_agrees(via, value, &expectation.expect)
             || at < oldest
-            || self.pending_decisions.values().any(|pending| {
-                pending.wall >= at
-                    && pending.expectations.iter().any(|previous| {
-                        previous.subject == expectation.subject
-                            && previous.field == expectation.field
-                    })
-            })
+            || self.pending_sample_contested(expectation, at)
         {
             return;
         }
@@ -623,6 +664,46 @@ impl Engine {
         };
     }
 
+    fn direct_field(&self, expectation: &Expectation) -> bool {
+        expectation
+            .via
+            .iter()
+            .any(|via| matches!(via, Via::TvDirect | Via::Denon))
+    }
+
+    pub(super) fn expectation_contested(&self, expectation: &Expectation) -> bool {
+        self.direct_field(expectation)
+            && self.pending_decisions.values().any(|pending| {
+                pending.expectations.iter().any(|previous| {
+                    previous.outcome == Outcome::Pending
+                        && previous.subject == expectation.subject
+                        && previous.field == expectation.field
+                        && previous.expect != expectation.expect
+                })
+            })
+    }
+
+    fn pending_sample_contested(&self, expectation: &Expectation, at: DateTime<Utc>) -> bool {
+        self.pending_decisions.values().any(|pending| {
+            pending.wall >= at
+                && pending.expectations.iter().any(|previous| {
+                    previous.subject == expectation.subject && previous.field == expectation.field
+                })
+        })
+    }
+
+    pub(super) fn refresh_tv_sources(&mut self) {
+        let sources = tv_sources(&self.config, !self.tv_direct_unavailable);
+        for pending in self.pending_decisions.values_mut() {
+            for expectation in &mut pending.expectations {
+                if expectation.subject == "tv" && expectation.outcome == Outcome::Pending {
+                    expectation.via.clear();
+                    expectation.via.extend_from_slice(sources);
+                }
+            }
+        }
+    }
+
     fn evaluate_expectation(
         &self,
         wall: DateTime<Utc>,
@@ -630,17 +711,21 @@ impl Engine {
         progress: &ExpectationProgress,
         expired: bool,
     ) {
-        // Only current independent samples count: an unreachable sample
-        // replaces that source's earlier disagreement, not its truth.
+        if progress.contested && !expired {
+            return;
+        }
+        // Only current independent samples count; probe Unreachable remains unusable.
         let mut disagreement = progress.cec_disagreement_at.map(|latency_ms| Observation {
             value: "on",
             latency_ms,
         });
         for &via in &expectation.via {
-            let Some(observation) = self.observation(wall, expectation, via) else {
+            let Some(observation) =
+                self.observation(wall, expectation, via, progress.contested && expired)
+            else {
                 continue;
             };
-            if observation.value == expectation.expect {
+            if sample_agrees(via, observation.value, &expectation.expect) {
                 expectation.outcome = Outcome::Met {
                     via,
                     observed: observation.value.into(),
@@ -753,7 +838,9 @@ fn expectation_config_changed(old: &Config, new: &Config, expectation: &Expectat
             } else {
                 old.verify.receiver_s != new.verify.receiver_s
             };
-            old.receiver.entity != new.receiver.entity || deadline_changed
+            old.receiver.entity != new.receiver.entity
+                || old.receiver.observe != new.receiver.observe
+                || deadline_changed
         }
         "speakers" => {
             old.sonos.entity != new.sonos.entity || old.verify.speakers_s != new.verify.speakers_s

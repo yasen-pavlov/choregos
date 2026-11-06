@@ -32,6 +32,8 @@ off = { kind = "webos", host = "192.168.10.20", key_env = "CHOREGOS_TV_KEY" }
 [receiver]
 entity = "media_player.receiver"
 select_source = true      # call media_player.select_source on takeover (the receiver may also follow <Active Source> itself)
+# Optional device truth source for power only; source selection and control stay HA.
+# observe = { kind = "denon", host = "receiver.lan", port = 8080 } # port defaults to 8080
 
 [presets]                 # HA scripts, chosen by local time
 timezone = "Europe/Berlin"
@@ -63,12 +65,16 @@ identify_retry_s = 10
 
 [verify]
 tv_poll_ms = 2000                 # direct webOS observation cadence, 500–10000 ms
-tv_window_s = 45                  # stop at target or this deadline, 5–300 seconds
+tv_window_s = 45                  # full action-window duration, 5–300 s; must be >= tv_s
+tv_idle_poll_s = 15               # continuous active-mode webOS idle polling, 5–120 seconds
+receiver_poll_ms = 1000           # direct receiver action-window cadence, 500–10000 ms
+receiver_window_s = 30            # full duration, 5–300 s; >= max(receiver_s, receiver_off_s)
+receiver_idle_poll_s = 15         # continuous direct receiver idle polling, 5–120 seconds
 probe_poll_ms = 2000              # configured console probes, 500–10000 ms
 probe_window_s = 45               # stop at target or deadline, 5–300 seconds
-tv_s = 45                        # TV observation window allows HA reconnect lag; latency is recorded separately
-receiver_s = 10                  # receiver on after turn_on (observed ~2 s)
-receiver_off_s = 20              # receiver off after turn_off: its integration reports off late (observed 0.2–10.2 s)
+tv_s = 45                        # TV boot-to-service window (observed 17–30 s), not HA reconnect allowance
+receiver_s = 10                  # receiver on deadline; direct latency measures the device itself
+receiver_off_s = 20              # receiver off deadline; with direct observation not an HA polling allowance
 speakers_s = 5
 source_s = 10
 drift_grace_s = 30               # reporting-only room intent disagreement grace, 5–600 seconds

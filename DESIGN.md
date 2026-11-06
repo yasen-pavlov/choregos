@@ -22,6 +22,8 @@ TV ──────────── HDMI ──── AV receiver (CEC audio
                               │ in5 the bridge      (HDMI-CEC device claiming the TV role, LA 0; Tasmota or aether firmware)
 Sonos (line-in of a separate amp, not on HDMI)
 home server: MQTT broker, Home Assistant (websocket), choregos (this)
+Receiver optional direct power observation: HTTP main-zone status
+(`observe = { kind = "denon", host = "receiver.lan", port = 8080 }`).
 ```
 
 The TV's CEC is physically disconnected: the bridge is the only "TV" on the
@@ -140,7 +142,8 @@ src/runtime/bridge/aether.rs   status/bus/tx/telemetry/cfg codec + id map, boot 
 src/runtime/ha.rs      HA websocket client: auth, call_service, state subscriptions, reconnect [core]
 src/runtime/wol.rs     magic packet to directed broadcast                [core]
 src/runtime/webos.rs   native TLS SSAP TV power-off                       [core]
-src/runtime/observe.rs bounded direct TV and console observation windows  [core]
+src/runtime/denon.rs   read-only receiver HTTP main-zone power status     [core]
+src/runtime/observe.rs shared direct TV/receiver idle and action-window polling; console windows [core]
 src/runtime/probe.rs   read-only unicast console discovery over UDP       [core]
 src/runtime/executor.rs Action → side effect (respects mode)             [core]
 src/state.rs           AppState shared with the web layer (RwLock snapshot + broadcast channel of UI events) [core]
@@ -190,6 +193,7 @@ off = { kind = "webos", host = "192.168.10.20", key_env = "CHOREGOS_TV_KEY" }
 [receiver]
 entity = "media_player.receiver"
 select_source = true      # call media_player.select_source on takeover (the receiver may also follow <Active Source> itself)
+# observe = { kind = "denon", host = "receiver.lan", port = 8080 } # power only; source/control stay HA
 
 [presets]                 # HA scripts, chosen by local time
 timezone = "Europe/Berlin"
@@ -219,12 +223,16 @@ presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
 
-[verify]                         # optional; direct webOS read windows after active TV dispatch
+[verify]                         # optional; continuous direct webOS observation in active mode
 tv_poll_ms = 2000                 # 500–10000 ms
 tv_window_s = 45                  # 5–300 seconds
+tv_idle_poll_s = 15               # idle polling, 5–120 seconds
+receiver_poll_ms = 1000           # direct receiver window cadence, 500–10000 ms
+receiver_window_s = 30            # 5–300 seconds
+receiver_idle_poll_s = 15         # 5–120 seconds
 probe_poll_ms = 2000              # 500–10000 ms
 probe_window_s = 45               # 5–300 seconds
-tv_s = 45                        # expectation window permits HA reconnect lag after TV wake
+tv_s = 45                        # TV boot-to-service window (observed 17–30 s)
 receiver_s = 10
 receiver_off_s = 20
 speakers_s = 5
@@ -393,16 +401,45 @@ cached On counts only when its HA `changed` time is strictly later than the
 last room-off; older/equal or missing timestamps cannot suppress repeated
 wakes during shutdown lag. Off requests never write optimistic HA state.
 
-Only for native webOS TV off, active TV wake/off dispatch starts read-only
-`getPowerState` polling through the shared TLS/SSAP session. Poll immediately,
-then every `[verify].tv_poll_ms` (default 2000, 500–10000) until target or
-`tv_window_s` (default 45, 5–300 seconds); a newer action replaces the window.
+With native webOS and a configured key, active mode observes `getPowerState`
+continuously through the shared TLS/SSAP session. Idle reads occur every
+`[verify].tv_idle_poll_s` (default 15, 5–120 seconds), never stopping at a target.
+TV wake/off dispatch replaces idle or an older window: poll immediately, then
+every `tv_poll_ms` (default 2000, 500–10000) for the full `tv_window_s`
+(default 45, 5–300 seconds), then resume idle in the same task. Never stop a
+direct action window at its target. Require `tv_window_s >= tv_s`. Reload/shutdown
+abort reads; adapter startup/reload restarts idle after clearing direct cache.
 `Active`, `Screen Off`, and `Screen Saver` map to On; `Active Standby`,
-`Suspend`, and `Power Off` map to Off. Failed queries map to Unreachable, not Off. Pairing-required stops
-polling and warns once until adapters restart. Shadow mode does not poll.
-The last `Event::TvPower { state: On|Off|Unreachable, at }` is kept separately
-as `tv_direct: Option<(TvState, DateTime<Utc>)>` in engine and snapshot, never
-persisted. Observation windows do not create expectations/verdicts or actions.
+`Suspend`, and `Power Off` map to Off. Failed queries map to Unreachable.
+Pairing-required stops polling, warns once, and emits `TvDirectUnavailable`
+(`tv/unavailable` trace). Clear direct cache and select HA until reload explicitly
+resets the fallback/streak and restarts the observer.
+Shadow mode does not poll. Every sample is delivered as `Event::TvPower`
+and traced as `tv/state`. The last sample is kept as `tv_direct` in engine and
+snapshot, never persisted. Observations never create corrective actions.
+
+Optional `[receiver].observe = { kind = "denon", host, port = 8080 }` reads
+`/goform/formMainZone_MainZoneXmlStatusLite.xml` with a three-second HTTP timeout,
+no credentials, and no redirects. Both native observation hosts must omit scheme,
+path, whitespace and embedded port; ports are nonzero and IPv6 must be bracketed.
+XML Power ON/OFF alone maps
+to the shared `DirectPower::{On, Off, Unreachable}`; failures are Unreachable,
+which is unusable because this receiver HTTP service stays reachable in standby.
+The optional raw InputFuncSelect code is traced as `source_code`, never mapped to a
+configured source: code-to-display-name mapping is vendor-specific. Source and
+all receiver control stay on HA. `receiver_power_sources(config) -> &[Via]`
+selects `[Denon]` when observe exists, otherwise `[Ha]`; source remains `[Ha]`.
+The shared direct observer loop uses `receiver_poll_ms` (1000, 500–10000),
+`receiver_window_s` (30, 5–300), and `receiver_idle_poll_s` (15, 5–120).
+Require `receiver_window_s >= max(receiver_s, receiver_off_s)`. Dispatched receiver
+turn_on/turn_off replaces idle/older windows. Like TV, it runs the full duration
+even at target, then resumes idle. Shadow/reload/shutdown behavior matches the TV.
+Every sample
+feeds `Event::ReceiverPower { state, at, source_code }` and `receiver/state` traces.
+`Engine.receiver_direct` and `Snapshot.receiver_direct` cache
+`Option<(DirectPower, DateTime<Utc>)>`, cleared on reload and never persisted.
+Receiver deadlines stay 10 s on / 20 s off pending calibration; direct latency
+measures the receiver itself, not HA polling.
 
 Optional per-device `probe = { kind = "ps5", host = "console.lan", port = 9302 }`
 adds Sony console observations. Send one unicast datagram
@@ -425,13 +462,13 @@ Remote Play must be enabled and UDP reachability provided by the operator.
 Each active observable decision carries `expectations: Vec<Expectation>` and a
 `verdict`. `Expectation` has `subject` (`tv`, `receiver`, `speakers`,
 `role:<name>`), `field` (`power`, `source`, `playback`), string `expect`,
-`via` (ordered `tv_direct`, `ps5`, `ha`, `cec`), `deadline_ms` relative to
+`via` (`tv_direct`, `denon`, `ps5`, `ha`, `cec`), `deadline_ms` relative to
 the decision time, `attempts: u8` (standby resends), and tagged `outcome.kind`:
 `pending`, `met {via, observed, latency_ms}`, `missed {observed}`,
 `unknown {observed?}`, or `cec_only {observed}`. Values are strings.
 
-Wake transitions expect TV On only when `WakeTv` was sent (direct webOS then
-HA, or HA only), receiver On only when `turn_on` was sent, speakers stopped
+Wake transitions expect TV On only when `WakeTv` was sent (direct webOS only
+when configured, otherwise HA only), receiver On only when `turn_on` was sent, speakers stopped
 only when `media_stop` was sent, and standby for stopped CEC-policy roles with
 verification enabled or an independent probe. `cec_standby` and
 `cec_pause_standby` permit `[ps5, cec]` with a probe, otherwise `[cec]`.
@@ -446,28 +483,36 @@ including shadow would-rows, have empty
 expectations and verdict `none`.
 
 Default deadlines under `[verify]` are TV 45 s, receiver power 10 s, speakers
-5 s, source 10 s. The TV deadline is an observation window accommodating
-20–33 s HA reconnect lag after wake, not a latency target. Standby with only a
-CEC leg uses `takeover_settle_ms × (standby_retries + 1)`; probe-only standby
+5 s, source 10 s. The TV deadline covers boot-to-service (observed 17–30 s),
+not HA reconnect allowance; default tightening remains on hold until calibration.
+Standby with only a CEC leg uses `takeover_settle_ms × (standby_retries + 1)`; probe-only standby
 uses `verify.probe_window_s × 1000`. With both legs, use the greater deadline
 so independent confirmation can arrive after CEC retries exhaust. The CEC
 retry schedule and verification-slot lifetime are unchanged.
-At creation only, the newest sample before the decision across listed independent sources (`ha`, `tv_direct`, or `ps5`, never `cec`) settles `met` with zero latency if it matches, is in `[decision.at - deadline_ms, decision.at)`, and postdates every still-pending decision carrying the same subject and field; if all expectations meet this way, the decision is immediately `achieved`.
+At creation only, the newest sample before the decision across listed independent sources (`ha`, `tv_direct`, `denon`, or `ps5`, never `cec`) settles `met` with zero latency if it agrees and is in `[decision.at - deadline_ms, decision.at)`. For direct-sourced fields, skip pre-settlement while any same-field expectation is pending. If an opposite-value expectation is pending at creation, mark the new direct expectation contested: it can settle only at its deadline against the newest usable fresh sample. HA fields retain the earlier rule: the sample must postdate every pending decision carrying the same subject/field. If all expectations meet at creation, the decision is immediately `achieved`.
+Contested deadline evaluation retains the newest usable direct value and timestamp
+alongside each raw cache. A transient unusable sample cannot erase that evidence:
+On at +30 s then one Unreachable at +44 s still meets at the TV's +45 s deadline.
+Only expired contested expectations consult these retained samples; ordinary
+expectations, pre-settlement, drift and UI continue to use the current raw sample.
+Reload clears both caches; pairing loss clears both TV caches.
 On every event, evaluate pending fields against observations newer than the
 decision: HA power/playback uses `changed`, source attributes use `updated`,
-direct observations use their timestamps. Independent sources settle a fresh
-match immediately with actual latency; a different source's disagreement cannot
-veto it. The CEC leg is confirmed only by the verification's due confirmed check,
+direct observations use their timestamps. Uncontested independent sources settle
+a fresh match immediately with actual latency; contested direct fields wait for
+their deadline. The CEC leg is confirmed only by the verification's due confirmed check,
 with fresh Standby/Transition still present, never by raw frame sampling.
 A brief Standby followed by On before that check is not success; exhaustion with
 fresh On is missed, and without usable evidence is unknown. With a probe, retain
 checked CEC confirmation until the deadline if no independent match arrives;
 later cancellation must not erase that checked success. At the deadline,
 use only each independent source's current sample, newer than the decision:
-the latest usable disagreement supplies `missed.observed`. Unreachable direct
-samples and HA unavailable/unknown replace that source's earlier disagreement;
-they neither confirm nor refute. Without current fresh usable evidence the
-outcome is unknown, not a remembered missed result.
+the latest usable disagreement supplies `missed.observed`. Two consecutive direct
+TV Unreachable samples establish literal `unreachable` at the second sample's time:
+it agrees with Off and disagrees with On. A single failure is unusable and clears
+grace; On/Off resets the streak. Receiver/probe Unreachable and HA unavailable/
+unknown remain unusable. Without current fresh usable evidence the outcome is
+unknown, not a remembered missed result.
 All deadlines feed `next_deadline`, including during warm-up.
 
 When all expectations settle, verdict is `achieved` if all met/CEC-only,
@@ -498,9 +543,15 @@ In active mode outside warm-up, compare `RoomIntent` to `tv.power` and
 also compare `receiver.source` when power is On and a source is intended.
 Unknown intent checks nothing. Speakers playback has no persistent intent,
 and role power is the CEC-derived wake input, so neither is monitored.
-Use the shared newest usable independent sample lookup: HA power uses
-`changed`, source uses `updated`, TV direct uses `at`; unknown/unavailable
-and direct Unreachable supply no evidence. Never use CEC evidence for drift.
+Use the shared newest usable independent sample lookup: HA power uses `changed`,
+source uses `updated`, TV direct uses `at`. `tv_sources(config, direct_available) -> &[Via]`
+selects `[TvDirect]` for available webOS transport, otherwise `[Ha]`.
+Receiver power uses `[Denon]` with observe, otherwise `[Ha]`; receiver source
+and speakers use `[Ha]`. HA caches continue to gate control-path wake suppression.
+TV Unreachable is usable only after two consecutive failures, agrees with Off and
+refutes On; details retain `unreachable`. A single failure, HA unknown/unavailable
+and receiver/probe Unreachable are unusable.
+Never use CEC evidence for drift.
 HA media-player power normalizes `on|playing|paused|idle|buffering` to `on`,
 and `off|standby` to `off` for both drift and expectations; other usable
 states stay raw. Playback normalization remains separate.
@@ -511,12 +562,15 @@ clears grace and resolves any open drift (observed current usable value or
 expectation for the same subject/field clears grace, retaining an open drift;
 another field's pending expectation does not block. Receiver source selection
 awaiting the takeover-settle timer also counts as pending for `receiver.source`,
-before its expectation exists. Agreement clears grace and resolves an open drift.
+before its expectation exists. Agreement clears grace and resolves an open drift
+only when the agreeing sample is newer than the disagreement that opened it.
+Keep that opening sample timestamp with the open detail; losing evidence or
+receiving stale agreement does not resolve.
 Disagreement starts grace at first observation
 using injected monotonic time, not the sample's historical timestamp.
-Changing the selected disagreement's timestamp or value restarts grace;
-identical redelivery preserves it. Thus HA reconnect off/unavailable/off/on
-flaps do not accumulate a false disagreement clock.
+Changing the disagreeing value restarts grace; a newer timestamp with the same
+value keeps it. Unusable evidence clears it, so HA off/unavailable/off/on flaps
+cannot accumulate a false clock, while continuous direct polls can reach grace.
 At `[verify].drift_grace_s` (default 30, bounds 5–600), emit one `drift`
 per onset; further disagreement emits nothing until resolution.
 Intent changes close the old drift immediately and reset grace before comparing
@@ -591,7 +645,8 @@ empty; corrupt or unknown versions warn and start empty without failing startup.
   them and replay ignores them, recomputing from inputs with ids starting at 1.
   Settlement traces use `choregos/verdict` with id, verdict and expectations;
   extraction retains them and replay ignores the recorded outcomes.
-  Direct observations are `tv/state` with `{state, at}` and `probe/state`
+  Direct observations are `tv/state` with `{state, at}`, `receiver/state`
+  with `{state, at, source_code}` (raw function code or null), and `probe/state`
   with `{role, state, at}`; replay consumes these known topics and extraction
   retains them. Older versions ignore them.
 
@@ -652,6 +707,10 @@ on `choregos/state/drift`: `state` is `ON` for a non-empty open set, otherwise
 `Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>, updated: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
 `TvPower{state: On|Off|Unreachable, at: DateTime<Utc>}` is a direct observation
 only, independent of the HA cache and room intent.
+`TvDirectUnavailable` clears frozen TV evidence and selects HA until reload;
+it is captured as `tv/unavailable` with an empty object payload.
+`ReceiverPower{state: DirectPower, at: DateTime<Utc>, source_code: Option<String>}` updates only the
+receiver direct cache. TV uses the same shared `DirectPower` enum.
 `ConsolePower{role, state: Awake|Standby|Unreachable, at: DateTime<Utc>}`
 updates only the role's direct observation, never its CEC-derived logical power.
 `Frame.ack` (observed ACK bit) and `Frame.t_us` (bridge-monotonic µs) are
@@ -716,7 +775,7 @@ impl AppState {
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }
-pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub intent: RoomIntent, pub tv_direct: Option<(TvState, DateTime<Utc>)>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
+pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub intent: RoomIntent, pub tv_direct: Option<(DirectPower, DateTime<Utc>)>, pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
 pub enum UiEvent { Frame(FrameView), Decision(DecisionView), Verdict { id: u64, verdict: Verdict, expectations: Vec<Expectation> } } // publish updated snapshot before events
 pub enum Command { AllOff, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
 

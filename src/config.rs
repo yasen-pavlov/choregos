@@ -209,6 +209,22 @@ fn default_webos_port() -> u16 {
 pub struct ReceiverConfig {
     pub entity: String,
     pub select_source: bool,
+    #[serde(default)]
+    pub observe: Option<ReceiverObserveConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReceiverObserveConfig {
+    Denon {
+        host: String,
+        #[serde(default = "default_receiver_port")]
+        port: u16,
+    },
+}
+
+fn default_receiver_port() -> u16 {
+    8080
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -255,6 +271,10 @@ fn default_standby_retries() -> u8 {
 pub struct VerifyConfig {
     pub tv_poll_ms: u64,
     pub tv_window_s: u64,
+    pub tv_idle_poll_s: u64,
+    pub receiver_poll_ms: u64,
+    pub receiver_window_s: u64,
+    pub receiver_idle_poll_s: u64,
     pub probe_poll_ms: u64,
     pub probe_window_s: u64,
     pub tv_s: u64,
@@ -270,6 +290,10 @@ impl Default for VerifyConfig {
         Self {
             tv_poll_ms: 2000,
             tv_window_s: 45,
+            tv_idle_poll_s: 15,
+            receiver_poll_ms: 1000,
+            receiver_window_s: 30,
+            receiver_idle_poll_s: 15,
             probe_poll_ms: 2000,
             probe_window_s: 45,
             tv_s: 45,
@@ -467,32 +491,9 @@ impl Config {
         self.validate_devices()?;
         self.validate_timing()?;
         self.validate_fake_tv()?;
-        if !(500..=10000).contains(&self.verify.tv_poll_ms) {
-            return invalid("verify tv_poll_ms must be in 500..=10000 ms");
-        }
-        if !(5..=300).contains(&self.verify.tv_window_s) {
-            return invalid("verify tv_window_s must be in 5..=300 seconds");
-        }
-        if !(500..=10000).contains(&self.verify.probe_poll_ms) {
-            return invalid("verify probe_poll_ms must be in 500..=10000 ms");
-        }
-        if !(5..=300).contains(&self.verify.probe_window_s) {
-            return invalid("verify probe_window_s must be in 5..=300 seconds");
-        }
-        if !(5..=600).contains(&self.verify.drift_grace_s) {
-            return invalid("verify drift_grace_s must be in 5..=600 seconds");
-        }
-        if [
-            self.verify.tv_s,
-            self.verify.receiver_s,
-            self.verify.receiver_off_s,
-            self.verify.speakers_s,
-            self.verify.source_s,
-        ]
-        .into_iter()
-        .any(|seconds| !(1..=300).contains(&seconds))
-        {
-            return invalid("verify expectation deadlines must be in 1..=300 seconds");
+        self.validate_verify()?;
+        if let Some(ReceiverObserveConfig::Denon { host, port }) = &self.receiver.observe {
+            validate_host_port(host, *port)?;
         }
         if self.trace.keep_days > 365 {
             return invalid("trace keep_days must be in 0..=365");
@@ -519,25 +520,82 @@ impl Config {
             parse_mac(mac)?;
         }
         if let TvOffConfig::Webos { host, port, .. } = &self.tv.off {
-            let ipv6 = host.parse::<std::net::Ipv6Addr>().is_ok()
-                || host
-                    .strip_prefix('[')
-                    .and_then(|s| s.strip_suffix(']'))
-                    .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok());
-            if host.is_empty()
-                || host.contains('/')
-                || host.chars().any(char::is_whitespace)
-                || (!ipv6 && host.contains([':', '[', ']']))
-            {
-                return invalid(
-                    "TV webOS host must be a hostname or IP address without a path or port",
-                );
-            }
-            if *port == 0 {
-                return invalid("TV webOS port must be nonzero");
-            }
+            validate_host_port(host, *port)?;
         }
         self.validate_presets()
+    }
+
+    fn validate_verify(&self) -> Result<(), ConfigError> {
+        for (name, value, min, max, unit) in [
+            ("tv_poll_ms", self.verify.tv_poll_ms, 500, 10000, "ms"),
+            ("tv_window_s", self.verify.tv_window_s, 5, 300, "seconds"),
+            (
+                "tv_idle_poll_s",
+                self.verify.tv_idle_poll_s,
+                5,
+                120,
+                "seconds",
+            ),
+            (
+                "receiver_poll_ms",
+                self.verify.receiver_poll_ms,
+                500,
+                10000,
+                "ms",
+            ),
+            (
+                "receiver_window_s",
+                self.verify.receiver_window_s,
+                5,
+                300,
+                "seconds",
+            ),
+            (
+                "receiver_idle_poll_s",
+                self.verify.receiver_idle_poll_s,
+                5,
+                120,
+                "seconds",
+            ),
+            ("probe_poll_ms", self.verify.probe_poll_ms, 500, 10000, "ms"),
+            (
+                "probe_window_s",
+                self.verify.probe_window_s,
+                5,
+                300,
+                "seconds",
+            ),
+            (
+                "drift_grace_s",
+                self.verify.drift_grace_s,
+                5,
+                600,
+                "seconds",
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return invalid(&format!("verify {name} must be in {min}..={max} {unit}"));
+            }
+        }
+        if [
+            self.verify.tv_s,
+            self.verify.receiver_s,
+            self.verify.receiver_off_s,
+            self.verify.speakers_s,
+            self.verify.source_s,
+        ]
+        .into_iter()
+        .any(|seconds| !(1..=300).contains(&seconds))
+        {
+            return invalid("verify expectation deadlines must be in 1..=300 seconds");
+        }
+        if self.verify.tv_window_s < self.verify.tv_s {
+            return invalid("verify tv_window_s must be >= tv_s");
+        }
+        if self.verify.receiver_window_s < self.verify.receiver_s.max(self.verify.receiver_off_s) {
+            return invalid("verify receiver_window_s must be >= max(receiver_s, receiver_off_s)");
+        }
+        Ok(())
     }
 
     fn validate_devices(&self) -> Result<(), ConfigError> {
@@ -737,6 +795,26 @@ pub fn parse_physical(value: &str) -> Result<u16, ConfigError> {
     Ok(address)
 }
 
+fn validate_host_port(host: &str, port: u16) -> Result<(), ConfigError> {
+    let bracketed_ipv6 = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok());
+    if host.is_empty()
+        || (!bracketed_ipv6
+            && !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    {
+        return invalid(
+            "observation host must contain only [A-Za-z0-9._-] or be a bracketed IPv6 address",
+        );
+    }
+    if port == 0 {
+        return invalid("observation port must be nonzero");
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +904,7 @@ mod tests {
             (2000, 301, false),
         ] {
             let mut config = example();
+            config.verify.tv_s = 1; // Bounds test is independent of the window/deadline relation.
             config.verify.tv_poll_ms = poll;
             config.verify.tv_window_s = window;
             assert_eq!(
@@ -841,6 +920,22 @@ mod tests {
         config.verify.tv_poll_ms = 500;
         assert_eq!(config.verify.tv_window_s, 45);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tv_idle_poll_bounds_and_legacy_config() {
+        let text = toml::to_string(&example())
+            .unwrap()
+            .replace("tv_idle_poll_s = 15\n", "");
+        let mut config = Config::parse(&text).unwrap();
+        assert_eq!(config.verify.tv_idle_poll_s, 15);
+        for (seconds, valid) in [(4, false), (5, true), (120, true), (121, false)] {
+            config.verify.tv_idle_poll_s = seconds;
+            assert_eq!(
+                Config::parse(&toml::to_string(&config).unwrap()).is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]
@@ -912,9 +1007,8 @@ mod tests {
         assert!(
             Config::parse(&text.replace("kind = \"webos\"", "kind = \"webos\"\nport = 0")).is_err()
         );
-        for host in ["2001:db8::1", "[2001:db8::1]"] {
-            assert!(Config::parse(&text.replace("tv.example.com", host)).is_ok());
-        }
+        assert!(Config::parse(&text.replace("tv.example.com", "2001:db8::1")).is_err());
+        assert!(Config::parse(&text.replace("tv.example.com", "[2001:db8::1]")).is_ok());
         assert!(
             Config::parse(&text.replace("kind = \"webos\"", "kind = \"webos\"\nunknown = true"))
                 .is_err()
@@ -1172,5 +1266,114 @@ mod bridge_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod receiver_observation_tests {
+    use super::*;
+
+    #[test]
+    fn action_windows_cover_all_power_expectation_deadlines() {
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        config.verify.tv_window_s = config.verify.tv_s - 1;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("tv_window_s must be >= tv_s")
+        );
+        config.verify.tv_window_s = config.verify.tv_s;
+        assert!(config.validate().is_ok());
+        config.verify.receiver_window_s = config.verify.receiver_off_s - 1;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("receiver_window_s must be >= max(receiver_s, receiver_off_s)")
+        );
+        config.verify.receiver_window_s = config.verify.receiver_off_s;
+        assert!(config.validate().is_ok());
+        config.verify.receiver_s = config.verify.receiver_window_s + 1;
+        assert!(
+            config.validate().is_err(),
+            "on deadline also constrains the window"
+        );
+    }
+
+    #[test]
+    fn receiver_observation_rejects_non_host_endpoints() {
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        for (host, port, valid) in [
+            ("", 8080, false),
+            ("http://receiver.example", 8080, false),
+            ("receiver.example/path", 8080, false),
+            ("bad host", 8080, false),
+            ("receiver.example:8080", 8080, false),
+            ("receiver.example?query", 8080, false),
+            ("receiver.example#fragment", 8080, false),
+            ("user@receiver.example", 8080, false),
+            ("receiver.example", 0, false),
+            ("2001:db8::1", 8080, false),
+            ("[2001:db8::1]", 8080, true),
+            ("receiver.example", 8080, true),
+            ("[not-ipv6]", 8080, false),
+        ] {
+            config.receiver.observe = Some(ReceiverObserveConfig::Denon {
+                host: host.into(),
+                port,
+            });
+            assert_eq!(config.validate().is_ok(), valid, "{host}:{port}");
+        }
+    }
+
+    #[test]
+    fn optional_receiver_observation_and_polling_bounds() {
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        assert!(config.receiver.observe.is_none());
+        let observe: ReceiverObserveConfig =
+            toml::from_str("kind='denon'\nhost='receiver.example'").unwrap();
+        assert!(matches!(
+            observe,
+            ReceiverObserveConfig::Denon { port: 8080, .. }
+        ));
+        config.receiver.observe = Some(observe);
+        assert!(config.validate().is_ok());
+        config.receiver.observe = Some(ReceiverObserveConfig::Denon {
+            host: " ".into(),
+            port: 8080,
+        });
+        assert!(config.validate().is_err());
+        config.receiver.observe = None;
+        assert_eq!(
+            (
+                config.verify.receiver_poll_ms,
+                config.verify.receiver_window_s,
+                config.verify.receiver_idle_poll_s
+            ),
+            (1000, 30, 15)
+        );
+        config.verify.receiver_s = 1;
+        config.verify.receiver_off_s = 1;
+        for (poll, window, idle, valid) in [
+            (499, 30, 15, false),
+            (500, 5, 5, true),
+            (10000, 300, 120, true),
+            (10001, 30, 15, false),
+            (1000, 4, 15, false),
+            (1000, 301, 15, false),
+            (1000, 30, 4, false),
+            (1000, 30, 121, false),
+        ] {
+            config.verify.receiver_poll_ms = poll;
+            config.verify.receiver_window_s = window;
+            config.verify.receiver_idle_poll_s = idle;
+            assert_eq!(
+                Config::parse(&toml::to_string(&config).unwrap()).is_ok(),
+                valid
+            );
+        }
     }
 }

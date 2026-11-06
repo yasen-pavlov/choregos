@@ -93,6 +93,7 @@ impl AppState {
             active_role: None,
             intent: RoomIntent::default(),
             tv_direct: None,
+            receiver_direct: None,
             drift: Vec::new(),
             conflicts: Vec::new(),
             recent_frames: VecDeque::new(),
@@ -244,7 +245,8 @@ pub struct Snapshot {
     pub ha: HaView,
     pub active_role: Option<String>,
     pub intent: RoomIntent,
-    pub tv_direct: Option<(TvState, DateTime<Utc>)>,
+    pub tv_direct: Option<(DirectPower, DateTime<Utc>)>,
+    pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>,
     pub drift: Vec<crate::action::DriftDetail>,
     pub conflicts: Vec<Conflict>,
     pub recent_frames: VecDeque<FrameView>,
@@ -383,13 +385,13 @@ impl RoomIntent {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TvState {
+pub enum DirectPower {
     On,
     Off,
     Unreachable,
 }
 
-impl std::fmt::Display for TvState {
+impl std::fmt::Display for DirectPower {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::On => "on",

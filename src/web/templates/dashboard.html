@@ -52,7 +52,10 @@
       <span class="pill drift-open" title="Drift (reporting only, nothing is sent): {{ drift.via }} has reported {{ drift.observed }} while the room intends {{ drift.intended }}, since {{ view::iso(drift.since) }}">{{ drift.subject }}.{{ drift.field }}: {{ drift.observed }}, intended {{ drift.intended }}, for {{ view::open_for(drift.since) }}</span>
       {% endfor %}
       {% if let Some((state, at)) = snapshot.tv_direct %}
-      <span class="bridge-detail" title="Answered by the TV's own webOS service, the earliest LAN signal after a wake (Home Assistant follows ~10 s later)">· tv (webOS) {{ state }} {{ view::since(at) }}</span>
+      <span class="bridge-detail" title="Answered by the TV's own webOS service; the TV's truth source for expectations and drift (unreachable is what standby looks like)">· tv (webOS) {{ state }} {{ view::since(at) }}</span>
+      {% endif %}
+      {% if let Some((state, at)) = snapshot.receiver_direct %}
+      <span class="bridge-detail" title="Answered by the receiver's own HTTP status; the receiver's power truth source for expectations and drift">· receiver (direct) {{ state }} {{ view::since(at) }}</span>
       {% endif %}
     </div>
     <div class="group end">

@@ -15,7 +15,7 @@ use crate::{
     },
     config::{Config, PowerEvent, Presence, Takeover},
     identity::{self, Resolution},
-    state::{BusPower, Command, ConsoleState, Mode, RolePower, RoomIntent, RoomPower, TvState},
+    state::{BusPower, Command, ConsoleState, DirectPower, Mode, RolePower, RoomIntent, RoomPower},
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::{Value, json};
@@ -58,8 +58,14 @@ pub enum Event {
         updated: Option<DateTime<Utc>>,
     },
     TvPower {
-        state: TvState,
+        state: DirectPower,
         at: DateTime<Utc>,
+    },
+    TvDirectUnavailable,
+    ReceiverPower {
+        state: DirectPower,
+        at: DateTime<Utc>,
+        source_code: Option<String>,
     },
     ConsolePower {
         role: String,
@@ -166,6 +172,8 @@ impl DecisionTrigger {
             Event::Tick
             | Event::HaState { .. }
             | Event::TvPower { .. }
+            | Event::TvDirectUnavailable
+            | Event::ReceiverPower { .. }
             | Event::ConsolePower { .. }
             | Event::SendResult { .. }
             | Event::BridgeOnline
@@ -205,6 +213,12 @@ struct DriftTrack {
 }
 
 impl DriftTrack {
+    fn newer_than_onset(&self, at: DateTime<Utc>) -> bool {
+        self.sample
+            .as_ref()
+            .is_none_or(|(opened_at, _)| at > *opened_at)
+    }
+
     fn disagreement_since(
         &mut self,
         now: Instant,
@@ -215,19 +229,21 @@ impl DriftTrack {
         let changed = self
             .sample
             .as_ref()
-            .is_none_or(|(previous_at, value)| *previous_at != at || value != observed);
+            .is_none_or(|(_, value)| value != observed);
         if self.since.is_none() || changed {
             self.since = Some((now, wall));
-            match &mut self.sample {
-                Some((previous_at, value)) => {
-                    *previous_at = at;
-                    if value != observed {
-                        value.clear();
-                        value.push_str(observed);
-                    }
+        }
+        // Until onset, retain the newest disagreeing sample without restarting
+        // continuous same-value grace. Once open, drift_onset leaves it frozen.
+        match &mut self.sample {
+            Some((previous_at, value)) => {
+                *previous_at = at;
+                if value != observed {
+                    value.clear();
+                    value.push_str(observed);
                 }
-                sample => *sample = Some((at, observed.into())),
             }
+            sample => *sample = Some((at, observed.into())),
         }
         *self.since.get_or_insert((now, wall))
     }
@@ -238,6 +254,7 @@ struct DriftInput {
     tv_direct: bool,
     tv_ha: bool,
     receiver_ha: bool,
+    receiver_direct: bool,
 }
 
 impl DriftInput {
@@ -245,6 +262,10 @@ impl DriftInput {
         match event {
             Event::TvPower { .. } => Self {
                 tv_direct: true,
+                ..Self::default()
+            },
+            Event::ReceiverPower { .. } => Self {
+                receiver_direct: true,
                 ..Self::default()
             },
             Event::HaState { entity, .. } => Self {
@@ -261,15 +282,16 @@ impl DriftInput {
             ("tv", Via::TvDirect) => self.tv_direct,
             ("tv", Via::Ha) => self.tv_ha,
             ("receiver", Via::Ha) => self.receiver_ha,
+            ("receiver", Via::Denon) => self.receiver_direct,
             _ => false,
         }
     }
 }
 
-const DRIFT_FIELDS: [(&str, Field, &[Via]); 3] = [
-    ("tv", Field::Power, &[Via::TvDirect, Via::Ha]),
-    ("receiver", Field::Power, &[Via::Ha]),
-    ("receiver", Field::Source, &[Via::Ha]),
+const DRIFT_FIELDS: [(&str, Field); 3] = [
+    ("tv", Field::Power),
+    ("receiver", Field::Power),
+    ("receiver", Field::Source),
 ];
 
 pub struct Engine {
@@ -279,7 +301,12 @@ pub struct Engine {
     pub roles: BTreeMap<String, RoleState>,
     pub ha: BTreeMap<String, HaState>,
     pub intent: RoomIntent,
-    pub tv_direct: Option<(TvState, DateTime<Utc>)>,
+    pub tv_direct: Option<(DirectPower, DateTime<Utc>)>,
+    pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>,
+    tv_last_usable: Option<(DirectPower, DateTime<Utc>)>,
+    receiver_last_usable: Option<(DirectPower, DateTime<Utc>)>,
+    tv_direct_unavailable: bool,
+    tv_unreachable_streak: u8,
     pub bridge_online: bool,
     pub warming: bool,
     pub decisions: Vec<Decision>,
@@ -324,6 +351,11 @@ impl Engine {
             ha: BTreeMap::new(),
             intent: RoomIntent::default(),
             tv_direct: None,
+            receiver_direct: None,
+            tv_last_usable: None,
+            receiver_last_usable: None,
+            tv_direct_unavailable: false,
+            tv_unreachable_streak: 0,
             bridge_online: false,
             warming: true,
             decisions: vec![],
@@ -409,51 +441,50 @@ impl Engine {
             Event::Command(command) => Some(Self::command_reason(command)),
             _ => None,
         };
-        let mut actions =
-            match event {
-                Event::BridgeOnline => self.handle_bridge_online(now),
-                Event::ServiceStarted => {
-                    self.record(None, None, None, "service_started", vec![], None);
-                    vec![]
+        let mut actions = match event {
+            Event::BridgeOnline => self.handle_bridge_online(now),
+            Event::ServiceStarted => {
+                self.record(None, None, None, "service_started", vec![], None);
+                vec![]
+            }
+            Event::BridgeOffline => self.handle_bridge_offline(),
+            Event::TvPower { state, at } => {
+                self.observe_tv_power(state, at);
+                vec![]
+            }
+            Event::TvDirectUnavailable => {
+                self.handle_tv_direct_unavailable();
+                vec![]
+            }
+            Event::ReceiverPower { state, at, .. } => {
+                self.observe_receiver_power(state, at);
+                vec![]
+            }
+            Event::ConsolePower { role, state, at } => {
+                if let Some(role) = self.roles.get_mut(&role) {
+                    role.direct = Some((state, at));
                 }
-                Event::BridgeOffline => self.handle_bridge_offline(),
-                Event::TvPower { state, at } => {
-                    self.tv_direct = Some((state, at));
-                    vec![]
-                }
-                Event::ConsolePower { role, state, at } => {
-                    if let Some(role) = self.roles.get_mut(&role) {
-                        role.direct = Some((state, at));
-                    }
-                    vec![]
-                }
-                Event::HaState {
-                    entity,
-                    state,
-                    attrs,
-                    changed,
-                    updated,
-                } => self.handle_ha_state(entity, state, attrs, changed, updated, wall),
-                Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
-                Event::Frame(frame) => self.handle_frame(frame, now, wall),
-                Event::SendResult {
-                    to, data, status, ..
-                } => {
-                    if let Some(pending) = self.standby_verifications.iter_mut().find(|pending| {
-                        pending.la == to && pending.frames.contains(&data.as_slice())
-                    }) {
-                        match status {
-                            SendStatus::Ack => pending.acked = true,
-                            SendStatus::Nack => pending.nacked = pending.nacked.saturating_add(1),
-                            _ => {}
-                        }
-                    }
-                    vec![]
-                }
-                Event::Command(command) => self.handle_command(command, now),
-                Event::Tick if self.bridge_online => self.bus.retry_identification(now),
-                Event::Tick => vec![],
-            };
+                vec![]
+            }
+            Event::HaState {
+                entity,
+                state,
+                attrs,
+                changed,
+                updated,
+            } => self.handle_ha_state(entity, state, attrs, changed, updated, wall),
+            Event::ConfigReloaded(config) => self.handle_config_reloaded(config, now),
+            Event::Frame(frame) => self.handle_frame(frame, now, wall),
+            Event::SendResult {
+                to, data, status, ..
+            } => {
+                self.note_send_result(to, &data, status);
+                vec![]
+            }
+            Event::Command(command) => self.handle_command(command, now),
+            Event::Tick if self.bridge_online => self.bus.retry_identification(now),
+            Event::Tick => vec![],
+        };
         let command_stops = matches!(
             self.trigger,
             Some(DecisionTrigger::Command(
@@ -508,6 +539,35 @@ impl Engine {
         actions
     }
 
+    fn handle_tv_direct_unavailable(&mut self) {
+        self.tv_direct = None;
+        self.tv_last_usable = None;
+        self.tv_unreachable_streak = 0;
+        self.tv_direct_unavailable = true;
+        self.refresh_tv_sources();
+    }
+
+    fn observe_receiver_power(&mut self, state: DirectPower, at: DateTime<Utc>) {
+        self.receiver_direct = Some((state, at));
+        if state != DirectPower::Unreachable {
+            Self::remember_direct(&mut self.receiver_last_usable, state, at);
+        }
+    }
+
+    fn note_send_result(&mut self, to: u8, data: &[u8], status: SendStatus) {
+        if let Some(pending) = self
+            .standby_verifications
+            .iter_mut()
+            .find(|pending| pending.la == to && pending.frames.contains(&data))
+        {
+            match status {
+                SendStatus::Ack => pending.acked = true,
+                SendStatus::Nack => pending.nacked = pending.nacked.saturating_add(1),
+                _ => {}
+            }
+        }
+    }
+
     fn handle_bridge_online(&mut self, now: Instant) -> Vec<Action> {
         self.bridge_online = true;
         self.resync(now)
@@ -546,12 +606,40 @@ impl Engine {
         vec![]
     }
 
+    fn observe_tv_power(&mut self, state: DirectPower, at: DateTime<Utc>) {
+        self.tv_direct = Some((state, at));
+        self.tv_unreachable_streak = if state == DirectPower::Unreachable {
+            self.tv_unreachable_streak.saturating_add(1)
+        } else {
+            0
+        };
+        if state != DirectPower::Unreachable || self.tv_unreachable_streak >= 2 {
+            Self::remember_direct(&mut self.tv_last_usable, state, at);
+        }
+    }
+
+    fn remember_direct(
+        cache: &mut Option<(DirectPower, DateTime<Utc>)>,
+        state: DirectPower,
+        at: DateTime<Utc>,
+    ) {
+        if cache.is_none_or(|(_, previous)| at >= previous) {
+            *cache = Some((state, at));
+        }
+    }
+
     fn handle_config_reloaded(&mut self, config: Arc<Config>, now: Instant) -> Vec<Action> {
         self.cancel_reconfigured_expectations(&config);
         let bridge_changed = self.config.bridge != config.bridge;
         self.config = config;
         self.intent.receiver_source = None;
         self.tv_direct = None;
+        self.receiver_direct = None;
+        self.tv_last_usable = None;
+        self.receiver_last_usable = None;
+        self.tv_direct_unavailable = false;
+        self.tv_unreachable_streak = 0;
+        self.refresh_tv_sources();
         for track in &mut self.drift_tracks {
             track.since = None;
         }
@@ -1461,7 +1549,7 @@ impl Engine {
         now: Instant,
         input: DriftInput,
     ) {
-        let (subject, field, sources) = DRIFT_FIELDS[index];
+        let (subject, field) = DRIFT_FIELDS[index];
         let intended = self.drift_intended(subject, field);
         if track.intended.as_deref() != intended {
             track.since = None;
@@ -1472,19 +1560,26 @@ impl Engine {
             track.since = None;
             return;
         };
-        let sample = self.newest_independent_sample(subject, field, sources, None);
+        let sample = self.newest_independent_sample(
+            subject,
+            field,
+            self.drift_sources(subject, field),
+            None,
+        );
         let Some(sample) = sample else {
             track.since = None;
             return;
         };
-        let (_, observed, _) = sample;
+        let (via, observed, at) = sample;
         if self.drift_field_pending(subject, field) {
             track.since = None;
             return;
         }
-        if observed == intended {
+        if expectations::sample_agrees(via, observed, intended) {
             track.since = None;
-            self.close_drift_field(track, index);
+            if track.newer_than_onset(at) {
+                self.close_drift_field(track, index);
+            }
         } else if let Some((detail, trigger)) =
             self.drift_onset(track, index, now, input, (intended, sample))
         {
@@ -1505,7 +1600,7 @@ impl Engine {
         if track.open.is_some() {
             return None;
         }
-        let (subject, field, _) = DRIFT_FIELDS[index];
+        let (subject, field) = DRIFT_FIELDS[index];
         let (intended, (via, observed, at)) = comparison;
         let (since, since_wall) = track.disagreement_since(now, self.wall, at, observed);
         if now.duration_since(since) < Duration::from_secs(self.config.verify.drift_grace_s) {
@@ -1527,13 +1622,21 @@ impl Engine {
         Some((detail, trigger))
     }
 
+    fn drift_sources(&self, subject: &str, field: Field) -> &[Via] {
+        match (subject, field) {
+            ("tv", _) => expectations::tv_sources(&self.config, !self.tv_direct_unavailable),
+            ("receiver", Field::Power) => expectations::receiver_power_sources(&self.config),
+            _ => &[Via::Ha],
+        }
+    }
+
     fn close_drift_field(&mut self, track: &mut DriftTrack, index: usize) {
         if track.open.is_none() {
             return;
         }
-        let (subject, field, sources) = DRIFT_FIELDS[index];
+        let (subject, field) = DRIFT_FIELDS[index];
         let observed = self
-            .newest_independent_sample(subject, field, sources, None)
+            .newest_independent_sample(subject, field, self.drift_sources(subject, field), None)
             .map(|(via, value, _)| (via, value));
         if let Some(detail) = Self::resolved_drift(track, observed) {
             let via = detail.via;
@@ -1554,6 +1657,10 @@ impl Engine {
         if subject == "receiver" && field == Field::Source && self.settle.is_some() {
             return true;
         }
+        self.field_expectation_pending(subject, field)
+    }
+
+    fn field_expectation_pending(&self, subject: &str, field: Field) -> bool {
         self.pending_decisions.values().any(|pending| {
             pending.expectations.iter().any(|expectation| {
                 expectation.outcome == Outcome::Pending
@@ -1602,7 +1709,9 @@ impl Engine {
         if verdict == Verdict::Pending {
             self.pending_decisions.insert(
                 id,
-                PendingDecision::new(self.now, self.wall, expectations.clone()),
+                PendingDecision::new(self.now, self.wall, expectations.clone(), |expectation| {
+                    self.expectation_contested(expectation)
+                }),
             );
         }
         self.decisions.push(Decision {
