@@ -3,7 +3,7 @@ use choregos::{
     cec::Frame,
     config::{Config, Takeover},
     engine::{Engine, Event},
-    state::{BusPower, Command, Mode, RolePower, RoomIntent, RoomPower, TvState},
+    state::{BusPower, Command, DirectPower, Mode, RolePower, RoomIntent, RoomPower},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -3986,7 +3986,7 @@ fn direct_observations_update_only_their_truth_source() {
         engine
             .handle(
                 Event::TvPower {
-                    state: TvState::On,
+                    state: DirectPower::On,
                     at: wall()
                 },
                 now,
@@ -3995,7 +3995,7 @@ fn direct_observations_update_only_their_truth_source() {
             .is_empty()
     );
     assert!(engine.decisions.is_empty());
-    assert_eq!(engine.tv_direct, Some((TvState::On, wall())));
+    assert_eq!(engine.tv_direct, Some((DirectPower::On, wall())));
     assert_eq!(engine.intent, RoomIntent::default());
     assert!(engine.ha.is_empty());
     let roles_before = engine.roles.len();
@@ -4022,7 +4022,7 @@ fn direct_observations_update_only_their_truth_source() {
         assert_eq!(engine.roles.len(), roles_before);
         assert!(!engine.roles.contains_key("unknown_role"));
         assert_eq!(engine.intent, RoomIntent::default());
-        assert_eq!(engine.tv_direct, Some((TvState::On, wall())));
+        assert_eq!(engine.tv_direct, Some((DirectPower::On, wall())));
         assert!(engine.ha.is_empty());
     }
 }
@@ -4155,7 +4155,7 @@ fn config_reload_discards_all_direct_observations_without_a_bridge_change() {
     let (mut engine, now) = setup();
     engine.handle(
         Event::TvPower {
-            state: TvState::On,
+            state: DirectPower::On,
             at: wall(),
         },
         now,
@@ -4202,7 +4202,26 @@ fn verdict_ha(engine: &mut Engine, start: Instant, ms: u64, entity: String, stat
 }
 
 fn verdict_wake() -> (Engine, Instant, u64) {
+    verdict_wake_transport(false)
+}
+
+fn verdict_wake_transport(direct: bool) -> (Engine, Instant, u64) {
+    verdict_wake_observers(direct, false)
+}
+
+fn verdict_wake_observers(direct: bool, receiver: bool) -> (Engine, Instant, u64) {
     let (mut engine, start) = setup();
+    if !direct {
+        std::sync::Arc::make_mut(&mut engine.config).tv.off = choregos::config::TvOffConfig::Ha;
+    }
+    if receiver {
+        std::sync::Arc::make_mut(&mut engine.config)
+            .receiver
+            .observe = Some(choregos::config::ReceiverObserveConfig::Denon {
+            host: "receiver.example".into(),
+            port: 8080,
+        });
+    }
     identify_atv(&mut engine, start);
     verdict_event(
         &mut engine,
@@ -4289,7 +4308,7 @@ fn wake_verdict_is_partial_when_receiver_never_reports_on() {
 #[test]
 fn direct_tv_observation_wins_before_ha_and_ha_only_configuration_excludes_it() {
     for direct in [true, false] {
-        let (mut engine, start, id) = verdict_wake();
+        let (mut engine, start, id) = verdict_wake_transport(true);
         if !direct {
             // Change the transport before creating a fresh wake, through a reload.
             let mut config = (*engine.config).clone();
@@ -4327,7 +4346,7 @@ fn direct_tv_observation_wins_before_ha_and_ha_only_configuration_excludes_it() 
             start,
             600,
             Event::TvPower {
-                state: TvState::On,
+                state: DirectPower::On,
                 at: wall() + chrono::Duration::milliseconds(600),
             },
         );
@@ -4354,6 +4373,7 @@ fn takeover_standby_uses_independent_console_evidence_or_honest_cec_only() {
         let (mut engine, start) = setup();
         let config = std::sync::Arc::make_mut(&mut engine.config);
         config.mode = Mode::Active;
+        config.tv.off = choregos::config::TvOffConfig::Ha;
         config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
             host: "console.example".into(),
             port: 9302,
@@ -4603,7 +4623,7 @@ fn quick_rewake_uses_newer_direct_off_instead_of_older_matching_ha_on() {
         start,
         9000,
         Event::TvPower {
-            state: TvState::Off,
+            state: DirectPower::Off,
             at: wall() + chrono::Duration::milliseconds(9000),
         },
     );
@@ -4820,6 +4840,11 @@ fn room_off_already_satisfied_independent_sources_achieve_at_creation() {
         port: 3001,
         key_env: "CHOREGOS_TV_KEY".into(),
     };
+    // Settle the preceding wake before testing uncontested pre-settlement.
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 150, tv, "on");
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 160, receiver, "on");
     verdict_event(
         &mut engine,
         start,
@@ -4833,7 +4858,7 @@ fn room_off_already_satisfied_independent_sources_achieve_at_creation() {
         start,
         2100,
         Event::TvPower {
-            state: TvState::Off,
+            state: DirectPower::Off,
             at: wall() + chrono::Duration::milliseconds(2100),
         },
     );
@@ -5039,10 +5064,14 @@ fn shadow_rows_and_actionless_rows_have_no_observable_verdict() {
 
 #[test]
 fn an_unreachable_sample_replaces_the_sources_earlier_disagreement() {
-    let (mut engine, start, id) = verdict_wake();
+    let (mut engine, start, id) = verdict_wake_transport(true);
     let receiver = engine.config.receiver.entity.clone();
     verdict_ha(&mut engine, start, 500, receiver, "on");
-    for (ms, state) in [(600, TvState::Off), (700, TvState::Unreachable)] {
+    for (ms, state) in [
+        (600, DirectPower::Off),
+        (700, DirectPower::Unreachable),
+        (800, DirectPower::Unreachable),
+    ] {
         verdict_event(
             &mut engine,
             start,
@@ -5063,7 +5092,9 @@ fn an_unreachable_sample_replaces_the_sources_earlier_disagreement() {
     assert_eq!(update.verdict, Verdict::Partial);
     assert_eq!(
         update.expectations[0].outcome,
-        Outcome::Unknown { observed: None }
+        Outcome::Missed {
+            observed: "unreachable".into()
+        }
     );
 }
 
@@ -5130,6 +5161,7 @@ fn opted_out_cec_standby_uses_only_a_configured_probe() {
         let (mut engine, start) = setup();
         let config = std::sync::Arc::make_mut(&mut engine.config);
         config.mode = Mode::Active;
+        config.tv.off = choregos::config::TvOffConfig::Ha;
         let console = config
             .device
             .iter_mut()
@@ -5453,7 +5485,7 @@ fn review_p4r_all_off_ignores_unobservable_media_stop_roles() {
 }
 
 #[test]
-fn review_p11_any_fresh_matching_source_wins_over_a_direct_disagreement() {
+fn ha_only_tv_ignores_direct_samples_including_unreachable() {
     for unreachable in [false, true] {
         let (mut engine, start, _) = verdict_wake();
         verdict_event(
@@ -5474,7 +5506,7 @@ fn review_p11_any_fresh_matching_source_wins_over_a_direct_disagreement() {
             start,
             4000,
             Event::TvPower {
-                state: TvState::On,
+                state: DirectPower::On,
                 at: wall() + chrono::Duration::milliseconds(4000),
             },
         );
@@ -5484,7 +5516,7 @@ fn review_p11_any_fresh_matching_source_wins_over_a_direct_disagreement() {
                 start,
                 6000,
                 Event::TvPower {
-                    state: TvState::Unreachable,
+                    state: DirectPower::Unreachable,
                     at: wall() + chrono::Duration::milliseconds(6000),
                 },
             );
@@ -5609,6 +5641,7 @@ fn bridge_offline_cancels_cec_only_but_preserves_independent_probe_expectations(
         let (mut engine, start) = setup();
         let config = std::sync::Arc::make_mut(&mut engine.config);
         config.mode = Mode::Active;
+        config.tv.off = choregos::config::TvOffConfig::Ha;
         if probe {
             config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
                 host: "console.example".into(),
@@ -5731,6 +5764,7 @@ fn review_q6_only_checked_cec_confirmation_survives_a_later_user_wake() {
     for checked in [false, true] {
         let (mut engine, start) = setup();
         let config = std::sync::Arc::make_mut(&mut engine.config);
+        config.tv.off = choregos::config::TvOffConfig::Ha;
         config.mode = Mode::Active;
         if checked {
             config.timing.takeover_settle_ms = 1000;
@@ -5806,6 +5840,7 @@ fn probe_standby_verdict(cec: bool, probe_window_s: u64, settle_ms: u64) -> (Eng
     let (mut engine, start) = setup();
     let config = std::sync::Arc::make_mut(&mut engine.config);
     config.mode = Mode::Active;
+    config.tv.off = choregos::config::TvOffConfig::Ha;
     config.verify.probe_window_s = probe_window_s;
     config.timing.takeover_settle_ms = settle_ms;
     config.device[0].verify_standby = cec;
@@ -6094,11 +6129,11 @@ fn a_sample_arriving_after_the_probe_deadline_cannot_replace_deadline_evidence()
 #[test]
 fn late_tv_or_ha_samples_cannot_replace_expired_disagreement() {
     for direct in [false, true] {
-        let (mut engine, start, id) = verdict_wake();
+        let (mut engine, start, id) = verdict_wake_transport(direct);
         let receiver = engine.config.receiver.entity.clone();
         let tv = engine.config.tv.entity.clone();
         verdict_ha(&mut engine, start, 500, receiver, "on");
-        let sample = |ms, state: TvState| {
+        let sample = |ms, state: DirectPower| {
             if direct {
                 Event::TvPower {
                     state,
@@ -6107,15 +6142,20 @@ fn late_tv_or_ha_samples_cannot_replace_expired_disagreement() {
             } else {
                 Event::HaState {
                     entity: tv.clone(),
-                    state: if state == TvState::On { "on" } else { "off" }.into(),
+                    state: if state == DirectPower::On {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                    .into(),
                     attrs: BTreeMap::new(),
                     changed: Some(wall() + chrono::Duration::milliseconds(ms)),
                     updated: None,
                 }
             }
         };
-        verdict_event(&mut engine, start, 44000, sample(44000, TvState::Off));
-        verdict_event(&mut engine, start, 45150, sample(45150, TvState::On));
+        verdict_event(&mut engine, start, 44000, sample(44000, DirectPower::Off));
+        verdict_event(&mut engine, start, 45150, sample(45150, DirectPower::On));
         assert_eq!(
             engine.expectations(id).unwrap()[0].outcome,
             Outcome::Missed {
@@ -6254,39 +6294,20 @@ fn drift_room_off(engine: &mut Engine, start: Instant) {
 }
 
 #[test]
-fn drift_tv_remote_on_uses_newest_usable_sample_not_arrival_order() {
+fn ha_only_tv_drift_ignores_direct_observations() {
     let (mut engine, start) = drift_ready();
     drift_room_off(&mut engine, start);
     let tv = engine.config.tv.entity.clone();
-    verdict_ha(&mut engine, start, 7000, tv, "on");
-    verdict_event(
-        &mut engine,
-        start,
-        8000,
-        Event::TvPower {
-            state: TvState::Off,
-            at: wall() + chrono::Duration::seconds(6),
-        },
-    );
+    verdict_ha(&mut engine, start, 7000, tv.clone(), "on");
+    tv_sample(&mut engine, start, 8000, 8000, DirectPower::Off);
     verdict_event(&mut engine, start, 37000, Event::Tick);
     assert_eq!(engine.drift()[0].subject, "tv");
     assert_eq!(engine.drift()[0].observed, "on");
-    verdict_event(
-        &mut engine,
-        start,
-        38000,
-        Event::TvPower {
-            state: TvState::Off,
-            at: wall() + chrono::Duration::seconds(38),
-        },
-    );
+    tv_sample(&mut engine, start, 38000, 38000, DirectPower::Off);
+    assert_eq!(engine.drift().len(), 1);
+    verdict_ha(&mut engine, start, 39000, tv, "off");
     assert!(engine.drift().is_empty());
-    let row = engine
-        .decisions
-        .iter()
-        .find(|row| row.reason == "drift_resolved")
-        .unwrap();
-    assert_eq!(row.drift.as_ref().unwrap().via, Via::TvDirect);
+    assert_eq!(engine.decisions[0].drift.as_ref().unwrap().via, Via::Ha);
 }
 
 #[test]
@@ -6365,7 +6386,7 @@ fn drift_unusable_samples_neither_start_nor_resolve_and_do_not_spin_deadlines() 
         start,
         4000,
         Event::TvPower {
-            state: TvState::Unreachable,
+            state: DirectPower::Unreachable,
             at: wall(),
         },
     );
@@ -6390,7 +6411,7 @@ fn drift_unusable_samples_neither_start_nor_resolve_and_do_not_spin_deadlines() 
         start,
         104000,
         Event::TvPower {
-            state: TvState::Unreachable,
+            state: DirectPower::Unreachable,
             at: wall(),
         },
     );
@@ -6647,12 +6668,20 @@ fn assert_restarted_source_grace(engine: &mut Engine, start: Instant) {
 }
 
 #[test]
-fn drift_new_timestamp_with_same_value_restarts_grace() {
+fn drift_new_timestamp_with_same_value_keeps_original_grace() {
     let (mut engine, start) = drift_ready();
     verdict_event(&mut engine, start, 2300, Event::BridgeOffline);
     drift_receiver(&mut engine, start, 3000, "on", "Other");
     drift_replacement_source(&mut engine, start, 10, "Other");
-    assert_restarted_source_grace(&mut engine, start);
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_secs(33))
+    );
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(3)
+    );
 }
 
 #[test]
@@ -6847,6 +6876,11 @@ fn drift_onset_trigger_requires_the_event_to_supply_the_selected_sample() {
     );
 
     let (mut engine, start) = drift_ready();
+    std::sync::Arc::make_mut(&mut engine.config).tv.off = choregos::config::TvOffConfig::Webos {
+        host: "tv.example".into(),
+        port: 3001,
+        key_env: "CHOREGOS_TV_KEY".into(),
+    };
     let tv = engine.config.tv.entity.clone();
     verdict_ha(&mut engine, start, 3000, tv.clone(), "off");
     verdict_event(
@@ -6854,7 +6888,7 @@ fn drift_onset_trigger_requires_the_event_to_supply_the_selected_sample() {
         start,
         4000,
         Event::TvPower {
-            state: TvState::Off,
+            state: DirectPower::Off,
             at: wall() + chrono::Duration::seconds(4),
         },
     );
@@ -6881,4 +6915,669 @@ fn drift_onset_trigger_requires_the_event_to_supply_the_selected_sample() {
         engine.decisions[0].drift.as_ref().unwrap().via,
         Via::TvDirect
     );
+}
+
+fn tv_sample(
+    engine: &mut Engine,
+    start: Instant,
+    delivered: u64,
+    sampled: i64,
+    state: DirectPower,
+) {
+    verdict_event(
+        engine,
+        start,
+        delivered,
+        Event::TvPower {
+            state,
+            at: wall() + chrono::Duration::milliseconds(sampled),
+        },
+    );
+}
+
+#[test]
+fn tv_shutdown_lag_live_reproduction_requires_fresh_uncontested_evidence() {
+    // Off is t0 = 8000; use the live trace's exact +2.2 s/+2.24 s/+3.2 s/+5 s offsets.
+    let (mut engine, start, off_id) = room_off_after_confirmed_ha_on();
+    tv_sample(&mut engine, start, 10200, 10200, DirectPower::On);
+    assert_eq!(
+        engine.expectations(off_id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    let actions = verdict_event(
+        &mut engine,
+        start,
+        10240,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    assert!(actions.contains(&Action::WakeTv));
+    let wake_id = engine
+        .decisions
+        .iter()
+        .find(|row| row.to == Some(RolePower::On))
+        .unwrap()
+        .id;
+    assert_eq!(
+        engine.expectations(wake_id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 11200, tv.clone(), "off");
+    assert_eq!(
+        engine.expectations(wake_id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    drift_receiver(&mut engine, start, 12000, "on", "Streamer");
+    tv_sample(&mut engine, start, 13000, 13000, DirectPower::Unreachable);
+    assert_eq!(
+        engine.expectations(off_id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    tv_sample(&mut engine, start, 14000, 14000, DirectPower::Unreachable);
+    assert_eq!(
+        engine.expectations(off_id).unwrap()[0].outcome,
+        Outcome::Met {
+            via: Via::TvDirect,
+            observed: "unreachable".into(),
+            latency_ms: 6000,
+        }
+    );
+    for ms in [28000, 43000] {
+        tv_sample(&mut engine, start, ms, ms as i64, DirectPower::Unreachable);
+    }
+    verdict_event(&mut engine, start, 55240, Event::Tick);
+    assert_eq!(
+        engine.expectations(wake_id).unwrap()[0].outcome,
+        Outcome::Missed {
+            observed: "unreachable".into()
+        }
+    );
+    for ms in [58000, 73000] {
+        tv_sample(&mut engine, start, ms, ms as i64, DirectPower::Unreachable);
+    }
+    verdict_event(&mut engine, start, 85239, Event::Tick);
+    assert!(engine.drift().is_empty());
+    verdict_event(&mut engine, start, 85240, Event::Tick);
+    let opening = engine.drift()[0].clone();
+    assert_eq!(
+        (&*opening.subject, &*opening.observed, opening.via),
+        ("tv", "unreachable", Via::TvDirect)
+    );
+    assert_eq!(
+        opening.since,
+        wall() + chrono::Duration::milliseconds(55240)
+    );
+    tv_sample(&mut engine, start, 86000, 10200, DirectPower::On);
+    assert_eq!(engine.drift(), vec![opening.clone()]);
+    verdict_ha(&mut engine, start, 87000, tv.clone(), "unavailable");
+    assert_eq!(engine.drift(), vec![opening.clone()]);
+    verdict_ha(&mut engine, start, 87500, tv, "on");
+    assert_eq!(engine.drift(), vec![opening.clone()]);
+    tv_sample(&mut engine, start, 88000, 88000, DirectPower::On);
+    assert!(engine.drift().is_empty());
+    let resolved = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "drift_resolved")
+        .unwrap();
+    assert_eq!(resolved.drift.as_ref().unwrap().since, opening.since);
+}
+
+#[test]
+fn tv_transport_selects_the_only_reporting_source() {
+    for direct in [false, true] {
+        let (mut engine, start, id) = verdict_wake_transport(direct);
+        assert_eq!(
+            engine.expectations(id).unwrap()[0].via,
+            if direct {
+                vec![Via::TvDirect]
+            } else {
+                vec![Via::Ha]
+            }
+        );
+        let tv = engine.config.tv.entity.clone();
+        verdict_ha(&mut engine, start, 200, tv.clone(), "on");
+        assert_eq!(
+            engine.expectations(id).unwrap()[0].outcome,
+            if direct {
+                Outcome::Pending
+            } else {
+                Outcome::Met {
+                    via: Via::Ha,
+                    observed: "on".into(),
+                    latency_ms: 100,
+                }
+            }
+        );
+        tv_sample(&mut engine, start, 300, 300, DirectPower::On);
+        drift_receiver(&mut engine, start, 400, "on", "Streamer");
+        verdict_event(&mut engine, start, 2200, Event::Tick);
+        verdict_ha(&mut engine, start, 3000, tv.clone(), "off");
+        verdict_event(&mut engine, start, 33000, Event::Tick);
+        assert_eq!(engine.drift().is_empty(), direct);
+        if !direct {
+            verdict_ha(&mut engine, start, 34000, tv, "on");
+            assert!(engine.drift().is_empty());
+        }
+    }
+}
+
+#[test]
+fn direct_unreachable_meets_off_and_never_starts_off_intent_drift() {
+    let (mut engine, start, id) = room_off_after_confirmed_ha_on();
+    tv_sample(&mut engine, start, 9000, 9000, DirectPower::Unreachable);
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    tv_sample(&mut engine, start, 9050, 9050, DirectPower::Unreachable);
+    drift_receiver(&mut engine, start, 9100, "off", "Streamer");
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Met {
+            via: Via::TvDirect,
+            observed: "unreachable".into(),
+            latency_ms: 1050,
+        }
+    );
+    verdict_event(&mut engine, start, 40000, Event::Tick);
+    assert!(engine.drift().is_empty());
+}
+
+#[test]
+fn ha_receiver_presettles_when_its_sample_postdates_pending_off() {
+    let (mut engine, start, _) = room_off_after_confirmed_ha_on();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 8500, receiver, "on");
+    verdict_event(
+        &mut engine,
+        start,
+        9000,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(
+        wake.expectations
+            .iter()
+            .find(|e| e.subject == "receiver")
+            .unwrap()
+            .outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            observed: "on".into(),
+            latency_ms: 0
+        }
+    );
+}
+
+#[test]
+fn receiver_drift_requires_strictly_newer_agreement_and_preserves_since() {
+    let (mut engine, start) = drift_ready();
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    let opening = engine.drift()[0].clone();
+    let receiver = engine.config.receiver.entity.clone();
+    for sampled in [2000, 3000] {
+        verdict_event(
+            &mut engine,
+            start,
+            34000 + sampled as u64,
+            Event::HaState {
+                entity: receiver.clone(),
+                state: "on".into(),
+                attrs: BTreeMap::from([("source".into(), Value::String("Streamer".into()))]),
+                changed: Some(wall() + chrono::Duration::milliseconds(sampled)),
+                updated: Some(wall() + chrono::Duration::seconds(34)),
+            },
+        );
+        assert_eq!(engine.drift(), vec![opening.clone()]);
+    }
+    drift_receiver(&mut engine, start, 38000, "on", "Streamer");
+    assert!(engine.drift().is_empty());
+    assert_eq!(
+        engine.decisions[0].drift.as_ref().unwrap().since,
+        opening.since
+    );
+}
+
+fn receiver_sample(engine: &mut Engine, start: Instant, ms: u64, state: DirectPower) {
+    verdict_event(
+        engine,
+        start,
+        ms,
+        Event::ReceiverPower {
+            state,
+            at: wall() + chrono::Duration::milliseconds(ms as i64),
+            source_code: None,
+        },
+    );
+}
+
+#[test]
+fn receiver_direct_sources_ignore_ha_power_but_keep_ha_source() {
+    let (mut engine, start, wake) = verdict_wake_observers(false, true);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv.clone(), "on");
+    drift_receiver(&mut engine, start, 300, "on", "Streamer");
+    assert_eq!(engine.expectations(wake).unwrap()[1].via, vec![Via::Denon]);
+    assert_eq!(
+        engine.expectations(wake).unwrap()[1].outcome,
+        Outcome::Pending
+    );
+    receiver_sample(&mut engine, start, 400, DirectPower::On);
+    assert_eq!(
+        engine.expectations(wake).unwrap()[1].outcome,
+        Outcome::Met {
+            via: Via::Denon,
+            observed: "on".into(),
+            latency_ms: 300,
+        }
+    );
+    verdict_event(&mut engine, start, 2200, Event::Tick);
+    drift_receiver(&mut engine, start, 3000, "off", "Streamer");
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert!(engine.drift().is_empty(), "HA off cannot start power drift");
+    receiver_sample(&mut engine, start, 34000, DirectPower::Off);
+    drift_receiver(&mut engine, start, 35000, "on", "Other");
+    verdict_event(&mut engine, start, 64000, Event::Tick);
+    let opening = engine
+        .drift()
+        .iter()
+        .find(|d| d.field == choregos::action::Field::Power)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (&*opening.subject, &*opening.observed, opening.via),
+        ("receiver", "off", Via::Denon)
+    );
+    drift_receiver(&mut engine, start, 65000, "on", "Other");
+    assert!(
+        engine.drift().contains(&opening),
+        "HA on cannot clear direct drift"
+    );
+    assert!(
+        engine
+            .drift()
+            .iter()
+            .any(|d| d.field == choregos::action::Field::Source && d.via == Via::Ha)
+    );
+    receiver_sample(&mut engine, start, 66000, DirectPower::Unreachable);
+    assert!(
+        engine.drift().contains(&opening),
+        "loss of evidence cannot resolve"
+    );
+    receiver_sample(&mut engine, start, 67000, DirectPower::On);
+    assert!(
+        !engine
+            .drift()
+            .iter()
+            .any(|d| d.field == choregos::action::Field::Power)
+    );
+
+    verdict_event(&mut engine, start, 68000, Event::Command(Command::AllOff));
+    verdict_event(&mut engine, start, 71000, Event::Tick);
+    let off = engine
+        .decisions
+        .iter()
+        .find(|d| d.reason == "off_timer_expired")
+        .unwrap()
+        .id;
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 72000, receiver, "off");
+    assert_eq!(
+        engine.expectations(off).unwrap()[1].outcome,
+        Outcome::Pending
+    );
+    receiver_sample(&mut engine, start, 73000, DirectPower::Unreachable);
+    assert_eq!(
+        engine.expectations(off).unwrap()[1].outcome,
+        Outcome::Pending
+    );
+    receiver_sample(&mut engine, start, 74000, DirectPower::Off);
+    assert_eq!(
+        engine.expectations(off).unwrap()[1].outcome,
+        Outcome::Met {
+            via: Via::Denon,
+            observed: "off".into(),
+            latency_ms: 3000,
+        }
+    );
+}
+
+#[test]
+fn receiver_unreachable_clears_grace_and_is_neither_off_nor_on_evidence() {
+    let (mut engine, start, id) = verdict_wake_observers(false, true);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv, "on");
+    receiver_sample(&mut engine, start, 300, DirectPower::Unreachable);
+    verdict_event(&mut engine, start, 10100, Event::Tick);
+    assert_eq!(
+        engine.expectations(id).unwrap()[1].outcome,
+        Outcome::Unknown { observed: None }
+    );
+    receiver_sample(&mut engine, start, 11000, DirectPower::Off);
+    receiver_sample(&mut engine, start, 40000, DirectPower::Unreachable);
+    verdict_event(&mut engine, start, 41000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    receiver_sample(&mut engine, start, 42000, DirectPower::Off);
+    receiver_sample(&mut engine, start, 57000, DirectPower::Off);
+    verdict_event(&mut engine, start, 71999, Event::Tick);
+    assert!(engine.drift().is_empty());
+    verdict_event(&mut engine, start, 72000, Event::Tick);
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(42)
+    );
+}
+
+#[test]
+fn receiver_direct_quick_rewake_waits_for_its_own_fresh_on_sample() {
+    let (mut engine, start, _) = verdict_wake_observers(false, true);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 200, tv, "on");
+    receiver_sample(&mut engine, start, 300, DirectPower::On);
+    verdict_event(&mut engine, start, 1000, Event::Command(Command::AllOff));
+    verdict_event(&mut engine, start, 4000, Event::Tick);
+    receiver_sample(&mut engine, start, 4500, DirectPower::On);
+    verdict_event(
+        &mut engine,
+        start,
+        5000,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|d| d.to == Some(RolePower::On))
+        .unwrap()
+        .id;
+    assert_eq!(
+        engine.expectations(wake).unwrap()[1].outcome,
+        Outcome::Pending
+    );
+    receiver_sample(&mut engine, start, 6000, DirectPower::On);
+    assert_eq!(
+        engine.expectations(wake).unwrap()[1].outcome,
+        Outcome::Pending
+    );
+    verdict_event(&mut engine, start, 15000, Event::Tick);
+    assert_eq!(
+        engine.expectations(wake).unwrap()[1].outcome,
+        Outcome::Met {
+            via: Via::Denon,
+            observed: "on".into(),
+            latency_ms: 1000,
+        }
+    );
+    let config = engine.config.clone();
+    verdict_event(&mut engine, start, 16000, Event::ConfigReloaded(config));
+    assert!(engine.receiver_direct.is_none());
+}
+
+#[test]
+fn contested_tv_wake_waits_for_deadline_and_uses_the_latest_direct_sample() {
+    for comes_back in [false, true] {
+        let (mut engine, start, _) = room_off_after_confirmed_ha_on();
+        // t0 = 8000: off, +1 s wake, +1.46 s first direct window read.
+        verdict_event(
+            &mut engine,
+            start,
+            9000,
+            Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+        );
+        let wake = engine
+            .decisions
+            .iter()
+            .find(|d| d.to == Some(RolePower::On))
+            .unwrap()
+            .id;
+        tv_sample(&mut engine, start, 9460, 9460, DirectPower::On);
+        assert_eq!(
+            engine.expectations(wake).unwrap()[0].outcome,
+            Outcome::Pending
+        );
+        drift_receiver(&mut engine, start, 10000, "on", "Streamer");
+        tv_sample(&mut engine, start, 13000, 13000, DirectPower::Unreachable);
+        tv_sample(&mut engine, start, 15000, 15000, DirectPower::Unreachable);
+        if comes_back {
+            tv_sample(&mut engine, start, 28000, 28000, DirectPower::On);
+            assert_eq!(
+                engine.expectations(wake).unwrap()[0].outcome,
+                Outcome::Pending
+            );
+        }
+        verdict_event(&mut engine, start, 53999, Event::Tick);
+        assert_eq!(
+            engine.expectations(wake).unwrap()[0].outcome,
+            Outcome::Pending
+        );
+        verdict_event(&mut engine, start, 54000, Event::Tick);
+        assert_eq!(
+            engine.expectations(wake).unwrap()[0].outcome,
+            if comes_back {
+                Outcome::Met {
+                    via: Via::TvDirect,
+                    observed: "on".into(),
+                    latency_ms: 19000,
+                }
+            } else {
+                Outcome::Missed {
+                    observed: "unreachable".into(),
+                }
+            }
+        );
+    }
+}
+
+#[test]
+fn isolated_tv_unreachable_is_unusable_and_does_not_meet_off_or_hold_grace() {
+    let (mut engine, start, id) = room_off_after_confirmed_ha_on();
+    tv_sample(&mut engine, start, 8500, 8500, DirectPower::On);
+    tv_sample(&mut engine, start, 9000, 9000, DirectPower::Unreachable);
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    tv_sample(&mut engine, start, 9500, 9500, DirectPower::On);
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    tv_sample(&mut engine, start, 10000, 10000, DirectPower::Unreachable);
+    tv_sample(&mut engine, start, 11000, 11000, DirectPower::Unreachable);
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Met {
+            via: Via::TvDirect,
+            observed: "unreachable".into(),
+            latency_ms: 3000,
+        }
+    );
+
+    let (mut engine, start, _) = verdict_wake_transport(true);
+    tv_sample(&mut engine, start, 200, 200, DirectPower::On);
+    drift_receiver(&mut engine, start, 300, "on", "Streamer");
+    verdict_event(&mut engine, start, 2200, Event::Tick);
+    tv_sample(&mut engine, start, 3000, 3000, DirectPower::Unreachable);
+    verdict_event(&mut engine, start, 33000, Event::Tick);
+    assert!(engine.drift().is_empty());
+    tv_sample(&mut engine, start, 34000, 34000, DirectPower::On);
+    tv_sample(&mut engine, start, 35000, 35000, DirectPower::Unreachable);
+    tv_sample(&mut engine, start, 36000, 36000, DirectPower::Unreachable);
+    verdict_event(&mut engine, start, 65999, Event::Tick);
+    assert!(engine.drift().is_empty());
+    verdict_event(&mut engine, start, 66000, Event::Tick);
+    assert_eq!(
+        engine.drift()[0].since,
+        wall() + chrono::Duration::seconds(36)
+    );
+}
+
+#[test]
+fn pairing_loss_clears_direct_cache_uses_ha_and_reload_restores_direct_sources() {
+    let (mut engine, start, id) = verdict_wake_transport(true);
+    tv_sample(&mut engine, start, 200, 200, DirectPower::Off);
+    verdict_event(&mut engine, start, 300, Event::TvDirectUnavailable);
+    assert!(engine.tv_direct.is_none());
+    assert_eq!(engine.expectations(id).unwrap()[0].via, vec![Via::Ha]);
+    let tv = engine.config.tv.entity.clone();
+    verdict_ha(&mut engine, start, 400, tv.clone(), "on");
+    assert_eq!(
+        engine.expectations(id).unwrap()[0].outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            observed: "on".into(),
+            latency_ms: 300,
+        }
+    );
+    let config = engine.config.clone();
+    verdict_event(&mut engine, start, 500, Event::ConfigReloaded(config));
+    verdict_event(&mut engine, start, 3500, Event::Tick);
+    verdict_event(&mut engine, start, 4000, Event::Command(Command::AllOff));
+    verdict_event(&mut engine, start, 7000, Event::Tick);
+    verdict_event(
+        &mut engine,
+        start,
+        7100,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|d| d.to == Some(RolePower::On))
+        .unwrap()
+        .id;
+    assert_eq!(
+        engine.expectations(wake).unwrap()[0].via,
+        vec![Via::TvDirect]
+    );
+    verdict_ha(&mut engine, start, 7200, tv, "on");
+    assert_eq!(
+        engine.expectations(wake).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+}
+
+#[test]
+fn ha_receiver_off_presettles_after_a_pending_wake_with_newer_off_evidence() {
+    let (mut engine, start, _) = verdict_wake();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 200, receiver, "off");
+    verdict_event(&mut engine, start, 300, Event::Command(Command::AllOff));
+    verdict_event(&mut engine, start, 3300, Event::Tick);
+    let off = engine
+        .decisions
+        .iter()
+        .find(|d| d.reason == "off_timer_expired")
+        .unwrap();
+    let expectation = off
+        .expectations
+        .iter()
+        .find(|e| e.subject == "receiver")
+        .unwrap();
+    assert_eq!(
+        expectation.outcome,
+        Outcome::Met {
+            via: Via::Ha,
+            observed: "off".into(),
+            latency_ms: 0
+        }
+    );
+}
+
+#[test]
+fn contested_tv_deadline_retains_last_usable_on_across_a_single_transient_failure() {
+    let (mut engine, start, _) = room_off_after_confirmed_ha_on();
+    verdict_event(
+        &mut engine,
+        start,
+        9000,
+        Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+    );
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|d| d.to == Some(RolePower::On))
+        .unwrap()
+        .id;
+    tv_sample(&mut engine, start, 39000, 39000, DirectPower::On); // wake +30 s
+    tv_sample(&mut engine, start, 53000, 53000, DirectPower::Unreachable); // wake +44 s
+    assert_eq!(
+        engine.expectations(wake).unwrap()[0].outcome,
+        Outcome::Pending
+    );
+    verdict_event(&mut engine, start, 54000, Event::Tick);
+    assert_eq!(
+        engine.expectations(wake).unwrap()[0].outcome,
+        Outcome::Met {
+            via: Via::TvDirect,
+            observed: "on".into(),
+            latency_ms: 30000,
+        }
+    );
+    assert_eq!(
+        engine.tv_direct,
+        Some((
+            DirectPower::Unreachable,
+            wall() + chrono::Duration::seconds(53)
+        ))
+    );
+    assert!(engine.drift().iter().all(|d| d.subject != "tv"));
+}
+
+#[test]
+fn receiver_retains_last_usable_sample_only_for_contested_deadline_evaluation() {
+    for contested in [false, true] {
+        let (mut engine, start, _) = verdict_wake_observers(false, true);
+        let tv = engine.config.tv.entity.clone();
+        verdict_ha(&mut engine, start, 200, tv, "on");
+        receiver_sample(&mut engine, start, 300, DirectPower::On);
+        verdict_event(&mut engine, start, 1000, Event::Command(Command::AllOff));
+        verdict_event(&mut engine, start, 4000, Event::Tick);
+        let id = if contested {
+            verdict_event(
+                &mut engine,
+                start,
+                5000,
+                Event::Frame(Frame::from_hex(4, 0, "04").unwrap()),
+            );
+            engine
+                .decisions
+                .iter()
+                .find(|d| d.to == Some(RolePower::On))
+                .unwrap()
+                .id
+        } else {
+            engine
+                .decisions
+                .iter()
+                .find(|d| d.reason == "off_timer_expired")
+                .unwrap()
+                .id
+        };
+        receiver_sample(&mut engine, start, 8000, DirectPower::On);
+        receiver_sample(&mut engine, start, 14000, DirectPower::Unreachable);
+        verdict_event(
+            &mut engine,
+            start,
+            if contested { 15000 } else { 24000 },
+            Event::Tick,
+        );
+        assert_eq!(
+            engine.expectations(id).unwrap()[1].outcome,
+            if contested {
+                Outcome::Met {
+                    via: Via::Denon,
+                    observed: "on".into(),
+                    latency_ms: 3000,
+                }
+            } else {
+                Outcome::Unknown { observed: None }
+            }
+        );
+    }
 }

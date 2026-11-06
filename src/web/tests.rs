@@ -1165,7 +1165,7 @@ async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
     snapshot.connections.mqtt_connected = true;
     snapshot.intent.power = crate::state::RoomPower::On;
     snapshot.intent.active_role = Some("streamer".into());
-    snapshot.tv_direct = Some((crate::state::TvState::On, chrono::Utc::now()));
+    snapshot.tv_direct = Some((crate::state::DirectPower::On, chrono::Utc::now()));
     h.state.publish(snapshot, []);
     let html = body(h.get("/", Some(&cookie)).await).await;
     // The poll swaps `#dashboard` and, out of band, `#status` from the same response.

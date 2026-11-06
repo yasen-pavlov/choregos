@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod cli;
+pub mod denon;
 pub mod executor;
 pub mod ha;
 pub mod mqtt;
@@ -17,7 +18,7 @@ use crate::{
     state::{
         AppState, BridgeTelemetry, BusEntryView, Command, CommandError, ConsoleState, DecisionView,
         FrameDirection, FrameView, HaEntityView, HaView, Mode, RolePower, RoleView, Snapshot,
-        TvState, UiEvent,
+        UiEvent,
     },
 };
 use chrono::{DateTime, Utc};
@@ -50,6 +51,7 @@ pub(crate) enum Input {
     },
     Request(Request),
 }
+
 struct Adapters {
     executor: Arc<executor::Executor>,
     mqtt_task: tokio::task::JoinHandle<()>,
@@ -68,6 +70,7 @@ impl Adapters {
             active: Arc::new(AtomicBool::new(config.mode == Mode::Active)),
         });
         let observer = Arc::new(observe::Observer::new(tx, executor.active.clone()));
+        observer.start(Arc::new(config.clone()));
         let worker_observer = observer.clone();
         let (effects, rx) = mpsc::channel::<(Arc<Config>, Vec<Action>)>(64);
         let worker = tokio::spawn(ordered_effects(executor.clone(), worker_observer, rx));
@@ -155,8 +158,13 @@ async fn ordered_effects(
                 tracing::error!(error = %error, "action failed");
             }
             match action {
-                Action::WakeTv => observer.tv(config.clone(), TvState::On),
-                Action::TvOff => observer.tv(config.clone(), TvState::Off),
+                Action::WakeTv | Action::TvOff => observer.tv(config.clone()),
+                Action::HaCall {
+                    entity, service, ..
+                } if entity == config.receiver.entity => match service.as_str() {
+                    "turn_on" | "turn_off" => observer.receiver(config.clone(), true),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -554,10 +562,7 @@ impl Runtime {
         };
         let success = result.is_ok();
         if success && let Command::SetMode(mode) = command {
-            self.adapters()
-                .executor
-                .active
-                .store(mode == Mode::Active, Ordering::Release);
+            self.adapters().observer.set_mode(mode, &self.engine.config);
         }
         if let Some(reply) = reply {
             let _ = reply.send(result);
@@ -767,6 +772,16 @@ impl Runtime {
             Event::TvPower { state, at } => TraceEntry::TvPower {
                 state: *state,
                 at: *at,
+            },
+            Event::TvDirectUnavailable => TraceEntry::TvDirectUnavailable,
+            Event::ReceiverPower {
+                state,
+                at,
+                source_code,
+            } => TraceEntry::ReceiverPower {
+                state: *state,
+                at: *at,
+                source_code: source_code.clone(),
             },
             Event::ConsolePower { role, state, at } => TraceEntry::ConsolePower {
                 role: role.clone(),
@@ -1100,6 +1115,7 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     snapshot.active_role = engine.intent.active_role.clone();
     snapshot.intent = engine.intent.clone();
     snapshot.tv_direct = engine.tv_direct;
+    snapshot.receiver_direct = engine.receiver_direct;
     snapshot.drift = engine.drift();
     snapshot.conflicts = engine.identity.conflicts.clone();
     snapshot.connections.bridge_online = engine.bridge_online;

@@ -584,6 +584,16 @@ impl Replay {
                 updated: updated.or(Some(timestamp)),
             }],
             TraceEntry::TvPower { state, at } => vec![Event::TvPower { state, at }],
+            TraceEntry::TvDirectUnavailable => vec![Event::TvDirectUnavailable],
+            TraceEntry::ReceiverPower {
+                state,
+                at,
+                source_code,
+            } => vec![Event::ReceiverPower {
+                state,
+                at,
+                source_code,
+            }],
             TraceEntry::ConsolePower { role, state, at } => {
                 vec![Event::ConsolePower { role, state, at }]
             }
@@ -1672,7 +1682,7 @@ mod extraction_tests {
 
     #[test]
     fn direct_tv_state_survives_extraction_and_replay_with_its_observed_time() {
-        use crate::state::TvState;
+        use crate::state::DirectPower;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("direct.jsonl");
         let observed = timestamp(-1);
@@ -1694,11 +1704,11 @@ mod extraction_tests {
         let mut output = vec![];
         replay.line(&text, &mut output).unwrap();
         let engine = replay.engine.as_ref().unwrap();
-        assert_eq!(engine.tv_direct, Some((TvState::Unreachable, observed)));
+        assert_eq!(engine.tv_direct, Some((DirectPower::Unreachable, observed)));
         assert!(engine.ha.is_empty());
         assert_eq!(engine.intent, crate::state::RoomIntent::default());
         assert_eq!(engine.roles["streamer"].power, crate::state::RolePower::Off);
-        for (index, (name, state)) in [("on", TvState::On), ("off", TvState::Off)]
+        for (index, (name, state)) in [("on", DirectPower::On), ("off", DirectPower::Off)]
             .into_iter()
             .enumerate()
         {
@@ -1739,6 +1749,111 @@ mod extraction_tests {
             trace::parse_checked(&row(
                 1,
                 "tv/state",
+                json!({"state":"unknown","at":observed})
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pairing_unavailable_trace_roundtrips_extracts_and_clears_replayed_cache() {
+        let text = trace::line(timestamp(1), &trace::TraceEntry::TvDirectUnavailable);
+        assert!(matches!(
+            trace::parse_checked(&text).unwrap().unwrap().1,
+            trace::TraceEntry::TvDirectUnavailable
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unavailable.jsonl");
+        std::fs::write(&path, &text).unwrap();
+        let mut extracted = vec![];
+        extract_with_warnings(
+            &[path],
+            (timestamp(1), timestamp(1)),
+            &[],
+            None,
+            &mut extracted,
+            &mut vec![],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(extracted).unwrap(), text);
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let mut replay = Replay::new(config, None, None).unwrap();
+        let mut output = vec![];
+        replay
+            .line(
+                &row(0, "tv/state", json!({"state":"on","at":timestamp(0)})),
+                &mut output,
+            )
+            .unwrap();
+        assert!(replay.engine.as_ref().unwrap().tv_direct.is_some());
+        replay.line(&text, &mut output).unwrap();
+        assert!(replay.engine.as_ref().unwrap().tv_direct.is_none());
+    }
+
+    #[test]
+    fn direct_receiver_state_roundtrips_extracts_and_replays_without_source_mapping() {
+        use crate::state::DirectPower;
+        let observed = timestamp(-1);
+        let entry = trace::TraceEntry::ReceiverPower {
+            state: DirectPower::Off,
+            at: observed,
+            source_code: Some("MPLAY".into()),
+        };
+        let text = trace::line(timestamp(0), &entry);
+        let (_, parsed) = trace::parse_checked(&text).unwrap().unwrap();
+        assert!(matches!(parsed, trace::TraceEntry::ReceiverPower {
+            state: DirectPower::Off, at, source_code: Some(code),
+        } if at == observed && code == "MPLAY"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receiver.jsonl");
+        std::fs::write(&path, &text).unwrap();
+        let mut extracted = vec![];
+        extract_with_warnings(
+            &[path],
+            (timestamp(0), timestamp(1)),
+            &[],
+            None,
+            &mut extracted,
+            &mut vec![],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(extracted).unwrap(), text);
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let mut replay = Replay::new(config, None, None).unwrap();
+        let mut output = vec![];
+        replay.line(&text, &mut output).unwrap();
+        let engine = replay.engine.as_ref().unwrap();
+        assert_eq!(engine.receiver_direct, Some((DirectPower::Off, observed)));
+        assert!(engine.ha.is_empty());
+        assert_eq!(engine.intent, crate::state::RoomIntent::default());
+        assert!(output.is_empty());
+        for (index, (name, state)) in [
+            ("on", DirectPower::On),
+            ("unreachable", DirectPower::Unreachable),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = timestamp(index as i64 + 1);
+            replay
+                .line(
+                    &row(
+                        index as i64 + 1,
+                        "receiver/state",
+                        json!({"state":name,"at":at}),
+                    ),
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(
+                replay.engine.as_ref().unwrap().receiver_direct,
+                Some((state, at))
+            );
+        }
+        assert!(
+            trace::parse_checked(&row(
+                3,
+                "receiver/state",
                 json!({"state":"unknown","at":observed})
             ))
             .is_err()

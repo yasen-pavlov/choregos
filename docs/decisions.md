@@ -2,6 +2,65 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-06 — Device truth sources for TV and receiver
+
+- HA webostv observes the same SSAP service as direct webOS, but 8–33 seconds
+  later with its own reconnect backoff. With native webOS configured, use only
+  `tv_direct` for TV expectations and drift; use HA without webOS or while direct
+  pairing is unavailable. Keep HA table and control-path wake gating unchanged.
+- A direct Active sample 2.2 seconds after TvOff can still describe shutdown
+  lag. For direct-sourced fields, a pending same-field expectation blocks
+  pre-settlement. A new opposite-value expectation is contested and waits until
+  its deadline, even if its first post-command read still says Active.
+  HA fields keep their previous timestamp-after-pending-decision rule.
+- HA unavailable once promoted a 130-second-old direct On sample and closed
+  real drift. Resolution now needs agreement newer than the opening
+  disagreement; intent-change, undefined-intent and shadow closures are unchanged.
+- Two consecutive TV direct Unreachable samples establish literal evidence,
+  matching Off and refuting On at the second sample's timestamp. A single
+  transient failure clears grace and cannot meet Off. HA unknown/unavailable
+  and console/receiver Unreachable remain unusable.
+- Continuous active-mode webOS reads use `verify.tv_idle_poll_s` (15 seconds,
+  bounds 5–120), replaced by fast action windows and resumed afterward.
+  Pairing block, reload/shutdown cancellation and shadow suppression remain.
+- Keep `tv_s = 45` for boot-to-service (observed 17–30 seconds), not HA
+  reconnect lag. Default tightening is on hold until roughly 2026-11-12.
+- Optional receiver `observe = { kind = "denon", host, port = 8080 }` uses
+  device HTTP main-zone power; HA is the fallback only when no direct
+  transport exists. Control remains HA. Receiver source stays HA because
+  InputFuncSelect code-to-name mapping is vendor-specific; raw codes are traced.
+  Receiver Unreachable is unusable (HTTP is reachable in standby), unlike TV.
+  Share `DirectPower` and the window/idle loop between both transports.
+- Receiver `receiver_poll_ms` / `receiver_window_s` / `receiver_idle_poll_s`
+  default to 1000 ms / 30 s / 15 s; bounds mirror TV settings. Keep receiver
+  On/Off deadlines 10/20 seconds pending calibration; device latency no longer
+  includes HA polling. The 2026-11-05 receiver-off rationale below is superseded
+  for direct observation only.
+- Simplify grace identity for all sources: same disagreeing value keeps grace
+  even with a new timestamp; new value restarts, unusable evidence clears.
+  Otherwise continuous direct polls can never reach 30-second grace. HA
+  off/unavailable/off/on still cannot accumulate grace across the unavailable.
+  Freeze the selected opening sample timestamp with the open detail for resolution.
+- Pairing-required emits `TvDirectUnavailable` (`tv/unavailable` trace), clears
+  frozen direct cache, and switches pending/new TV expectations and drift to HA.
+  Reload explicitly resets this fallback/streak and restarts the observer.
+- Shared native host/port validation rejects schemes, paths, whitespace, embedded
+  ports, zero ports, and unbracketed IPv6. Receiver Power alone decides state;
+  missing/empty InputFuncSelect only omits the raw source code. Receiver samples
+  use the ordinary Event ingress/tracing path.
+- Second review: direct TV/receiver action windows run their full configured
+  duration, never stopping at the target. Require TV window >= TV deadline and
+  receiver window >= max(On, Off deadlines), so contested verdicts have fresh
+  action-cadence reads regardless of idle cadence. Console probe windows still
+  stop at target.
+- Preserve the newest usable direct sample beside raw TV/receiver caches, used
+  only at expired contested deadlines. A single transient failure cannot erase
+  a prior fresh On; ordinary verdicts, drift and dashboard still use raw evidence.
+  Reload clears retained caches; pairing loss clears TV's retained cache.
+- Restrict unbracketed native observation hosts to `[A-Za-z0-9._-]`, rejecting
+  URL authority/query/fragment delimiters too. A real loopback TLS webOS prompt
+  test verifies unavailable emission and suppression of later action queries.
+
 ## 2026-11-05 — Reporting-only room drift
 
 - Compare configured TV/receiver power and intended receiver source after

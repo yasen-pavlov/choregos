@@ -1,6 +1,6 @@
 //! One-shot LG webOS SSAP power-off, independent of HA's reconnect state.
 
-use crate::{config::Secret, state::TvState};
+use crate::{config::Secret, state::DirectPower};
 use futures_util::{SinkExt, StreamExt};
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
@@ -53,7 +53,7 @@ pub async fn turn_off(host: &str, port: u16, key: &Secret) -> anyhow::Result<()>
 }
 
 /// Direct power read using the same registration and SSAP exchange as power-off.
-pub async fn power_state(host: &str, port: u16, key: &Secret) -> anyhow::Result<TvState> {
+pub async fn power_state(host: &str, port: u16, key: &Secret) -> anyhow::Result<DirectPower> {
     within_timeout(async {
         let mut ws = connect(host, port).await?;
         register(&mut ws, key).await?;
@@ -65,14 +65,14 @@ pub async fn power_state(host: &str, port: u16, key: &Secret) -> anyhow::Result<
     .await
 }
 
-fn parse_power(reply: &Value) -> anyhow::Result<TvState> {
+fn parse_power(reply: &Value) -> anyhow::Result<DirectPower> {
     anyhow::ensure!(
         reply["type"] == "response" && reply["payload"]["returnValue"] != false,
         "webOS power-state query failed"
     );
     match reply["payload"]["state"].as_str() {
-        Some("Active" | "Screen Off" | "Screen Saver") => Ok(TvState::On),
-        Some("Active Standby" | "Suspend" | "Power Off") => Ok(TvState::Off),
+        Some("Active" | "Screen Off" | "Screen Saver") => Ok(DirectPower::On),
+        Some("Active Standby" | "Suspend" | "Power Off") => Ok(DirectPower::Off),
         _ => anyhow::bail!("webOS returned an unknown power state"),
     }
 }
@@ -197,7 +197,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         power["id"] == "power_state_0" && (power["type"] == "response" || power["type"] == "error"),
         "webOS returned an unexpected power-state response"
     );
-    if matches!(parse_power(&power), Ok(TvState::Off)) {
+    if matches!(parse_power(&power), Ok(DirectPower::Off)) {
         let _ = ws.close(None).await;
         return Ok(());
     }
@@ -283,12 +283,12 @@ mod tests {
     #[test]
     fn direct_power_mapping_distinguishes_screen_off_and_unknown_states() {
         for (state, expected) in [
-            ("Active", TvState::On),
-            ("Active Standby", TvState::Off),
-            ("Suspend", TvState::Off),
-            ("Power Off", TvState::Off),
-            ("Screen Off", TvState::On),
-            ("Screen Saver", TvState::On),
+            ("Active", DirectPower::On),
+            ("Active Standby", DirectPower::Off),
+            ("Suspend", DirectPower::Off),
+            ("Power Off", DirectPower::Off),
+            ("Screen Off", DirectPower::On),
+            ("Screen Saver", DirectPower::On),
         ] {
             assert_eq!(
                 parse_power(&json!({"type":"response","payload":{"state":state}})).unwrap(),

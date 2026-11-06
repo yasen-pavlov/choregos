@@ -1489,7 +1489,7 @@ async fn direct_tv_poll_starts_only_after_wake_dispatch_finishes() {
     use super::{
         Input, executor::Executor, ha::Ha, mqtt::Mqtt, observe::Observer, ordered_effects,
     };
-    use crate::{action::Action, config::TvOffConfig, engine::Event, state::TvState};
+    use crate::{action::Action, config::TvOffConfig, engine::Event, state::DirectPower};
     use std::sync::{Arc, atomic::AtomicBool};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1555,7 +1555,7 @@ async fn direct_tv_poll_starts_only_after_wake_dispatch_finishes() {
     assert!(matches!(
         event,
         Input::Event(Event::TvPower {
-            state: TvState::Unreachable,
+            state: DirectPower::Unreachable,
             ..
         })
     ));
@@ -1868,4 +1868,80 @@ async fn restart_settles_interrupted_verification_instead_of_restoring_a_permane
     )
     .await;
     harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_observer_set_mode_and_reload_restart_idle_sampling() {
+    use crate::{config::ReceiverObserveConfig, state::DirectPower};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            if socket.read(&mut request).await.unwrap() == 0 {
+                continue;
+            }
+            let body = "<item><Power><value>OFF</value></Power></item>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    let mut harness = Harness::start().await;
+    let mut config = harness.config.clone();
+    config.receiver.observe = Some(ReceiverObserveConfig::Denon {
+        host: "127.0.0.1".into(),
+        port,
+    });
+    config.verify.receiver_idle_poll_s = 5;
+    harness
+        .state
+        .save_config(&toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        harness.state.snapshot().receiver_direct.is_none(),
+        "shadow startup does not poll"
+    );
+    harness.command(Command::SetMode(Mode::Active)).await;
+    let first = wait_snapshot(&harness.state, |s| {
+        matches!(s.receiver_direct, Some((DirectPower::Off, _)))
+    })
+    .await
+    .receiver_direct
+    .unwrap()
+    .1;
+    harness.command(Command::SetMode(Mode::Shadow)).await;
+    tokio::time::sleep(Duration::from_millis(5200)).await;
+    assert_eq!(
+        harness.state.snapshot().receiver_direct,
+        Some((DirectPower::Off, first))
+    );
+    harness.command(Command::SetMode(Mode::Active)).await;
+    let second = wait_snapshot(&harness.state, |s| {
+        s.receiver_direct.is_some_and(|(_, at)| at > first)
+    })
+    .await
+    .receiver_direct
+    .unwrap()
+    .1;
+    config.mode = Mode::Active;
+    config.trace.keep_days = 29; // unrelated reload must still restart observation.
+    harness
+        .state
+        .save_config(&toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    let restarted = wait_snapshot(&harness.state, |s| {
+        s.receiver_direct
+            .is_some_and(|(state, at)| state == DirectPower::Off && at > second)
+    })
+    .await;
+    assert!(restarted.receiver_direct.unwrap().1 > second);
+    harness.shutdown().await;
+    server.abort();
 }
