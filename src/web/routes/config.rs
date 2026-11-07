@@ -11,7 +11,12 @@ use serde::Deserialize;
 
 use crate::{
     config::{Config, ConfigError},
-    web::{WebError, WebState, auth::Ctx, render, view::Layout},
+    web::{
+        WebError, WebState,
+        auth::Ctx,
+        render,
+        view::{self, Layout},
+    },
 };
 
 /// The full page includes `partials/config_form.html`, so it carries the same fields.

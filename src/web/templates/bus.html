@@ -14,7 +14,7 @@
   {# `row` prepends one live frame or decision. #}
   <div hidden sse-swap="reset" hx-target="#bus-rows" hx-swap="innerHTML"></div>
   <table class="grid bus">
-    <thead><tr><th>time</th><th></th><th>from</th><th>to</th><th>op</th><th>name</th><th>operands</th></tr></thead>
+    <thead><tr><th scope="col">time</th><th scope="col">dir</th><th scope="col">from</th><th scope="col">to</th><th scope="col">op</th><th scope="col">name</th><th scope="col">operands</th></tr></thead>
     <tbody id="bus-rows" sse-swap="row" hx-swap="afterbegin">
       {% include "partials/bus_rows.html" %}
     </tbody>

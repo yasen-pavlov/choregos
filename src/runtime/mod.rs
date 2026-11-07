@@ -479,6 +479,7 @@ impl Runtime {
                 vec![]
             }
             Input::Bridge { entry, decoded } => {
+                let aether_status = aether_status(&entry);
                 self.trace_entry(wall, entry);
                 // Local replies are UI-only: never engine inputs or host sends.
                 for frame in decoded.local {
@@ -495,9 +496,19 @@ impl Runtime {
                         ui_events.push(UiEvent::Frame(view));
                     }
                 }
+                // Only a status the adapter accepted (it emits BridgeOnline) names the board;
+                // a rejected, offline or duplicate one leaves the stored identity alone.
+                let accepted = decoded
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::BridgeOnline));
                 self.apply_events(decoded.events, now, wall, &mut ui_events);
                 if let Some(bus) = decoded.bus {
                     self.snapshot.bridge_bus = Some(bus);
+                }
+                if accepted && let Some((node, boot)) = aether_status {
+                    self.snapshot.bridge_node = Some(node);
+                    self.snapshot.bridge_boot = Some(boot);
                 }
                 self.publish_snapshot(now, wall, ui_events).await;
                 return Ok(());
@@ -642,6 +653,8 @@ impl Runtime {
             if matches!(event, Event::BridgeOffline) {
                 self.snapshot.bridge_bus = None;
                 self.snapshot.bridge_telemetry = None;
+                self.snapshot.bridge_node = None;
+                self.snapshot.bridge_boot = None;
             }
             let actions = self.engine.handle(event, now, wall);
             self.record_decisions(wall, ui_events);
@@ -1145,8 +1158,14 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
                 last_event: engine.roles[&device.role].last_event.clone(),
                 last_seen: entry.and_then(|e| e.last_seen).map(timestamp),
                 conflicted: engine.identity.blocked.contains(&device.role),
+                restored: la.is_none()
+                    && engine.bus.entries.iter().any(|(&la, entry)| {
+                        !entry.verified
+                            && crate::identity::matches(device, la, entry, engine.bus.bridge)
+                    }),
                 direct: engine.roles[&device.role].direct,
                 probe_configured: device.probe.is_some(),
+                media_player: device.media_player.clone(),
             }
         })
         .collect();
@@ -1196,6 +1215,14 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
             .collect(),
     };
 }
+/// The node and boot counter an aether status names, for the bridge drawer.
+fn aether_status(entry: &trace::TraceEntry) -> Option<(String, u32)> {
+    let trace::TraceEntry::AetherStatus { node, payload } = entry else {
+        return None;
+    };
+    let boot = payload.get("boot")?.as_u64()?;
+    Some((node.clone(), u32::try_from(boot).ok()?))
+}
 fn frame_view(
     frame: &Frame,
     timestamp: DateTime<Utc>,
@@ -1234,6 +1261,8 @@ fn frame_view(
     }
 }
 
+#[cfg(test)]
+mod bridge_identity_tests;
 #[cfg(test)]
 mod loop_tests;
 #[cfg(test)]
@@ -1495,6 +1524,37 @@ mod tests {
         engine.handle(Event::ConfigReloaded(Arc::new(config)), now, Utc::now());
         update_snapshot(&mut snapshot, &engine, now, Utc::now());
         assert_eq!(snapshot.bridge_logical_address, 0);
+    }
+
+    #[test]
+    fn roles_matching_only_a_restored_unverified_entry_read_as_restored_not_bound() {
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let now = Instant::now();
+        let wall: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        // The streamer's vendor key, restored from the state file and not yet re-confirmed.
+        let identities = vec![LearnedIdentity {
+            la: 4,
+            physical: Some(0x2100),
+            vendor: Some(0x0010FA),
+            osd: Some("Streamer".into()),
+            device_type: Some(4),
+            confirmed_at: wall,
+        }];
+        let engine = Engine::new(config.clone(), now, identities, 1);
+        let mut snapshot = AppState::new(config, String::new()).snapshot();
+        update_snapshot(&mut snapshot, &engine, now, wall);
+        let role = |name: &str| {
+            snapshot
+                .roles
+                .iter()
+                .find(|role| role.role == name)
+                .unwrap()
+        };
+        let streamer = role("streamer");
+        assert_eq!(streamer.logical_address, None);
+        assert!(streamer.restored);
+        // Kodi matches by OSD name, which the restored entry does not carry.
+        assert!(!role("kodi").restored);
     }
 }
 

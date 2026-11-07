@@ -2,6 +2,17 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-07 — Phase 2 slice 1: cockpit and chrome
+
+- Phase 2 slice 1: cockpit + chrome; consistency badge rule (warming → not checked
+  (shadow) → unknown: no intent yet → drift → unknown: TV unreachable → consistent);
+  toasts instead of flash; bridge drawer (raw send moved there); dashboard route replaced.
+- Additive, display-only snapshot fields: `RoleView.media_player` (the configured HA
+  media player), `RoleView.restored` (unbound, but an unverified entry restored from the
+  state file matches the role's keys, using the same predicate `identity::resolve` binds
+  with), `Snapshot.bridge_node` and `Snapshot.bridge_boot` (from the last aether status the
+  adapter accepted; cleared on bridge offline), and `Snapshot.off_deadline` (reserved;
+  engine accessor pending, so always `None` and the cockpit shows no countdown).
 ## 2026-11-07 (evening) — Probe trust and same-field closure
 
 - E3: entering rest produced only 9–10 seconds of Standby before a roughly
@@ -75,7 +86,6 @@ Deviations from DESIGN.md agreed in review. Newest first.
 - Reduce private probe-run tracking to `(ConsoleState, Instant)` and remove the
   unused wall timestamp parameter. Raw direct samples retain query-send wall time
   for reporting. No snapshot or persistence changes.
-
 
 ## 2026-11-07 — Console start evidence and startup source guard
 

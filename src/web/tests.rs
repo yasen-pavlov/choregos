@@ -92,6 +92,7 @@ on = ["active_source"]
 off = ["standby"]
 takeover = "cec_standby"
 presence = "events"
+media_player = "media_player.test_streamer"
 
 [[device]]
 role = "console"
@@ -248,6 +249,9 @@ async fn unauthenticated_requests_are_sent_to_login() {
         "/devices",
         "/decisions",
         "/config",
+        "/p/cockpit",
+        "/p/status",
+        "/p/bridge",
     ] {
         let response = h.get(path, None).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
@@ -279,22 +283,15 @@ async fn healthz_is_public_json() {
 }
 
 #[tokio::test]
-async fn local_login_opens_a_fresh_session_showing_the_dashboard() {
+async fn local_login_opens_a_fresh_session_showing_the_cockpit() {
     let h = harness(UNREACHABLE_ISSUER);
     let form = h.get("/login/local", None).await;
     let anonymous = session_cookie(&form).unwrap();
     let (cookie, _) = h.login().await;
     assert_ne!(cookie, anonymous, "session id is cycled on login");
     let html = body(h.get("/", Some(&cookie)).await).await;
-    for expected in [
-        "Test Streamer",
-        "Test Console",
-        "Streamer Input",
-        "media_player.test_tv",
-        "mode-shadow",
-        "admin",
-    ] {
-        assert!(html.contains(expected), "dashboard lacks {expected}");
+    for expected in ["Test Streamer", "Test Console", "mode-shadow", "admin"] {
+        assert!(html.contains(expected), "cockpit lacks {expected}");
     }
     // The login form cookie never becomes authenticated.
     assert_eq!(
@@ -561,7 +558,15 @@ async fn devices_rows_offer_forget_except_for_the_bridge() {
 async fn pages_render_and_reference_served_assets() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    for path in ["/bus?la=4&opcode=82", "/devices", "/decisions", "/config"] {
+    for path in [
+        "/bus?la=4&opcode=82",
+        "/devices",
+        "/decisions",
+        "/config",
+        "/p/cockpit",
+        "/p/status",
+        "/p/bridge",
+    ] {
         let response = h.get(path, Some(&cookie)).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
@@ -1010,46 +1015,80 @@ async fn decisions_page_renders_drift_detail_and_resolved_duration_without_a_ver
     assert!(!mismatched.contains("drift"), "{mismatched}");
 }
 
+/// Publishes the current snapshot after `edit`; returns the polled top-bar status block.
+async fn status_after(h: &Harness, cookie: &str, edit: impl FnOnce(&mut Snapshot)) -> String {
+    let mut snapshot = h.state.snapshot();
+    edit(&mut snapshot);
+    h.state.publish(snapshot, []);
+    body(h.get("/p/status", Some(cookie)).await).await
+}
+
+/// The consistency badge's classes, text and tooltip.
+fn badge(status: &str) -> (&str, &str, &str) {
+    let tag = &status[status
+        .find("id=\"consistency\"")
+        .expect("badge is rendered")..];
+    (
+        between(tag, "class=\"", "\""),
+        between(tag, ">", "</span>"),
+        between(tag, "title=\"", "\""),
+    )
+}
+
 #[tokio::test]
-async fn dashboard_shows_one_pill_per_open_drift_and_none_without() {
+async fn consistency_badge_follows_warming_shadow_drift_and_tv_reachability() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    let quiet = body(h.get("/", Some(&cookie)).await).await;
-    assert!(!quiet.contains("drift-open"));
+    // A fresh service is warming; warming outranks shadow.
+    let status = status_after(&h, &cookie, |_| {}).await;
+    assert_eq!(badge(&status).1, "warming");
+    assert_eq!(badge(&status).0, "chip lg pend");
 
-    let mut snapshot = h.state.snapshot();
+    let status = status_after(&h, &cookie, |snapshot| snapshot.warming = false).await;
+    assert_eq!(badge(&status).1, "not checked (shadow)");
+    assert_eq!(badge(&status).0, "chip lg shadow");
+
     let since = chrono::Utc::now() - chrono::TimeDelta::seconds(125);
-    snapshot.drift = vec![
-        drift_detail("off", since),
-        DriftDetail {
-            subject: "tv".to_owned(),
-            intended: "off".to_owned(),
-            observed: "on".to_owned(),
-            via: crate::action::Via::TvDirect,
-            ..drift_detail("on", since)
-        },
-    ];
-    h.state.publish(snapshot, []);
-    let html = body(h.get("/", Some(&cookie)).await).await;
-    let group = between(
-        &html,
-        "<span class=\"label\">active source</span>",
-        "</div>",
-    );
-    assert_eq!(
-        group.matches("class=\"pill drift-open\"").count(),
-        2,
-        "{group}"
+    let status = status_after(&h, &cookie, |snapshot| {
+        snapshot.mode = crate::state::Mode::Active;
+        snapshot.intent.power = crate::state::RoomPower::On;
+        snapshot.drift = vec![
+            drift_detail("off", since),
+            DriftDetail {
+                subject: "tv".to_owned(),
+                intended: "off".to_owned(),
+                observed: "on".to_owned(),
+                via: crate::action::Via::TvDirect,
+                ..drift_detail("on", since)
+            },
+        ];
+        // An open drift outranks an unreachable TV.
+        snapshot.tv_direct = Some((crate::state::DirectPower::Unreachable, chrono::Utc::now()));
+    })
+    .await;
+    let (classes, label, title) = badge(&status);
+    assert_eq!((classes, label), ("chip lg warn", "drift: receiver.power"));
+    assert!(
+        title.contains("receiver.power: intended on, observed off via ha"),
+        "{title}"
     );
     assert!(
-        group.contains(">receiver.power: off, intended on, for 2m "),
-        "{group}"
+        title.contains("tv.power: intended off, observed on via tv_direct"),
+        "{title}"
     );
-    assert!(
-        group.contains(">tv.power: on, intended off, for 2m "),
-        "{group}"
-    );
-    assert!(group.contains("tv_direct has reported on while the room intends off"));
+
+    let status = status_after(&h, &cookie, |snapshot| snapshot.drift.clear()).await;
+    assert_eq!(badge(&status).1, "unknown: TV unreachable");
+
+    let status = status_after(&h, &cookie, |snapshot| {
+        snapshot.tv_direct = Some((crate::state::DirectPower::On, chrono::Utc::now()));
+    })
+    .await;
+    assert_eq!(badge(&status).1, "consistent");
+    assert_eq!(badge(&status).0, "chip lg ok");
+    // The room strip carries the same verdict with its sentence.
+    let cockpit = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    assert!(cockpit.contains("TV and receiver agree with the intent."));
 }
 
 #[tokio::test]
@@ -1155,7 +1194,7 @@ async fn bus_stream_re_renders_the_ring_when_a_verdict_settles() {
 }
 
 #[tokio::test]
-async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
+async fn cockpit_poll_carries_the_status_block_and_stable_control_ids() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
     let mut snapshot = h.state.snapshot();
@@ -1163,19 +1202,17 @@ async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
     snapshot.warming = false;
     snapshot.connections.mode = crate::state::Mode::Active;
     snapshot.connections.mqtt_connected = true;
+    snapshot.active_role = Some("console".into());
     snapshot.intent.power = crate::state::RoomPower::On;
-    snapshot.intent.active_role = Some("streamer".into());
-    snapshot.tv_direct = Some((crate::state::DirectPower::On, chrono::Utc::now()));
+    snapshot.intent.active_role = Some("console".into());
     h.state.publish(snapshot, []);
-    let html = body(h.get("/", Some(&cookie)).await).await;
-    // The poll swaps `#dashboard` and, out of band, `#status` from the same response.
-    assert!(html.contains(r##"hx-select-oob="#status""##));
-    let status = between(&html, "id=\"status\"", "</div>");
-    assert!(status.contains("mode-active"));
-    assert!(!status.contains("warming"));
-    assert!(status.contains("conn up\" title=\"MQTT connected"));
-    assert!(html.contains("intent on / streamer"));
-    assert!(html.contains("tv (webOS) on"));
+    let partial = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    // One response: the cockpit body plus the chrome blocks the poll swaps out of band.
+    assert!(partial.contains("<main id=\"cockpit\""));
+    let status = between(&partial, "id=\"status\"", "<div class=\"conns\"");
+    assert!(status.contains("id=\"mode-active\""));
+    assert!(partial.contains("<div id=\"bands\""));
+    assert!(partial.contains("conn up\" title=\"MQTT connected"));
     for id in [
         "mode-shadow",
         "mode-active",
@@ -1184,10 +1221,18 @@ async fn dashboard_refresh_carries_header_status_and_stable_control_ids() {
         "standby-console",
     ] {
         assert!(
-            html.contains(&format!("id=\"{id}\"")),
+            partial.contains(&format!("id=\"{id}\"")),
             "{id} has a stable id"
         );
     }
+    // The active role offers standby instead of take over.
+    assert!(!partial.contains("id=\"takeover-console\""));
+    // The cockpit page polls itself; every other page polls the status block.
+    let page = body(h.get("/", Some(&cookie)).await).await;
+    assert!(page.contains("hx-get=\"/p/cockpit\""));
+    assert!(!page.contains("hx-get=\"/p/status\""));
+    let devices = body(h.get("/devices", Some(&cookie)).await).await;
+    assert!(devices.contains("hx-get=\"/p/status\""));
 }
 
 #[tokio::test]
@@ -1197,6 +1242,7 @@ async fn role_path_segments_cannot_escape_their_action() {
     let mut snapshot = h.state.snapshot();
     snapshot.roles[0].role = "../all-off".to_owned();
     snapshot.roles[1].role = "a/b".to_owned();
+    snapshot.roles[1].power = RolePower::On;
     h.state.publish(snapshot, []);
     let html = body(h.get("/", Some(&cookie)).await).await;
     assert!(html.contains(r#"hx-post="/actions/takeover/..%2Fall-off""#));
@@ -1205,38 +1251,273 @@ async fn role_path_segments_cannot_escape_their_action() {
     assert!(!html.contains("/actions/standby/a/b"));
 }
 
+/// The `<article>` of the cockpit card titled `title`.
+fn card<'a>(html: &'a str, title: &str) -> &'a str {
+    between(
+        html,
+        &format!("<h2 class=\"grow\">{title}</h2>"),
+        "</article>",
+    )
+}
+
 #[tokio::test]
-async fn unreachable_tv_reads_as_off_while_other_entities_keep_the_error_state() {
+async fn unreachable_tv_reads_as_off_while_the_receiver_keeps_its_error_state() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
     let mut snapshot = h.state.snapshot();
     snapshot.ha.tv.state = "unavailable".to_owned();
     snapshot.ha.receiver.state = "unavailable".to_owned();
     h.state.publish(snapshot, []);
-    let html = body(h.get("/", Some(&cookie)).await).await;
-    let tv = between(&html, "media_player.test_tv", "</tr>");
-    let tv_pill = classes_around(tv, "off (unreachable)</span>");
-    assert!(tv_pill.contains(&"state-off"));
-    assert!(!tv_pill.contains(&"state-unavailable"));
-    let receiver = between(&html, "media_player.test_receiver", "</tr>");
-    assert!(!receiver.contains("off (unreachable)"));
-    assert!(classes_around(receiver, "unavailable</span>").contains(&"state-unavailable"));
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let tv = card(&html, "TV");
+    assert!(
+        tv.contains("<span class=\"src\">ha</span> off (unreachable)"),
+        "{tv}"
+    );
+    assert!(tv.contains("<span class=\"chip dim\">off</span>"), "{tv}");
+    let receiver = card(&html, "Receiver");
+    assert!(!receiver.contains("off (unreachable)"), "{receiver}");
+    assert!(
+        receiver.contains("<span class=\"src\">ha</span> unavailable"),
+        "{receiver}"
+    );
+    assert!(
+        receiver.contains("<span class=\"chip none\">unknown</span>"),
+        "{receiver}"
+    );
 }
 
-/// Publishes the current snapshot after `edit`; returns the dashboard's bridge group and the
-/// header status block.
-async fn bridge_group(
-    h: &Harness,
-    cookie: &str,
-    edit: impl FnOnce(&mut Snapshot),
-) -> (String, String) {
+#[tokio::test]
+async fn role_cards_read_home_assistant_only_for_roles_with_a_media_player() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    let streamer = snapshot
+        .ha
+        .media_players
+        .iter_mut()
+        .find(|entity| entity.entity == "media_player.test_streamer")
+        .expect("the streamer's media player is tracked");
+    streamer.state = "playing".to_owned();
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let streamer = card(&html, "Test Streamer");
+    assert!(
+        streamer.contains("<span class=\"src\">ha</span> playing"),
+        "{streamer}"
+    );
+    let console = card(&html, "Test Console");
+    assert!(
+        console.contains("<span class=\"src\">ha</span> not configured"),
+        "{console}"
+    );
+}
+
+#[tokio::test]
+async fn off_timer_shows_only_an_exposed_deadline_never_a_guess() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    // On with no active role used to be read as a running timer; it is not evidence of one.
+    let mut snapshot = h.state.snapshot();
+    snapshot.intent.power = crate::state::RoomPower::On;
+    snapshot.intent.active_role = None;
+    snapshot.intent.off_at = Some(chrono::Utc::now() + chrono::TimeDelta::seconds(60));
+    h.state.publish(snapshot.clone(), []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let timer = between(&html, "<span class=\"k\">Off timer</span>", "</div>");
+    assert!(!html.contains("running"), "{timer}");
+    assert!(!timer.contains("off in"), "{timer}");
+    assert!(
+        timer.contains("<span class=\"dim small\">Starts when the last role turns off.</span>"),
+        "{timer}"
+    );
+
+    let deadline = chrono::Utc::now() + chrono::TimeDelta::seconds(90);
+    snapshot.off_deadline = Some(deadline);
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let timer = between(&html, "<span class=\"k\">Off timer</span>", "</div>");
+    assert!(
+        timer.contains(&format!("off at {} (in ", crate::web::view::hms(&deadline))),
+        "{timer}"
+    );
+    assert!(timer.contains("<span class=\"value\">off in "), "{timer}");
+    assert!(!html.contains("running"), "{timer}");
+}
+
+#[tokio::test]
+async fn restored_roles_wait_for_the_bus_while_unmatched_roles_read_unbound() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.warming = false;
+    // The runtime flags the streamer: unbound, and a restored unverified entry matches it.
+    snapshot.bus = vec![bus_entry(4)];
+    let streamer = snapshot
+        .roles
+        .iter_mut()
+        .find(|role| role.role == "streamer")
+        .unwrap();
+    streamer.restored = true;
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let streamer = card(&html, "Test Streamer");
+    assert!(
+        streamer.contains("<span class=\"chip pend\">restored</span>"),
+        "{streamer}"
+    );
+    assert!(
+        streamer.contains("Restored from the state file"),
+        "{streamer}"
+    );
+    assert!(
+        streamer.contains("<span class=\"src\">cec</span> silent since restore"),
+        "{streamer}"
+    );
+    let takeover = between(&html, "id=\"takeover-streamer\"", "</button>");
+    assert!(takeover.contains("disabled"), "{takeover}");
+    let console = card(&html, "Test Console");
+    assert!(
+        console.contains("<span class=\"chip dim\">unbound</span>"),
+        "{console}"
+    );
+    assert!(
+        !console.contains("Restored from the state file"),
+        "{console}"
+    );
+}
+
+#[tokio::test]
+async fn shadow_offers_would_actions_without_confirmation() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.warming = false;
+    snapshot.roles[0].logical_address = Some(4);
+    snapshot.bus = vec![BusEntryView {
+        identified: true,
+        verified: true,
+        matched_role: Some("streamer".to_owned()),
+        ..bus_entry(4)
+    }];
+    h.state.publish(snapshot.clone(), []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let takeover = between(&html, "id=\"takeover-streamer\"", "</button>");
+    assert!(takeover.ends_with(">Would take over…"), "{takeover}");
+    assert!(!takeover.contains("hx-confirm"), "{takeover}");
+    assert!(!takeover.contains("disabled"), "{takeover}");
+    let all_off = between(&html, "id=\"all-off\"", "</button>");
+    assert!(all_off.ends_with(">Would turn all off…"), "{all_off}");
+    assert!(!all_off.contains("hx-confirm"), "{all_off}");
+    // A role that is not bound to a verified device cannot act yet.
+    let unbound = between(&html, "id=\"takeover-console\"", "</button>");
+    assert!(
+        unbound.contains("disabled title=\"not verified yet\""),
+        "{unbound}"
+    );
+
+    snapshot.mode = crate::state::Mode::Active;
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let takeover = between(&html, "id=\"takeover-streamer\"", "</button>");
+    assert!(takeover.ends_with(">Take over…"), "{takeover}");
+    assert!(
+        takeover.contains("hx-confirm=\"Take over the room with Test Streamer?\""),
+        "{takeover}"
+    );
+}
+
+#[tokio::test]
+async fn last_decisions_skip_migrated_history_and_mark_the_restart() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let row = |id: u64, reason: &str, trigger: crate::action::Trigger| DecisionView {
+        id,
+        reason: reason.to_owned(),
+        trigger,
+        ..verdict_decision()
+    };
+    let frame = || crate::action::Trigger::Frame {
+        from: 4,
+        to: 0,
+        data: "82".to_owned(),
+    };
+    let service = |name| crate::action::Trigger::Service { name };
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend([
+        row(9, "PowerOn", frame()),
+        row(10, "PowerOn", frame()),
+        row(11, "PowerOn", service(crate::action::ServiceKind::Migrated)),
+        row(
+            12,
+            "service_started",
+            service(crate::action::ServiceKind::Started),
+        ),
+        row(13, "Standby", frame()),
+        row(14, "Standby", frame()),
+        row(15, "Standby", frame()),
+        row(16, "Standby", frame()),
+    ]);
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+    let table = between(&html, "Last 5 decisions", "</table>");
+    // Five rows: the separator and the migrated row take no slot, so #10 is the fifth.
+    for id in [16, 15, 14, 13, 10] {
+        assert!(table.contains(&format!("id=\"recent-{id}\"")), "#{id}");
+    }
+    for id in [11, 9] {
+        assert!(!table.contains(&format!("id=\"recent-{id}\"")), "#{id}");
+    }
+    let separator = table
+        .find("service started — rows below were made by the previous run")
+        .expect("the restart is marked");
+    assert!(table.find("id=\"recent-13\"").unwrap() < separator);
+    assert!(separator < table.find("id=\"recent-10\"").unwrap());
+}
+
+#[tokio::test]
+async fn action_responses_toast_out_of_band_and_refresh_the_status() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let page = body(h.get("/", Some(&cookie)).await).await;
+    assert!(page.contains("<div id=\"toasts\" class=\"toasts\" aria-live=\"polite\"></div>"));
+
+    let _received = answer_one_command(&h.state, Ok(()));
+    let response = h
+        .post_form("/actions/all-off", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(
+        html.contains("hx-swap-oob=\"afterbegin:#toasts\""),
+        "{html}"
+    );
+    assert!(html.contains("All off requested."), "{html}");
+    // The harness runs in shadow: the toast says nothing was sent.
+    assert!(html.contains("toast would"), "{html}");
+    assert!(html.contains("id=\"status\" class=\"status\" hx-swap-oob=\"true\""));
+    assert!(html.contains("id=\"bands\" hx-swap-oob=\"true\""));
+
+    let rejected = h
+        .post_form("/actions/identify/15", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = body(rejected).await;
+    assert!(html.contains("toast bad"), "{html}");
+    assert!(html.contains("Logical address must be 0–14."), "{html}");
+}
+
+/// Publishes the current snapshot after `edit`; returns the bridge drawer.
+async fn drawer_after(h: &Harness, cookie: &str, edit: impl FnOnce(&mut Snapshot)) -> String {
     let mut snapshot = h.state.snapshot();
     edit(&mut snapshot);
     h.state.publish(snapshot, []);
-    let html = body(h.get("/", Some(cookie)).await).await;
-    let group = between(&html, "<span class=\"label\">bridge</span>", "</div>").to_owned();
-    let status = between(&html, "id=\"status\"", "</div>").to_owned();
-    (group, status)
+    body(h.get("/p/bridge", Some(cookie)).await).await
+}
+
+fn online(snapshot: &mut Snapshot) {
+    snapshot.bridge_online = true;
+    snapshot.connections.bridge_online = true;
 }
 
 /// Telemetry as an adapter reports it, `age` old, stale after the adapter's `stale_after_s`.
@@ -1251,36 +1532,72 @@ fn telemetry(signal_dbm: i32, age: chrono::TimeDelta, stale_after_s: u64) -> Bri
 }
 
 #[tokio::test]
-async fn dashboard_bridge_line_shows_telemetry_and_last_frame() {
+async fn bridge_drawer_hosts_raw_send_and_devices_no_longer_does() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    let (group, status) = bridge_group(&h, &cookie, |snapshot| {
-        snapshot.bridge_online = true;
-        snapshot.connections.bridge_online = true;
+    let drawer = drawer_after(&h, &cookie, |_| {}).await;
+    let form = between(&drawer, "<form id=\"raw-send\"", "</form>");
+    assert!(form.contains("hx-post=\"/actions/send-raw\""), "{form}");
+    assert!(
+        form.contains("hx-confirm=\"Send this raw CEC frame?\""),
+        "{form}"
+    );
+    assert!(form.contains("name=\"to\"") && form.contains("name=\"data\""));
+    let devices = body(h.get("/devices", Some(&cookie)).await).await;
+    assert!(!devices.contains("/actions/send-raw"));
+    // The close button asks for nothing, which empties the drawer and stops its polling.
+    let closed = h.get("/p/bridge?close=true", Some(&cookie)).await;
+    assert_eq!(closed.status(), StatusCode::OK);
+    assert!(body(closed).await.is_empty());
+}
+
+#[tokio::test]
+async fn bridge_drawer_shows_boot_telemetry_and_last_frame_while_online() {
+    let h = harness_from(bridge_config_text(
+        UNREACHABLE_ISSUER,
+        PUBLIC_URL,
+        AETHER_BRIDGE,
+    ));
+    let (cookie, _) = h.login().await;
+    let drawer = drawer_after(&h, &cookie, |snapshot| {
+        online(snapshot);
+        snapshot.bridge_node = Some("cec-bridge".to_owned());
+        snapshot.bridge_boot = Some(7);
         snapshot.bridge_telemetry = Some(telemetry(-50, chrono::TimeDelta::minutes(2), 900));
         snapshot.last_frame_at = Some(chrono::Utc::now() - chrono::TimeDelta::seconds(12));
     })
     .await;
+    assert!(drawer.contains("id=\"bridge-boot\">7</dd>"), "{drawer}");
+    assert!(
+        drawer.contains("<dd class=\"mono\">cec-bridge</dd>"),
+        "{drawer}"
+    );
+    assert!(drawer.contains("−50 dBm · 2 links</dd>"), "{drawer}");
+    assert!(!classes_around(&drawer, "−50 dBm").contains(&"warn-text"));
+    assert!(drawer.contains(">3d 6h</dd>"), "{drawer}");
     // Exact ages are covered by the fixed-clock `view::ago_at` test; here only their presence.
-    let line = "· −50 dBm · 2 links · up 3d 6h · telemetry ";
-    assert!(group.contains(line), "{group}");
-    assert!(!classes_around(&group, line).contains(&"warn"));
+    assert!(between(&drawer, "id=\"bridge-telemetry\" class=\"mono\">", "</dd>").ends_with(" ago"));
     assert!(
-        between(&group, line, "</span>").ends_with(" ago"),
-        "{group}"
+        between(&drawer, "id=\"bridge-last-frame\" class=\"mono\">", "</dd>").ends_with(" ago")
     );
-    assert!(
-        between(&group, "· last frame ", "</span>").ends_with(" ago"),
-        "{group}"
-    );
+    let status = body(h.get("/p/status", Some(&cookie)).await).await;
     assert!(status.contains("title=\"CEC bridge online · −50 dBm\""));
+
+    // A status without a boot counter (Tasmota, or none received yet) shows none.
+    let drawer = drawer_after(&h, &cookie, |snapshot| {
+        snapshot.bridge_boot = None;
+        snapshot.bridge_node = None;
+    })
+    .await;
+    assert!(!drawer.contains("Boot count"), "{drawer}");
+    assert!(!drawer.contains("cec-bridge"), "{drawer}");
 }
 
 #[tokio::test]
 async fn weak_signal_or_telemetry_past_its_stale_after_is_flagged_while_online() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    // The fixed-clock `view` tests pin the boundaries; here the page follows the adapter's
+    // The fixed-clock `view` tests pin the boundaries; here the drawer follows the adapter's
     // threshold, and a zero threshold (telemetry disabled) only judges the signal.
     for (signal, age_s, stale_after_s, flagged) in [
         (-80, 10, 600, true),
@@ -1290,15 +1607,15 @@ async fn weak_signal_or_telemetry_past_its_stale_after_is_flagged_while_online()
         (-80, 86_400, 0, true),
     ] {
         let age = chrono::TimeDelta::seconds(age_s);
-        let (group, _) = bridge_group(&h, &cookie, |snapshot| {
-            snapshot.bridge_online = true;
+        let drawer = drawer_after(&h, &cookie, |snapshot| {
+            online(snapshot);
             snapshot.bridge_telemetry = Some(telemetry(signal, age, stale_after_s));
         })
         .await;
         assert_eq!(
-            classes_around(&group, " dBm").contains(&"warn"),
+            classes_around(&drawer, " dBm").contains(&"warn-text"),
             flagged,
-            "{signal} dBm, {age}, stale after {stale_after_s} s: {group}"
+            "{signal} dBm, {age}, stale after {stale_after_s} s: {drawer}"
         );
     }
 }
@@ -1307,23 +1624,35 @@ async fn weak_signal_or_telemetry_past_its_stale_after_is_flagged_while_online()
 async fn bus_line_fault_is_flagged_only_when_not_ok() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    for (bus, pill) in [
+    for (bus, fault) in [
         (None, None),
         (Some("ok"), None),
-        (Some("stuck_low"), Some("bus stuck_low</span>")),
-        (Some("no_pullup"), Some("bus no_pullup</span>")),
+        (Some("stuck_low"), Some("stuck_low")),
+        (Some("no_pullup"), Some("no_pullup")),
     ] {
-        let (group, _) = bridge_group(&h, &cookie, |snapshot| {
-            snapshot.bridge_online = true;
+        let drawer = drawer_after(&h, &cookie, |snapshot| {
+            online(snapshot);
             snapshot.bridge_bus = bus.map(str::to_owned);
         })
         .await;
-        match pill {
-            Some(pill) => assert!(
-                classes_around(&group, pill).contains(&"bus-fault"),
-                "{bus:?}: {group}"
-            ),
-            None => assert!(!group.contains("bus-fault"), "{bus:?}: {group}"),
+        let cockpit = body(h.get("/p/cockpit", Some(&cookie)).await).await;
+        let alerts = between(
+            &cockpit,
+            "<div id=\"alerts\" class=\"alerts\">",
+            "<div class=\"section-h\">",
+        );
+        match fault {
+            Some(fault) => {
+                assert!(
+                    drawer.contains(&format!("<span class=\"chip bad\">{fault}</span>")),
+                    "{bus:?}: {drawer}"
+                );
+                assert!(alerts.contains(&format!("Bus fault: {fault}")), "{alerts}");
+            }
+            None => {
+                assert!(!drawer.contains("chip bad"), "{bus:?}: {drawer}");
+                assert!(!alerts.contains("Bus fault"), "{alerts}");
+            }
         }
     }
 }
@@ -1332,26 +1661,28 @@ async fn bus_line_fault_is_flagged_only_when_not_ok() {
 async fn bridge_without_telemetry_says_so_and_offline_shows_none() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    let (online, _) = bridge_group(&h, &cookie, |snapshot| snapshot.bridge_online = true).await;
-    assert!(online.contains("online</span>"));
-    assert!(online.contains("· no telemetry yet"));
-    assert!(!online.contains("last frame"));
+    let drawer = drawer_after(&h, &cookie, online).await;
+    assert!(drawer.contains("<span class=\"chip ok\">online</span>"));
+    assert!(drawer.contains("no telemetry yet"));
 
-    let (offline, status) = bridge_group(&h, &cookie, |snapshot| {
+    let offline = drawer_after(&h, &cookie, |snapshot| {
         snapshot.bridge_online = false;
+        snapshot.connections.bridge_online = false;
         snapshot.bridge_telemetry = Some(telemetry(-80, chrono::TimeDelta::minutes(30), 900));
         // Last known line state from before the bridge dropped: stale, like the telemetry.
         snapshot.bridge_bus = Some("stuck_low".to_owned());
     })
     .await;
-    assert!(offline.contains("offline</span>"));
-    for absent in ["dBm", "telemetry", "links", "warn", "bus-fault"] {
+    assert!(offline.contains("<span class=\"chip bad\">offline</span>"));
+    for absent in ["dBm", "Telemetry", "links", "warn-text", "stuck_low"] {
         assert!(
             !offline.contains(absent),
             "offline shows {absent}: {offline}"
         );
     }
+    let status = body(h.get("/p/status", Some(&cookie)).await).await;
     assert!(status.contains("title=\"CEC bridge offline\""));
+    assert!(status.contains("Bridge offline — no frame has arrived yet."));
 }
 
 #[tokio::test]

@@ -22,7 +22,7 @@ struct DecisionsTemplate {
 
 pub(crate) async fn page(State(web): State<WebState>, ctx: Ctx) -> Result<Html<String>, WebError> {
     let snapshot = web.app.snapshot();
-    let layout = Layout::new(ctx, "decisions", &snapshot);
+    let layout = Layout::new(ctx, "recorder", &snapshot);
     let mut decisions: Vec<DecisionView> = snapshot.decisions.into();
     decisions.sort_by_key(|decision| std::cmp::Reverse(decision.timestamp));
     render(&DecisionsTemplate {

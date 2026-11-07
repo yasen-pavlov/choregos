@@ -56,6 +56,8 @@ impl AppState {
             bridge_online: false,
             bridge_bus: None,
             bridge_telemetry: None,
+            bridge_node: None,
+            bridge_boot: None,
             last_frame_at: None,
             bridge_logical_address: config.bridge.logical_address(),
             bridge_max_raw_bytes: config.bridge.max_raw_bytes(),
@@ -74,8 +76,10 @@ impl AppState {
                     last_event: None,
                     last_seen: None,
                     conflicted: false,
+                    restored: false,
                     direct: None,
                     probe_configured: device.probe.is_some(),
+                    media_player: device.media_player.clone(),
                 })
                 .collect(),
             bus: Vec::new(),
@@ -96,6 +100,7 @@ impl AppState {
             receiver_direct: None,
             drift: Vec::new(),
             conflicts: Vec::new(),
+            off_deadline: None,
             recent_frames: VecDeque::new(),
             decisions: VecDeque::new(),
             connections,
@@ -236,6 +241,10 @@ pub struct Snapshot {
     pub warming: bool,
     pub bridge_online: bool,
     pub bridge_bus: Option<String>,
+    /// Aether node that reported the current status; `None` for Tasmota and while offline.
+    pub bridge_node: Option<String>,
+    /// Aether boot counter of the current status; `None` for Tasmota and while offline.
+    pub bridge_boot: Option<u32>,
     pub bridge_telemetry: Option<BridgeTelemetry>,
     pub last_frame_at: Option<DateTime<Utc>>,
     pub bridge_logical_address: u8,
@@ -249,6 +258,9 @@ pub struct Snapshot {
     pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>,
     pub drift: Vec<crate::action::DriftDetail>,
     pub conflicts: Vec<Conflict>,
+    /// When the room-off timer fires. Filled once the engine exposes its room-off deadline;
+    /// `None` until then (`intent.off_at` is when the room last went off, not a deadline).
+    pub off_deadline: Option<DateTime<Utc>>,
     pub recent_frames: VecDeque<FrameView>,
     pub decisions: VecDeque<DecisionView>,
     pub connections: Health,
@@ -441,8 +453,13 @@ pub struct RoleView {
     pub last_event: Option<String>,
     pub last_seen: Option<DateTime<Utc>>,
     pub conflicted: bool,
+    /// Unbound, but an unverified bus entry restored from the state file matches the role's
+    /// identity keys; it binds once the device is re-confirmed on the bus. Display only.
+    pub restored: bool,
     pub direct: Option<(ConsoleState, DateTime<Utc>)>,
     pub probe_configured: bool,
+    /// The device's configured Home Assistant media player, if any.
+    pub media_player: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

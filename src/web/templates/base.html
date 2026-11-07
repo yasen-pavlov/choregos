@@ -11,35 +11,43 @@
 <script src="/static/{{ crate::web::HTMX_SSE_JS }}" defer></script>
 </head>
 {% if let Some(layout) = layout %}
+{% let status = layout.status %}
 <body hx-headers='{"X-CSRF-Token": "{{ layout.csrf }}"}'>
-<header class="top">
-  <a class="brand" href="/">choregos</a>
-  <nav>
-    <a href="/"{% if layout.page == "dashboard" %} aria-current="page"{% endif %}>dashboard</a>
-    <a href="/bus"{% if layout.page == "bus" %} aria-current="page"{% endif %}>bus</a>
-    <a href="/devices"{% if layout.page == "devices" %} aria-current="page"{% endif %}>devices</a>
-    <a href="/decisions"{% if layout.page == "decisions" %} aria-current="page"{% endif %}>decisions</a>
-    <a href="/config"{% if layout.page == "config" %} aria-current="page"{% endif %}>config</a>
+<header class="topbar{% if status.is_shadow() %} shadow{% endif %}">
+  <a class="brand" href="/" aria-label="choregos — Cockpit"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="4" cy="14" r="1.6"></circle><path d="M8.5 14a4.5 4.5 0 0 0-4.5-4.5"></path><path d="M13.5 14a9.5 9.5 0 0 0-9.5-9.5"></path></svg><span class="brand-name">choregos</span></a>
+  <nav class="nav" aria-label="Primary">
+    <a href="/"{% if layout.page == "cockpit" %} aria-current="page"{% endif %}>Cockpit</a>
+    <a href="/decisions"{% if layout.page == "recorder" %} aria-current="page"{% endif %}>Recorder</a>
+    <a href="/devices"{% if layout.page == "devices" %} aria-current="page"{% endif %}>Devices</a>
+    <a href="/config"{% if layout.page == "config" %} aria-current="page"{% endif %}>Config</a>
   </nav>
-  <div id="status" class="status">
-    <span class="badge {% if layout.is_active() %}mode-active{% else %}mode-shadow{% endif %}" title="operating mode">{{ layout.mode }}</span>
-    {% if layout.warming %}<span class="badge warming" title="waiting for the bus to answer the startup resync">warming</span>{% endif %}
-    <span class="conn {% if layout.health.bridge_online %}up{% else %}down{% endif %}" title="CEC bridge {% if layout.health.bridge_online %}online{% if let Some(signal) = layout.bridge_signal %} · {{ signal }}{% endif %}{% else %}offline{% endif %}">bridge</span>
-    <span class="conn {% if layout.health.mqtt_connected %}up{% else %}down{% endif %}" title="MQTT {% if layout.health.mqtt_connected %}connected{% else %}disconnected{% endif %}">mqtt</span>
-    <span class="conn {% if layout.health.ha_connected %}up{% else %}down{% endif %}" title="Home Assistant {% if layout.health.ha_connected %}connected{% else %}disconnected{% endif %}">ha</span>
-  </div>
+  {% include "partials/status.html" %}
   <form class="session" method="post" action="/logout">
     <input type="hidden" name="_csrf" value="{{ layout.csrf }}">
     <span class="user">{{ layout.user.name }} <span class="dim">{{ layout.user.method.label() }}</span></span>
-    <button type="submit" class="link">log out</button>
+    <button type="submit" class="link">Log out</button>
   </form>
 </header>
-<div id="flash" aria-live="polite"></div>
+{% include "partials/bands.html" %}
+{% if layout.page != "cockpit" %}
+{# The cockpit carries #status and #bands on its own poll; other pages poll them here. #}
+<div hidden hx-get="/p/status" hx-trigger="every 3s" hx-target="#status" hx-select="#status" hx-select-oob="#bands" hx-swap="outerHTML"></div>
+{% endif %}
 {% else %}
 <body class="bare">
 {% endif %}
-<main>
+{% block main %}<main>
 {% block content %}{% endblock %}
-</main>
+</main>{% endblock %}
+{% if let Some(layout) = layout %}
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="drawer"></div>
+<nav class="tabs" aria-label="Primary">
+  <a href="/"{% if layout.page == "cockpit" %} aria-current="page"{% endif %}><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M3 14a7 7 0 1 1 14 0"></path><path d="M10 14l3.5-4.5"></path></svg>Cockpit</a>
+  <a href="/decisions"{% if layout.page == "recorder" %} aria-current="page"{% endif %}><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 5h12M4 10h12M4 15h7"></path></svg>Recorder</a>
+  <a href="/devices"{% if layout.page == "devices" %} aria-current="page"{% endif %}><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="9" rx="1.5"></rect><path d="M7 16h6"></path></svg>Devices</a>
+  <a href="/config"{% if layout.page == "config" %} aria-current="page"{% endif %}><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 6h12M4 14h12"></path><circle cx="8" cy="6" r="1.8"></circle><circle cx="13" cy="14" r="1.8"></circle></svg>Config</a>
+</nav>
+{% endif %}
 </body>
 </html>

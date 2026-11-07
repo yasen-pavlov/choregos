@@ -189,7 +189,8 @@ pub(crate) async fn page(
         query => format!("/bus/events?{query}"),
     };
     render(&BusTemplate {
-        layout: Some(Layout::new(ctx, "bus", &snapshot)),
+        // Live frames sit under the Recorder until slice 2 moves them to /recorder/live.
+        layout: Some(Layout::new(ctx, "recorder", &snapshot)),
         rows,
         filter,
         stream_url,

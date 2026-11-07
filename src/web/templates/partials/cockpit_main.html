@@ -1,0 +1,139 @@
+{# Polled every 3 s: this element is replaced and, out of band, the chrome's #status and #bands, #}
+{# all rendered from one snapshot. Controls keep stable ids so htmx restores keyboard focus. #}
+<main id="cockpit" class="cockpit" hx-get="/p/cockpit" hx-trigger="every 3s" hx-swap="outerHTML" hx-select="#cockpit" hx-select-oob="#status,#bands" hx-disinherit="*">
+  <section class="panel flush{% if cockpit.shadow %} shadow-edge{% endif %}" aria-label="Room">
+    <div class="strip">
+      <div class="cell">
+        <span class="k">Room intent{% if cockpit.shadow %} (would){% endif %}</span>
+        <span class="big">{{ cockpit.room.power }}</span>
+        {% if let Some((id, at)) = cockpit.room.since %}<span class="dim small" title="{{ view::iso(at) }}">since {{ view::when_ms(at) }} · <a href="/decisions#d-{{ id }}">#{{ id }}</a></span>{% endif %}
+      </div>
+      <div class="cell">
+        <span class="k">Active source</span>
+        {% if let Some(active) = cockpit.room.active %}
+        <span class="value">{{ active.name }}</span>
+        <span class="dim small">role {{ active.role }}{% if let Some(la) = active.logical_address %} · LA {{ la }}{% endif %}{% if let Some(at) = active.since %} · since {{ view::when(at) }}{% endif %}</span>
+        {% else %}
+        <span class="value dim">none</span>
+        {% endif %}
+      </div>
+      <div class="cell">
+        <span class="k">Receiver input</span>
+        <span class="value">{{ cockpit.room.receiver_value }}</span>
+        {% if cockpit.room.receiver_source.is_some() || cockpit.room.intended_source.is_some() %}
+        <span class="prov">{% if let Some(seg) = cockpit.room.receiver_source %}{% include "partials/segment.html" %}{% endif %}{% if let Some(intended) = cockpit.room.intended_source %}<span class="dis"><span class="src">intended</span> {{ intended }}</span>{% endif %}</span>
+        {% endif %}
+      </div>
+      <div class="cell">
+        <span class="k">Off timer</span>
+        <span class="value{% if !cockpit.room.off_running %} dim{% endif %}">{{ cockpit.room.off_value }}</span>
+        <span class="dim small">{{ cockpit.room.off_detail }}</span>
+      </div>
+      <div class="cell wide">
+        <span class="k">Room vs. devices</span>
+        <span><span class="chip lg {{ cockpit.consistency.tone() }}" title="{{ cockpit.consistency.title() }}">{{ cockpit.consistency.label() }}</span></span>
+        <span class="dim small">{{ cockpit.consistency.sentence() }}</span>
+      </div>
+      <div class="cell act">
+        <button type="button" id="all-off" class="btn {% if cockpit.shadow %}would{% else %}danger{% endif %}" hx-post="/actions/all-off" hx-swap="none"{% if !cockpit.shadow %} hx-confirm="Turn everything off? The TV, the receiver and every playback device go to standby."{% endif %}{% if cockpit.warming %} disabled title="warming: actions are refused until the bus model settles"{% endif %}>{% if cockpit.shadow %}Would turn all off…{% else %}All off…{% endif %}</button>
+      </div>
+    </div>
+    {% for v in cockpit.verifying %}
+    <div class="verifying">
+      <span class="chip pend">verifying {{ v.id }}</span>
+      <span class="grow">{% for item in v.items %}{% if !loop.first %} · {% endif %}<span class="mono">{{ item.name }}</span> <b>{{ item.expect }}</b>{% if let Some((tone, label)) = item.chip %} <span class="chip {{ tone }}">{{ label }}</span>{% if !item.detail.is_empty() %} <span class="mono dim">{{ item.detail }}</span>{% endif %}{% else %} — {{ item.detail }}{% endif %}{% endfor %}</span>
+      <span class="mono num dim">{{ v.progress() }}</span>
+      {% if v.max_ms > 0 %}<progress max="{{ v.max_ms }}" value="{{ v.value() }}" aria-label="time towards the last deadline"></progress>{% endif %}
+      <a class="small" href="/decisions#d-{{ v.id }}">#{{ v.id }} →</a>
+    </div>
+    {% endfor %}
+  </section>
+
+  <div id="alerts" class="alerts">{% for alert in cockpit.alerts %}<div class="alert {{ alert.tone }}"><span class="dot {{ alert.tone }}"></span><div class="body"><span class="t">{{ alert.title }}</span><span class="small">{{ alert.detail }}</span></div>{% if alert.bridge_button %}<button type="button" class="btn sm" hx-get="/p/bridge" hx-target="#drawer" hx-swap="innerHTML">Open bridge</button>{% endif %}{% if alert.devices_link %}<a class="button btn sm" href="/devices">Open in Devices</a>{% endif %}</div>{% endfor %}</div>
+
+  <div class="section-h"><h2>Playback devices</h2><span class="note">power comes from the device's own CEC events; the marked segment is the source Choregos used</span></div>
+  {% if cockpit.cards.is_empty() %}
+  <section class="panel empty-state" aria-label="Playback devices">
+    <h1>No roles configured</h1>
+    <p>Choregos is listening to the HDMI bus but has no roles, so it will not wake or sleep anything. A role tells it which device is which.</p>
+    <p class="row"><a class="button primary" href="/config">Add a role in Config</a> <a href="/devices">See what is on the bus</a></p>
+  </section>
+  {% else %}
+  <section class="cards" aria-label="Playback devices">
+    {% for card in cockpit.cards %}
+    <article class="card{% if card.active %} active{% endif %} {{ card.edge }}">
+      <div class="head">
+        <div class="row"><h2 class="grow">{{ card.name }}</h2>{% if card.active %}<span class="chip info">active</span>{% endif %}<span class="chip {% if card.on %}ok{% else %}dim{% endif %}">{% if card.on %}on{% else %}off{% endif %}</span></div>
+        <div class="mono dim">{{ card.role }}{% if let Some(la) = card.logical_address %} · LA {{ la }}{% endif %}{% if let Some(pa) = card.physical_address %} · {{ pa }}{% endif %} · <span class="chip {{ card.identity.1 }}">{{ card.identity.0 }}</span></div>
+      </div>
+      <div class="sec">
+        <span class="k">Power</span>
+        <span class="prov">{% for seg in card.power %}{% include "partials/segment.html" %}{% endfor %}</span>
+      </div>
+      <div class="sec">
+        {% if card.restored %}
+        <span class="small">Restored from the state file{% if let Some(at) = card.restored_at %} at {{ view::when(at) }}{% endif %}. Waiting for {{ card.name }} to talk on the bus before it can trigger actions.</span>
+        {% else %}
+        <span class="k">Last decision</span>
+        {% endif %}
+        {% if let Some(last) = card.last %}
+        <span><a class="mono" href="/decisions#d-{{ last.id }}">#{{ last.id }}</a> <span class="dim" title="{{ view::iso(last.timestamp) }}">{{ view::when(last.timestamp) }}</span> <span class="mono" title="{{ view::reason_title(last.reason) }}">{{ last.reason }}</span> {% if last.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(last.verdict) }}">{{ last.verdict }}</span>{% endif %}</span>
+        {% if let Some(line) = card.line %}<span class="dim small">{{ line }}</span>{% endif %}
+        {% else %}
+        <span class="dim small">No decision yet.</span>
+        {% endif %}
+      </div>
+      <div class="sec actions">
+        {% if card.show_takeover %}<button type="button" id="takeover-{{ card.role }}" class="btn sm{% if cockpit.shadow %} would{% endif %}" hx-post="/actions/takeover/{{ card.role|urlencode_strict }}" hx-swap="none"{% if !cockpit.shadow %} hx-confirm="Take over the room with {{ card.name }}?"{% endif %}{% if let Some(why) = card.disabled %} disabled title="{{ why }}"{% endif %}>{% if cockpit.shadow %}Would take over…{% else %}Take over…{% endif %}</button>{% endif %}
+        {% if card.show_standby %}<button type="button" id="standby-{{ card.role }}" class="btn sm{% if cockpit.shadow %} would{% endif %}" hx-post="/actions/standby/{{ card.role|urlencode_strict }}" hx-swap="none"{% if !cockpit.shadow %} hx-confirm="Put {{ card.name }} in standby?"{% endif %}{% if let Some(why) = card.disabled %} disabled title="{{ why }}"{% endif %}>{% if cockpit.shadow %}Would standby…{% else %}Standby…{% endif %}</button>{% endif %}
+        {% if let Some(la) = card.logical_address %}<button type="button" class="btn sm ghost" hx-post="/actions/identify/{{ la }}" hx-swap="none"{% if cockpit.warming %} disabled title="warming: actions are refused until the bus model settles"{% endif %}>Identify</button>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  <div class="section-h"><h2>Outputs</h2><span class="note">{% if cockpit.shadow %}Home Assistant only{% else %}device first, Home Assistant as fallback{% endif %}</span></div>
+  <section class="cards outputs" aria-label="Outputs">
+    {% for output in cockpit.outputs %}
+    <article class="card">
+      <div class="ph"><h2 class="grow">{{ output.name }}</h2><span class="chip {{ output.chip.0 }}">{{ output.chip.1 }}</span></div>
+      <div class="pb lines">
+        {% for line in output.lines %}
+        <div class="line"><span class="k">{{ line.key }}</span>{% if !line.segments.is_empty() %}<span class="prov">{% for seg in line.segments %}{% include "partials/segment.html" %}{% endfor %}</span>{% endif %}{% if let Some(extra) = line.extra %}<span class="mono">{{ extra }}</span>{% endif %}</div>
+        {% endfor %}
+        {% if let Some(note) = output.note %}<p class="note">{{ note }}</p>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="panel flush" aria-label="Last decisions">
+    <div class="ph"><h2 class="grow">Last 5 decisions</h2><a class="small" href="/decisions">Open Recorder →</a></div>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th scope="col">#</th><th scope="col">Time</th><th scope="col">Role</th><th scope="col">Change</th><th scope="col">Reason</th><th scope="col">Actions</th><th scope="col">Verdict</th><th scope="col" class="r">Latency</th></tr></thead>
+        <tbody>
+          {% for row in cockpit.recent %}
+          {% if row.separator %}
+          <tr class="sep"><td colspan="8">#{{ row.decision.id }} · {{ view::when_ms(row.decision.timestamp) }} · service started — rows below were made by the previous run</td></tr>
+          {% else %}
+          <tr id="recent-{{ row.decision.id }}"{% if row.decision.would %} class="would"{% endif %}>
+            <td class="mono"><a href="/decisions#d-{{ row.decision.id }}">{{ row.decision.id }}</a>{% if let Some(parent) = row.decision.parent %} <span class="dim">↳ {{ parent }}</span>{% endif %}</td>
+            <td class="mono num" title="{{ view::iso(row.decision.timestamp) }}">{{ view::when_ms(row.decision.timestamp) }}</td>
+            <td>{% if let Some(name) = row.role_name %}{{ name }}{% else %}<span class="dim">room</span>{% endif %}</td>
+            <td class="mono">{% if row.decision.from.is_none() && row.decision.to.is_none() %}<span class="dim">—</span>{% else %}{{ view::transition(row.decision.from, row.decision.to) }}{% endif %}</td>
+            <td class="mono" title="{{ view::reason_title(row.decision.reason) }}">{{ row.decision.reason }}</td>
+            <td class="mono dim">{{ row.actions }}</td>
+            <td>{% if row.decision.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(row.decision.verdict) }}">{{ row.decision.verdict }}</span>{% endif %}</td>
+            <td class="mono num r">{% if let Some(latency) = row.latency %}{{ latency }}{% else %}<span class="dim">{% if row.decision.verdict == crate::action::Verdict::Pending %}…{% else %}—{% endif %}</span>{% endif %}</td>
+          </tr>
+          {% endif %}
+          {% else %}
+          <tr><td colspan="8" class="empty">No decisions yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>

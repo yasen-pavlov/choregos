@@ -69,7 +69,10 @@ pub fn router(state: AppState) -> Router {
     };
 
     let protected = Router::new()
-        .route("/", get(routes::dashboard::page))
+        .route("/", get(routes::cockpit::page))
+        .route("/p/cockpit", get(routes::cockpit::partial))
+        .route("/p/status", get(routes::chrome::status))
+        .route("/p/bridge", get(routes::chrome::bridge))
         .route("/bus", get(routes::bus::page))
         .route("/bus/events", get(routes::bus::events))
         .route("/devices", get(routes::devices::page))

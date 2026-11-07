@@ -1,0 +1,1 @@
+<span class="{{ seg.class() }}"{% if let Some(title) = seg.title() %} title="{{ title }}"{% endif %}><span class="src">{{ seg.source }}</span> {{ seg.value }}{% if let Some(age) = seg.age() %} <span class="age">{{ age }}</span>{% endif %}</span>

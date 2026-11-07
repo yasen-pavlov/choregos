@@ -1,0 +1,45 @@
+<aside class="drawer" aria-label="Bridge">
+  <div class="ph"><h2 class="grow">Bridge</h2><button type="button" class="btn sm ghost" hx-get="/p/bridge?close=true" hx-target="#drawer" hx-swap="innerHTML" aria-label="Close the bridge drawer">✕</button></div>
+  <div class="pb">
+    {# Only this block re-polls while the drawer is open, so the raw-send form keeps its input. #}
+    <div id="bridge-info" class="pb-flow" hx-get="/p/bridge" hx-trigger="every 3s" hx-select="#bridge-info" hx-swap="outerHTML">
+      <div class="row"><span class="k grow">Link</span><span class="chip {% if snapshot.bridge_online %}ok{% else %}bad{% endif %}">{% if snapshot.bridge_online %}online{% else %}offline{% endif %}</span></div>
+      <dl class="dl">
+        {% if let Some(node) = snapshot.bridge_node %}<dt>Adapter</dt><dd class="mono">aether</dd><dt>Node</dt><dd class="mono">{{ node }}</dd>{% endif %}
+        {% if let Some(boot) = snapshot.bridge_boot %}<dt>Boot count</dt><dd class="mono" id="bridge-boot">{{ boot }}</dd>{% endif %}
+        <dt>Own LA</dt><dd class="mono">{{ snapshot.bridge_logical_address }}</dd>
+        {% if snapshot.bridge_online %}
+        {% if let Some(telemetry) = snapshot.bridge_telemetry %}
+        <dt>Wi-Fi</dt><dd id="bridge-wifi" class="mono{% if view::bridge_degraded(snapshot) %} warn-text{% endif %}" title="Wi-Fi signal · Wi-Fi links since boot (1 = never reconnected)">{{ view::dbm(telemetry.signal_dbm) }} · {{ view::links(telemetry.link_count) }}</dd>
+        <dt>Up</dt><dd class="mono">{{ view::uptime(telemetry.uptime_s) }}</dd>
+        <dt>Telemetry</dt><dd id="bridge-telemetry" class="mono">{{ view::since(telemetry.at) }}</dd>
+        {% else %}
+        <dt>Telemetry</dt><dd class="dim">no telemetry yet</dd>
+        {% endif %}
+        {% endif %}
+      </dl>
+      {% if snapshot.bridge_online %}
+      <hr>
+      <div class="row"><span class="k grow">Bus</span>{% if let Some(fault) = view::bus_fault(snapshot) %}<span class="chip bad">{{ fault }}</span>{% else if let Some(bus) = snapshot.bridge_bus %}<span class="chip ok">{{ bus }}</span>{% else %}<span class="chip none">not reported</span>{% endif %}</div>
+      <dl class="dl">
+        <dt>Last frame</dt><dd id="bridge-last-frame" class="mono">{{ view::ago(snapshot.last_frame_at) }}</dd>
+        <dt>Fault</dt><dd>{% if let Some(fault) = view::bus_fault(snapshot) %}{{ view::bus_fault_sentence(fault) }}{% else %}<span class="dim">none</span>{% endif %}</dd>
+      </dl>
+      {% endif %}
+    </div>
+    <hr>
+    <div class="k">Raw send</div>
+    <form id="raw-send" hx-post="/actions/send-raw" hx-swap="none" hx-confirm="Send this raw CEC frame?">
+      <div class="fields">
+        <label for="raw-to">To LA</label>
+        <input id="raw-to" name="to" inputmode="numeric" list="raw-to-options" placeholder="4" required>
+        <label for="raw-data">Data (hex)</label>
+        <input id="raw-data" name="data" class="mono" placeholder="8F" required>
+      </div>
+      <datalist id="raw-to-options">{% for entry in snapshot.bus %}<option value="{{ entry.logical_address }}">{% if let Some(role) = entry.matched_role %}{{ role }}{% else %}{{ view::opt(entry.osd) }}{% endif %}</option>{% endfor %}</datalist>
+      <p class="help">Opcode and operands in hex, 1–{{ snapshot.bridge_max_raw_bytes }} bytes. The frame comes from LA {{ snapshot.bridge_logical_address }}, the bridge's own address.</p>
+      <div class="row"><button type="submit" class="btn{% if shadow %} would{% endif %}">{% if shadow %}Would send…{% else %}Send…{% endif %}</button></div>
+      {% if shadow %}<p class="help">In shadow this records a <span class="chip would">would</span> row; the executor does not put the frame on the bus.</p>{% endif %}
+    </form>
+  </div>
+</aside>

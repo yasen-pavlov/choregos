@@ -1,0 +1,8 @@
+<div id="bands"{% if status.oob %} hx-swap-oob="true"{% endif %}>
+  {%- if status.is_shadow() %}
+  <div class="band shadow"><span class="chip fill">shadow</span><span class="grow">Shadow — observing only; every action is recorded as "would".</span></div>
+  {%- endif %}
+  {%- if !status.health.bridge_online %}
+  <div class="band bad"><span class="dot bad"></span><span class="grow">Bridge offline — {% if let Some(at) = status.last_frame_at %}no frames since {{ view::when(at) }} ({{ view::since(at) }}); bus and power values are as of then.{% else %}no frame has arrived yet.{% endif %}</span><button type="button" class="btn sm danger" hx-get="/p/bridge" hx-target="#drawer" hx-swap="innerHTML">Open bridge</button></div>
+  {%- endif %}
+</div>

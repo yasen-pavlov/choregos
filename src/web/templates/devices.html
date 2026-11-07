@@ -4,7 +4,7 @@
 <section class="panel scroll">
   <h2>bus table</h2>
   <table class="grid">
-    <thead><tr><th>LA</th><th>PA</th><th>type</th><th>vendor</th><th>OSD</th><th>power</th><th>seen</th><th>role</th><th></th></tr></thead>
+    <thead><tr><th scope="col">LA</th><th scope="col">PA</th><th scope="col">type</th><th scope="col">vendor</th><th scope="col">OSD</th><th scope="col">power</th><th scope="col">seen</th><th scope="col">role</th><th scope="col">actions</th></tr></thead>
     <tbody>
       {% for entry in snapshot.bus %}
       <tr{% if !entry.identified %} class="unidentified"{% endif %}>
@@ -17,8 +17,8 @@
         <td class="dim">{% if !entry.verified %}restored{% else %}{{ view::ago(entry.last_seen) }}{% endif %}</td>
         <td>{% if let Some(role) = entry.matched_role %}<span class="mono">{{ role }}</span>{% else if entry.identified %}<span class="dim">unmatched</span>{% else %}<span class="warn">unidentified</span>{% endif %}</td>
         <td><div class="group">
-          <button class="small" hx-post="/actions/identify/{{ entry.logical_address }}" hx-target="#flash">identify</button>
-          {% if entry.logical_address != snapshot.bridge_logical_address %}<button class="small" hx-post="/actions/forget/{{ entry.logical_address }}" hx-target="#flash" hx-confirm="Forget LA {{ entry.logical_address }}? It will be re-learned if it talks again.">forget</button>{% endif %}
+          <button class="small" hx-post="/actions/identify/{{ entry.logical_address }}" hx-swap="none">identify</button>
+          {% if entry.logical_address != snapshot.bridge_logical_address %}<button class="small" hx-post="/actions/forget/{{ entry.logical_address }}" hx-swap="none" hx-confirm="Forget LA {{ entry.logical_address }}? It will be re-learned if it talks again.">forget</button>{% endif %}
         </div></td>
       </tr>
       {% else %}
@@ -31,7 +31,7 @@
 <section class="panel scroll">
   <h2>roles</h2>
   <table class="grid">
-    <thead><tr><th>role</th><th>name</th><th>receiver source</th><th>LA</th><th>PA</th><th>power</th></tr></thead>
+    <thead><tr><th scope="col">role</th><th scope="col">name</th><th scope="col">receiver source</th><th scope="col">LA</th><th scope="col">PA</th><th scope="col">power</th></tr></thead>
     <tbody>
       {% for role in snapshot.roles %}
       <tr{% if role.conflicted %} class="conflicted"{% endif %}>
@@ -45,15 +45,6 @@
       {% endfor %}
     </tbody>
   </table>
-</section>
-
-<section class="panel">
-  <h2>send raw frame</h2>
-  <form class="filters" hx-post="/actions/send-raw" hx-target="#flash" hx-confirm="Send this raw CEC frame?">
-    <label>to LA <input name="to" inputmode="numeric" size="3" placeholder="4" required></label>
-    <label>data <input name="data" class="mono" size="24" placeholder="8F" required></label>
-    <button type="submit">send</button>
-    <span class="hint">opcode + operands in hex; in shadow mode this is logged as <span class="mono">would:</span> only.</span>
-  </form>
+  <p class="hint">Raw CEC frames are sent from the bridge drawer: open it from the bridge pill in the top bar.</p>
 </section>
 {% endblock %}

@@ -1,5 +1,8 @@
 use crate::{
-    cec::{bus::BusModel, frame::parse_physical},
+    cec::{
+        bus::{BusEntry, BusModel},
+        frame::parse_physical,
+    },
     config::DeviceConfig,
     state::Conflict,
 };
@@ -12,30 +15,35 @@ pub struct Resolution {
     pub blocked: BTreeSet<String>,
 }
 
+/// Whether the bus entry at `la` carries every identity key the device configures. Says
+/// nothing about verification: `resolve` binds only verified entries.
+pub fn matches(device: &DeviceConfig, la: u8, entry: &BusEntry, bridge: u8) -> bool {
+    let keys = &device.matches;
+    la != bridge
+        && keys
+            .osd
+            .as_ref()
+            .is_none_or(|osd| entry.osd.as_deref().map(str::trim) == Some(osd.trim()))
+        && keys
+            .vendor
+            .as_ref()
+            .is_none_or(|vendor| entry.vendor == u32::from_str_radix(vendor, 16).ok())
+        && keys
+            .physical
+            .as_ref()
+            .is_none_or(|pa| entry.physical == parse_physical(pa))
+}
+
 pub fn resolve(devices: &[DeviceConfig], bus: &BusModel) -> Resolution {
     let mut result = Resolution::default();
     let mut by_la: BTreeMap<u8, Vec<String>> = BTreeMap::new();
     for device in devices {
-        let matches = &device.matches;
-        let addresses: Vec<_> =
-            bus.entries
-                .iter()
-                .filter(|(la, entry)| {
-                    **la != bus.bridge
-                        && entry.verified
-                        && matches.osd.as_ref().is_none_or(|osd| {
-                            entry.osd.as_deref().map(str::trim) == Some(osd.trim())
-                        })
-                        && matches.vendor.as_ref().is_none_or(|vendor| {
-                            entry.vendor == u32::from_str_radix(vendor, 16).ok()
-                        })
-                        && matches
-                            .physical
-                            .as_ref()
-                            .is_none_or(|pa| entry.physical == parse_physical(pa))
-                })
-                .map(|(&la, _)| la)
-                .collect();
+        let addresses: Vec<_> = bus
+            .entries
+            .iter()
+            .filter(|(la, entry)| entry.verified && matches(device, **la, entry, bus.bridge))
+            .map(|(&la, _)| la)
+            .collect();
         if addresses.len() > 1 {
             result.blocked.insert(device.role.clone());
             result.conflicts.push(Conflict {

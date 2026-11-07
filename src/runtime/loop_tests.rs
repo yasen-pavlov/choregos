@@ -25,7 +25,7 @@ const DUMMY_SECRET: &str = "runtime-test-only-dummy-secret-value";
 
 // Broker::start creates unowned server threads and has no shutdown API. Hosting
 // the same Router/Server in an owned runtime lets tests really sever every socket.
-struct Broker {
+pub(super) struct Broker {
     address: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -80,7 +80,7 @@ impl Broker {
             thread: Some(thread),
         }
     }
-    async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -108,7 +108,7 @@ struct MqttView {
     subscriptions: u64,
     publications: Vec<Publish>,
 }
-struct MqttPeer {
+pub(super) struct MqttPeer {
     client: AsyncClient,
     port: u16,
     view: watch::Receiver<MqttView>,
@@ -165,7 +165,7 @@ impl MqttPeer {
         .await
         .expect("MQTT observation timed out")
     }
-    async fn publish(&self, topic: &str, retained: bool, payload: impl Into<Vec<u8>>) {
+    pub(super) async fn publish(&self, topic: &str, retained: bool, payload: impl Into<Vec<u8>>) {
         self.client
             .publish(topic, QoS::AtLeastOnce, retained, payload)
             .await
@@ -334,14 +334,14 @@ async fn ha_session(socket: TcpStream, observed: watch::Sender<HaView>, initial:
     }
 }
 
-struct Harness {
-    state: AppState,
+pub(super) struct Harness {
+    pub(super) state: AppState,
     config: Config,
     path: PathBuf,
     inputs: mpsc::Sender<super::Input>,
-    peer: MqttPeer,
+    pub(super) peer: MqttPeer,
     ha: HaFake,
-    broker: Broker,
+    pub(super) broker: Broker,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<crate::engine::Engine>>>,
     _directory: tempfile::TempDir,
@@ -351,7 +351,7 @@ impl Harness {
     async fn start() -> Self {
         Self::start_with_bridge(false).await
     }
-    async fn start_with_bridge(native: bool) -> Self {
+    pub(super) async fn start_with_bridge(native: bool) -> Self {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reservation.local_addr().unwrap();
         drop(reservation);
@@ -554,7 +554,7 @@ impl Harness {
         }
         None
     }
-    async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) {
         self.stop_runtime().await;
         self.ha.shutdown().await;
         self.broker.shutdown().await;
@@ -576,7 +576,10 @@ fn role_on(snapshot: &Snapshot) -> bool {
         .iter()
         .any(|role| role.role == "streamer" && role.power == RolePower::On)
 }
-async fn wait_snapshot(state: &AppState, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
+pub(super) async fn wait_snapshot(
+    state: &AppState,
+    predicate: impl Fn(&Snapshot) -> bool,
+) -> Snapshot {
     tokio::time::timeout(WAIT, async {
         loop {
             let snapshot = state.snapshot();
