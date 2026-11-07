@@ -7,6 +7,7 @@ use super::{
 };
 
 const RESYNC_WINDOW: Duration = Duration::from_secs(5);
+const LATE_REPEATS: u8 = 3;
 
 impl Engine {
     fn probe_policy(&self, role: &str) -> Option<(StartWake, Duration)> {
@@ -24,7 +25,7 @@ impl Engine {
         self.roles
             .iter()
             .filter_map(|(role, state)| {
-                let evidence = state.start?;
+                let evidence = state.start.as_ref()?;
                 if !evidence.state.unconfirmed() || self.identity.blocked.contains(role) {
                     return None;
                 }
@@ -45,10 +46,15 @@ impl Engine {
         sample: ConsoleState,
         at: DateTime<Utc>,
     ) -> Vec<Action> {
+        let sent_at = self
+            .now
+            .checked_sub((self.wall - at).to_std().unwrap_or_default())
+            .unwrap_or(self.now);
         let Some(state) = self.roles.get_mut(role) else {
             return vec![];
         };
         state.direct = Some((sample, at));
+        state.observe_probe_run(sample, sent_at);
         if self.config.mode == Mode::Shadow {
             state.start = None;
             state.start_baseline = None;
@@ -58,53 +64,69 @@ impl Engine {
         let Some((policy, boot)) = self.probe_policy(role) else {
             return vec![];
         };
-        let sent_at = self
-            .now
-            .checked_sub((self.wall - at).to_std().unwrap_or_default())
-            .unwrap_or(self.now);
+        self.clear_expired_rejection(role, boot);
         if self.roles[role]
             .start
+            .as_ref()
             .is_some_and(|e| e.state.unconfirmed())
             && (self.warming || self.identity.blocked.contains(role))
         {
             return vec![];
         }
-        if self.roles[role]
-            .start
-            .is_some_and(|e| e.state.unconfirmed() && self.now >= e.at + boot)
-        {
-            let trigger = self
-                .trigger
-                .replace(DecisionTrigger::Timer(TimerKind::ConsoleBoot));
-            let actions = self.end_console_start(role, "console_start_expired", policy);
-            self.trigger = trigger;
-            // A deadline sample can establish the next baseline, not resurrect an old episode.
-            let state = self.roles.get_mut(role).expect("configured role");
-            state.start_baseline = (sample == ConsoleState::Standby).then_some(sent_at);
-            state.start_first = None;
+        if let Some(actions) = self.observe_start_end(role, sample, sent_at, policy, boot) {
             return actions;
         }
-        if sample == ConsoleState::Standby
-            && self.roles[role]
-                .start
-                .is_some_and(|e| e.state.unconfirmed())
-        {
-            let actions = self.end_console_start(role, "console_start_retracted", policy);
-            self.roles
-                .get_mut(role)
-                .expect("configured role")
-                .start_baseline = Some(sent_at);
-            return actions;
-        }
+        let rest = self
+            .config
+            .device
+            .iter()
+            .find(|d| d.role == role)
+            .and_then(|d| d.probe.as_ref())
+            .map(|p| Duration::from_secs(p.rest_s()))
+            .expect("probe policy");
         if self
             .roles
             .get_mut(role)
             .expect("configured role")
-            .classify_start(sample, sent_at)
+            .classify_start(sample, sent_at, rest)
         {
             return self.create_console_start(role, policy);
         }
         vec![]
+    }
+
+    fn observe_start_end(
+        &mut self,
+        role: &str,
+        sample: ConsoleState,
+        sent_at: Instant,
+        policy: StartWake,
+        boot: Duration,
+    ) -> Option<Vec<Action>> {
+        let evidence = self.roles[role]
+            .start
+            .as_ref()
+            .filter(|e| e.state.unconfirmed())?;
+        let reason = if self.now >= evidence.at + boot {
+            "console_start_expired"
+        } else if sample == ConsoleState::Standby {
+            "console_start_retracted"
+        } else {
+            return None;
+        };
+        let expired = reason == "console_start_expired";
+        let previous = expired.then(|| {
+            self.trigger
+                .replace(DecisionTrigger::Timer(TimerKind::ConsoleBoot))
+        });
+        let actions = self.end_console_start(role, reason, policy);
+        if let Some(previous) = previous {
+            self.trigger = previous;
+        }
+        let state = self.roles.get_mut(role).expect("configured role");
+        state.start_baseline = state.standby_baseline(sent_at);
+        state.start_first = None;
+        Some(actions)
     }
 
     fn create_console_start(&mut self, role: &str, policy: StartWake) -> Vec<Action> {
@@ -185,7 +207,7 @@ impl Engine {
         if target != RolePower::On || policy != StartWake::Would {
             return None;
         }
-        let evidence = self.roles.get(role)?.start?;
+        let evidence = self.roles.get(role)?.start.as_ref()?;
         if self.now >= evidence.at + boot {
             return None;
         }
@@ -193,7 +215,7 @@ impl Engine {
     }
 
     fn older_than_active(&self, role: &str) -> bool {
-        let Some(evidence) = self.roles[role].start else {
+        let Some(evidence) = self.roles[role].start.as_ref() else {
             return false;
         };
         self.intent
@@ -214,26 +236,32 @@ impl Engine {
         if target != RolePower::On {
             return self.transition(role, target, reason, now);
         }
+        self.roles.get_mut(role).expect("configured role").awake_at = Some(now);
         let Some((policy, boot)) = self.probe_policy(role) else {
             return self.transition(role, target, reason, now);
         };
-        let Some(evidence) = self.roles[role].start.filter(|e| now < e.at + boot) else {
+        self.clear_expired_rejection(role, boot);
+        let Some(evidence) = self.roles[role]
+            .start
+            .as_ref()
+            .filter(|e| now < e.at + boot)
+        else {
             return self.transition(role, target, reason, now);
         };
-        if matches!(evidence.state, StartState::Rejected) {
-            return vec![];
+        if matches!(evidence.state, StartState::Rejected { .. }) {
+            return self.repeat_late_announcement(role, policy, reason, now);
         }
+        let decision = evidence.state.decision();
         self.roles
             .get_mut(role)
             .expect("configured role")
             .start
             .as_mut()
             .expect("start")
-            .state = StartState::Confirmed {
-            decision: evidence.state.decision(),
-        };
+            .state = StartState::Confirmed { decision };
         if self.older_than_active(role) {
-            let actions = self.late_announcement(role, policy);
+            let winner = self.intent.active_role.clone().expect("older active role");
+            let actions = self.late_announcement(role, policy, &winner);
             if policy != StartWake::Would {
                 return actions;
             }
@@ -241,13 +269,88 @@ impl Engine {
         self.transition(role, target, reason, now)
     }
 
-    fn late_announcement(&mut self, role: &str, policy: StartWake) -> Vec<Action> {
+    fn repeat_late_announcement(
+        &mut self,
+        role: &str,
+        policy: StartWake,
+        reason: &str,
+        now: Instant,
+    ) -> Vec<Action> {
+        let Some(winner) = self.repeat_winner(role, policy) else {
+            self.roles.get_mut(role).expect("configured role").start = None;
+            return self.transition(role, RolePower::On, reason, now);
+        };
+        let evidence = self.roles[role].start.as_ref().expect("rejected episode");
+        let settle = Duration::from_millis(self.config.timing.takeover_settle_ms);
+        if evidence.late_repeats >= LATE_REPEATS
+            || evidence.last_late.is_some_and(|last| now < last + settle)
+        {
+            return if policy == StartWake::Would {
+                self.transition(role, RolePower::On, reason, now)
+            } else {
+                vec![]
+            };
+        }
+        self.roles
+            .get_mut(role)
+            .expect("configured role")
+            .start
+            .as_mut()
+            .expect("rejected episode")
+            .late_repeats += 1;
+        let actions = self.late_announcement(role, policy, &winner);
+        if policy == StartWake::Would {
+            self.transition(role, RolePower::On, reason, now)
+        } else {
+            actions
+        }
+    }
+
+    fn repeat_winner(&self, role: &str, policy: StartWake) -> Option<String> {
+        let active = self.intent.active_role.as_deref()?;
+        if active != role {
+            return Some(active.into());
+        }
+        if policy == StartWake::Would
+            && let StartState::Rejected { winner, .. } = &self.roles[role].start.as_ref()?.state
+        {
+            return Some(winner.clone());
+        }
+        None
+    }
+
+    fn clear_expired_rejection(&mut self, role: &str, boot: Duration) {
+        let state = self.roles.get_mut(role).expect("configured role");
+        if state.start.as_ref().is_some_and(|evidence| {
+            matches!(evidence.state, StartState::Rejected { .. }) && self.now >= evidence.at + boot
+        }) {
+            state.start = None;
+            state.start_first = None;
+        }
+    }
+
+    fn late_announcement(&mut self, role: &str, policy: StartWake, winner: &str) -> Vec<Action> {
+        let evidence = self
+            .roles
+            .get_mut(role)
+            .expect("configured role")
+            .start
+            .as_mut()
+            .expect("start");
+        evidence.last_late = Some(self.now);
+        if !matches!(&evidence.state, StartState::Rejected { winner: previous, .. } if previous == winner)
+        {
+            evidence.state = StartState::Rejected {
+                decision: evidence.state.decision(),
+                winner: winner.into(),
+            };
+        }
         let mut actions = if policy == StartWake::Would {
             self.stop_actions(role)
         } else {
             self.stop_role(role, self.now)
         };
-        self.reassert_active_source(&mut actions);
+        self.reassert_source(winner, &mut actions);
         if policy == StartWake::Would {
             self.record_would(
                 role,
@@ -272,20 +375,10 @@ impl Engine {
                 pending.parent = Some(id);
             }
         }
-        self.roles
-            .get_mut(role)
-            .expect("configured role")
-            .start
-            .as_mut()
-            .expect("start")
-            .state = StartState::Rejected;
         actions
     }
 
-    fn reassert_active_source(&self, actions: &mut Vec<Action>) {
-        let Some(active) = self.intent.active_role.as_deref() else {
-            return;
-        };
+    fn reassert_source(&self, active: &str, actions: &mut Vec<Action>) {
         if let Some(physical) = self
             .identity
             .roles
@@ -330,7 +423,7 @@ impl Engine {
             .roles
             .iter()
             .filter_map(|(role, state)| {
-                let evidence = state.start?;
+                let evidence = state.start.as_ref()?;
                 let (policy, boot) = self.probe_policy(role)?;
                 (!self.identity.blocked.contains(role)
                     && evidence.state.unconfirmed()
@@ -392,6 +485,7 @@ impl Engine {
             {
                 let parent = self.roles[&role]
                     .start
+                    .as_ref()
                     .and_then(|evidence| evidence.state.decision());
                 self.record_would(&role, "console_start_expired", vec![], parent);
             } else if self.roles[&role].power == RolePower::On {
@@ -624,14 +718,14 @@ impl Engine {
 }
 
 impl StartState {
-    fn unconfirmed(self) -> bool {
+    fn unconfirmed(&self) -> bool {
         matches!(self, Self::Pending | Self::Woke { .. } | Self::Superseded)
     }
 
-    fn decision(self) -> Option<u64> {
+    fn decision(&self) -> Option<u64> {
         match self {
-            Self::Woke { decision } => Some(decision),
-            Self::Confirmed { decision } => decision,
+            Self::Woke { decision } => Some(*decision),
+            Self::Confirmed { decision } | Self::Rejected { decision, .. } => *decision,
             _ => None,
         }
     }
@@ -640,33 +734,88 @@ impl StartState {
 impl RoleState {
     pub(super) fn unconfirmed_start_wake(&self) -> bool {
         self.start
+            .as_ref()
             .is_some_and(|e| matches!(e.state, StartState::Woke { .. }))
     }
 
-    fn classify_start(&mut self, sample: ConsoleState, sent_at: Instant) -> bool {
+    fn observe_probe_run(&mut self, sample: ConsoleState, sent_at: Instant) {
+        if self
+            .probe_run
+            .is_none_or(|(previous, _)| previous != sample)
+        {
+            self.probe_run = Some((sample, sent_at));
+        }
+    }
+
+    pub(super) fn probe_standby_trusted(&self) -> bool {
+        self.probe_run.is_some_and(|(sample, start)| {
+            sample == ConsoleState::Standby && self.latest_awake().is_none_or(|awake| start > awake)
+        })
+    }
+
+    fn latest_awake(&self) -> Option<Instant> {
+        self.on_since.max(self.awake_at)
+    }
+
+    fn standby_baseline(&self, sent_at: Instant) -> Option<(Instant, Instant)> {
+        self.probe_run
+            .filter(|_| self.probe_standby_trusted())
+            .map(|(_, start)| (sent_at, start))
+    }
+
+    fn classify_start(&mut self, sample: ConsoleState, sent_at: Instant, rest: Duration) -> bool {
         match sample {
             ConsoleState::Standby => {
-                self.start_baseline = Some(sent_at);
+                self.start_baseline = self.standby_baseline(sent_at);
                 self.start_first = None;
-                self.start = None;
+                let settled = self
+                    .start_baseline
+                    .is_some_and(|(_, start)| sent_at.saturating_duration_since(start) >= rest);
+                if settled
+                    || !self
+                        .start
+                        .as_ref()
+                        .is_some_and(|e| matches!(e.state, StartState::Rejected { .. }))
+                {
+                    self.start = None;
+                }
             }
             ConsoleState::Awake => {
                 self.start_baseline = None;
                 self.start_first = None;
             }
-            ConsoleState::Unreachable if self.start.is_none() && self.start_baseline.is_some() => {
-                if let Some(first) = self.start_first.take() {
-                    self.start = Some(StartEvidence {
-                        at: first,
-                        last_standby: self.start_baseline.take().expect("standby baseline"),
-                        state: StartState::Pending,
-                    });
-                    return true;
-                }
-                self.start_first = Some(sent_at);
+            ConsoleState::Unreachable if self.start.is_none() => {
+                return self.classify_unreachable(sent_at, rest);
             }
             ConsoleState::Unreachable => {}
         }
         false
+    }
+
+    fn classify_unreachable(&mut self, sent_at: Instant, rest: Duration) -> bool {
+        let Some((last, start)) = self.start_baseline else {
+            return false;
+        };
+        if self.latest_awake().is_some_and(|awake| start <= awake)
+            || sent_at.saturating_duration_since(start) < rest
+        {
+            self.start_baseline = None;
+            self.start_first = None;
+            return false;
+        }
+        if let Some(first) = self.start_first.take() {
+            self.start = Some(StartEvidence {
+                at: first,
+                last_standby: last,
+                state: StartState::Pending,
+                late_repeats: 0,
+                last_late: None,
+            });
+            self.start_baseline = None;
+            true
+        } else {
+            self.start_first = Some(sent_at);
+            false
+        }
     }
 }

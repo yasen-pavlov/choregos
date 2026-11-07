@@ -84,8 +84,10 @@ pub struct RoleState {
     pub last_event: Option<String>,
     pub direct: Option<(ConsoleState, DateTime<Utc>)>,
     pub on_since: Option<Instant>,
+    probe_run: Option<(ConsoleState, Instant)>,
+    awake_at: Option<Instant>,
     start: Option<StartEvidence>,
-    start_baseline: Option<Instant>,
+    start_baseline: Option<(Instant, Instant)>,
     start_first: Option<Instant>,
     poll_at: Option<Instant>,
     awaiting: bool,
@@ -98,6 +100,8 @@ impl Default for RoleState {
             last_event: None,
             direct: None,
             on_since: None,
+            probe_run: None,
+            awake_at: None,
             start: None,
             start_baseline: None,
             start_first: None,
@@ -108,20 +112,78 @@ impl Default for RoleState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StartEvidence {
     at: Instant,
     last_standby: Instant,
     state: StartState,
+    late_repeats: u8,
+    last_late: Option<Instant>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum StartState {
     Pending,
-    Woke { decision: u64 },
+    Woke {
+        decision: u64,
+    },
     Superseded,
-    Confirmed { decision: Option<u64> },
-    Rejected,
+    Confirmed {
+        decision: Option<u64>,
+    },
+    Rejected {
+        decision: Option<u64>,
+        winner: String,
+    },
+}
+
+/// Current consecutive direct samples; timestamps date query send, not receipt.
+#[derive(Clone, Copy, Debug)]
+struct DirectRun {
+    state: DirectPower,
+    start: DateTime<Utc>,
+    last: DateTime<Utc>,
+    previous: Option<DateTime<Utc>>,
+    count: u32,
+}
+
+impl DirectRun {
+    fn observe(run: &mut Option<Self>, state: DirectPower, at: DateTime<Utc>) {
+        if let Some(current) = run {
+            if at < current.last {
+                return;
+            }
+            if current.state == state {
+                current.count = current.count.saturating_add(1);
+                current.previous = Some(current.last);
+                current.last = at;
+                return;
+            }
+        }
+        *run = Some(Self {
+            state,
+            start: at,
+            last: at,
+            previous: None,
+            count: 1,
+        });
+    }
+
+    fn sustained(self, tv: bool) -> bool {
+        if self.state == DirectPower::Unreachable {
+            tv && self.count >= 2
+        } else {
+            self.count >= 3 && self.last - self.start >= chrono::Duration::seconds(4)
+        }
+    }
+
+    fn evidence_at(self) -> DateTime<Utc> {
+        if self.state == DirectPower::Unreachable {
+            self.last
+        } else {
+            self.start
+        }
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub struct HaState {
@@ -330,6 +392,8 @@ pub struct Engine {
     pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>,
     tv_last_usable: Option<(DirectPower, DateTime<Utc>)>,
     receiver_last_usable: Option<(DirectPower, DateTime<Utc>)>,
+    tv_run: Option<DirectRun>,
+    receiver_run: Option<DirectRun>,
     tv_direct_unavailable: bool,
     tv_unreachable_streak: u8,
     pub bridge_online: bool,
@@ -382,6 +446,8 @@ impl Engine {
             receiver_direct: None,
             tv_last_usable: None,
             receiver_last_usable: None,
+            tv_run: None,
+            receiver_run: None,
             tv_direct_unavailable: false,
             tv_unreachable_streak: 0,
             bridge_online: false,
@@ -578,6 +644,7 @@ impl Engine {
     fn handle_tv_direct_unavailable(&mut self) {
         self.tv_direct = None;
         self.tv_last_usable = None;
+        self.tv_run = None;
         self.tv_unreachable_streak = 0;
         self.tv_direct_unavailable = true;
         self.refresh_tv_sources();
@@ -585,6 +652,7 @@ impl Engine {
 
     fn observe_receiver_power(&mut self, state: DirectPower, at: DateTime<Utc>) {
         self.receiver_direct = Some((state, at));
+        DirectRun::observe(&mut self.receiver_run, state, at);
         if state != DirectPower::Unreachable {
             Self::remember_direct(&mut self.receiver_last_usable, state, at);
         }
@@ -644,6 +712,7 @@ impl Engine {
 
     fn observe_tv_power(&mut self, state: DirectPower, at: DateTime<Utc>) {
         self.tv_direct = Some((state, at));
+        DirectRun::observe(&mut self.tv_run, state, at);
         self.tv_unreachable_streak = if state == DirectPower::Unreachable {
             self.tv_unreachable_streak.saturating_add(1)
         } else {
@@ -668,7 +737,7 @@ impl Engine {
         self.release_unconfirmed_starts();
         self.cancel_reconfigured_expectations(&config);
         let bridge_changed = self.config.bridge != config.bridge;
-        self.config = config;
+        let previous_config = std::mem::replace(&mut self.config, config);
         self.intent.receiver_source = None;
         self.tv_direct = None;
         self.receiver_direct = None;
@@ -676,6 +745,8 @@ impl Engine {
         self.resync_at = None;
         self.tv_last_usable = None;
         self.receiver_last_usable = None;
+        self.tv_run = None;
+        self.receiver_run = None;
         self.tv_direct_unavailable = false;
         self.tv_unreachable_streak = 0;
         self.refresh_tv_sources();
@@ -688,8 +759,16 @@ impl Engine {
         for device in &self.config.device {
             let role = self.roles.entry(device.role.clone()).or_default();
             role.direct = None;
+            let previous_probe = previous_config
+                .device
+                .iter()
+                .find(|old| old.role == device.role)
+                .and_then(|old| old.probe.as_ref());
+            if previous_probe != device.probe.as_ref() {
+                role.probe_run = None;
+                role.start_baseline = None;
+            }
             role.start = None;
-            role.start_baseline = None;
             role.start_first = None;
             role.poll_at = (role.power == RolePower::On && device.presence == Presence::Poll)
                 .then_some(now + Duration::from_secs(self.config.timing.presence_poll_s));
@@ -705,7 +784,9 @@ impl Engine {
             self.signals.clear();
             self.intent.active_role = None;
             for role in self.roles.values_mut() {
-                *role = RoleState::default();
+                role.power = RolePower::Off;
+                role.last_event = None;
+                role.poll_at = None;
             }
         } else {
             self.bus.configure_identification(
@@ -1645,7 +1726,7 @@ impl Engine {
         if track.intended.as_deref() != intended {
             track.since = None;
             track.intended = intended.map(str::to_owned);
-            self.close_drift_field(track, index);
+            self.close_drift_field(track, index, true);
         }
         let Some(intended) = self.drift_intended(subject, field) else {
             track.since = None;
@@ -1669,7 +1750,7 @@ impl Engine {
         if expectations::sample_agrees(via, observed, intended) {
             track.since = None;
             if track.newer_than_onset(at) {
-                self.close_drift_field(track, index);
+                self.close_drift_field(track, index, false);
             }
         } else if let Some((detail, trigger)) =
             self.drift_onset(track, index, now, input, (intended, sample))
@@ -1721,14 +1802,17 @@ impl Engine {
         }
     }
 
-    fn close_drift_field(&mut self, track: &mut DriftTrack, index: usize) {
+    fn close_drift_field(&mut self, track: &mut DriftTrack, index: usize, intent_change: bool) {
         if track.open.is_none() {
             return;
         }
         let (subject, field) = DRIFT_FIELDS[index];
-        let observed = self
-            .newest_independent_sample(subject, field, self.drift_sources(subject, field), None)
-            .map(|(via, value, _)| (via, value));
+        let sample = if intent_change {
+            self.drift_closure_sample(subject, field, self.drift_sources(subject, field))
+        } else {
+            self.newest_independent_sample(subject, field, self.drift_sources(subject, field), None)
+        };
+        let observed = sample.map(|(via, value, _)| (via, value));
         if let Some(detail) = Self::resolved_drift(track, observed) {
             let via = detail.via;
             self.record_drift("drift_resolved", detail, DecisionTrigger::Observation(via));
@@ -1739,7 +1823,7 @@ impl Engine {
         for index in 0..DRIFT_FIELDS.len() {
             let mut track = std::mem::take(&mut self.drift_tracks[index]);
             track.since = None;
-            self.close_drift_field(&mut track, index);
+            self.close_drift_field(&mut track, index, false);
             self.drift_tracks[index] = track;
         }
     }
@@ -1795,13 +1879,16 @@ impl Engine {
         }
         let id = self.next_decision_id;
         self.next_decision_id = id.checked_add(1).expect("decision id exhausted");
-        let expectations = self.decision_expectations(role.as_deref(), to, reason, &actions);
+        let mut expectations = self.decision_expectations(role.as_deref(), to, reason, &actions);
+        let contested = self.prepare_expectations(&mut expectations);
         let verdict = expectations::verdict(&expectations);
         if verdict == Verdict::Pending {
             self.pending_decisions.insert(
                 id,
                 PendingDecision::new(self.now, self.wall, expectations.clone(), |expectation| {
-                    self.expectation_contested(expectation)
+                    contested.iter().any(|(subject, field)| {
+                        subject == &expectation.subject && *field == expectation.field
+                    })
                 }),
             );
         }

@@ -2,6 +2,81 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-07 (evening) — Probe trust and same-field closure
+
+- E3: entering rest produced only 9–10 seconds of Standby before a roughly
+  37-second dark phase, falsely resembling a boot. Require trusted settled rest
+  for `probe.rest_s` (default 30, inclusive bounds 5–300 seconds) before the
+  first Unreachable query. Real measured boots had at least 54 seconds of rest.
+- E4: after an interrupted sleep, discovery kept reporting Standby while CEC
+  had reactivated the console. Trust Standby only if its consecutive run began
+  strictly after the latest Off→On transition and latest configured On frame,
+  including rejected/suppressed late frames. Use this for pre-settlement,
+  ongoing/deadline expectations and the start baseline; Awake is unaffected.
+- E5: quick re-wakes may go directly Standby→Awake with no dark phase. There
+  is then no start evidence; preserve ordinary announcement-order takeover.
+- E6: repeats during boot can make the receiver follow the loser again, and
+  the first Standby can be ignored. After the initial late announcement, allow
+  three repeat sequences per episode; the fourth and later repeats within
+  `boot_s` are suppressed. Would remains hypothetical and preserves live takeover.
+- E7: a later same-field command closes every older pending field before its
+  new expectation exists. Direct runs need three equal samples spanning four
+  seconds; TV Unreachable needs two fresh failures. HA needs one fresh usable
+  sample. Matching/contradicting/no run closes met/missed/unknown; latency uses
+  the run start (second fresh failure for TV Unreachable). CEC/probe closure
+  keeps cancellation semantics, including checked CEC success and control slots.
+  Opposite direct closure to unknown passes contested shutdown-lag protection
+  forward: no pre-settlement or single-read success, but a fresh sustained run
+  may meet early. A run-settled opposite leaves the new field ordinary.
+- Exact quick-cycle trace outcomes supersede approximate initial expectations:
+  the first short Off is unknown; the following wake is missed/unreachable
+  when the next Off closes it, because a sustained contradictory run exists.
+  That next Off pre-settles met/0. The following wake meets at 4002 ms
+  query-send latency and final Off at 6109 ms. No later cycle votes backward.
+- E8 root cause was not intent ordering: one failed TV read replaced raw On
+  just before the new intent. A single failure is unusable, so the closure
+  lookup returned none despite retained usable On. Intent-change drift closure
+  now uses retained direct evidence when current raw evidence is unusable.
+  Ordinary drift, pre-settlement and dashboard remain raw; entering Shadow also
+  uses raw usable evidence or unknown, never retained fallback. Pairing/reload
+  clears retained TV/receiver evidence. No Snapshot/schema changes are needed.
+- Keep the observation-first rollout (`start_wake = "would"`) pending ring review.
+
+### Accepted review amendments
+
+- A rejected episode survives short/untrusted rest-entry Standby samples:
+  update its baseline only until trusted rest reaches `rest_s` or boot expires.
+  Keep the winner in `StartState::Rejected`, not a
+  separate role field. Every configured On frame advances `awake_at`, so a
+  subsequent rejected repeat invalidates an intervening Standby run.
+- Preserve probe-run trust and its settled-rest clock on reload when that role's
+  probe configuration is unchanged; reset both when it changes. Continue clearing
+  raw observations/start episodes. Same-config reload must not launder stale rest.
+- Act repeats require a different current active role. If the winner releases,
+  end the episode and treat the console's next frame as ordinary wake, without
+  stream-path reversal. Would uses the stored winner only while the console
+  holds the room live.
+- On frames within `takeover_settle_ms` of the previous late row are one
+  announcement, with no further row, actions or repeat count. Three repeat
+  sequences are allowed after the initial reversal; not three individual frames.
+- Remove obsolete same-field pre-settlement guards now made unreachable by
+  closure. Keep retained drift fallback exclusive to intent changes, not Shadow.
+- Review regression coverage adds rejected rest-entry/+17-second repeat,
+  delayed darkness, coalesced `0D`/`82`, winner release, probe-preserving/resetting
+  reloads and raw-evidence Shadow closure. The review fixes leave golden bytes
+  unchanged; no re-blessing is needed.
+- Final would-mode parity fix: coalesced and over-cap frames suppress only the
+  hypothetical row; ordinary live takeover still runs. Regression tests put a
+  different live source between the first late frame and suppressed next frame.
+- Trusted Standby lasting `rest_s` ends a rejected episode before boot expiry.
+  With `boot_s = 90`, rest at 68–108 seconds allows darkness at 109 seconds to
+  create a new start at 110 seconds; the On frame at 123 seconds is not late.
+  Short/untrusted rest still preserves the original episode.
+- Reduce private probe-run tracking to `(ConsoleState, Instant)` and remove the
+  unused wall timestamp parameter. Raw direct samples retain query-send wall time
+  for reporting. No snapshot or persistence changes.
+
+
 ## 2026-11-07 — Console start evidence and startup source guard
 
 - A console's discovery responder went from rest-mode Standby to Unreachable

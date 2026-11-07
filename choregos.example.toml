@@ -119,9 +119,12 @@ off = ["standby", "inactive_source", "power_standby"]
 takeover = "cec_standby"
 presence = "events"
 # Optional Sony console truth source; Remote Play and UDP reachability required:
-# probe = { kind = "ps5", host = "console.lan", port = 9302, idle_poll_s = 2, start_wake = "off", boot_s = 30 }
+# probe = { kind = "ps5", host = "console.lan", port = 9302, idle_poll_s = 2, start_wake = "off", boot_s = 30, rest_s = 30 }
 # start_wake: off (ordering only), would (observe first), act (early room wake).
 # Unconfirmed starts retract on Standby or expire after boot_s; Remote Play can wake the room.
+# rest_s (5–300 s) requires settled, trusted Standby before a dark-phase start.
+# Standby runs must begin after every On frame (accepted or ignored); dark-free re-wakes use CEC order.
+# Same-probe reload preserves the run/rest clock; changed probe configuration resets it.
 
 [[device]]
 role = "console_a"

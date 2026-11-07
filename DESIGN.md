@@ -352,15 +352,30 @@ Per role: `Off | On`, derived from configured `on`/`off` bus signals, commands,
 or opt-in console start evidence. State changes produce decisions;
 duplicates (same state) are ignored (replaces today's `rbe` nodes).
 `RoleState.on_since: Option<Instant>` records each Off→On transition.
+Every configured On frame also sets private `awake_at`, even when rejected or
+suppressed as a late announcement. Probe Standby is trusted only when its
+consecutive run began strictly after `max(on_since, awake_at)` (or neither
+exists). Every probe sample updates private
+`probe_run: Option<(ConsoleState, Instant)>`; Awake/Unreachable
+breaks Standby runs. This gates expectation pre-settlement, fresh/deadline
+evaluation and the start-classifier baseline, never Awake evidence.
 Probe roles keep private, non-persisted `start: Option<StartEvidence>` with
 first-Unreachable query-send `at`, `last_standby: Instant`, and lifecycle state
-Pending / Woke { decision } / Superseded / Confirmed { decision } / Rejected.
+Pending / Woke { decision } / Superseded / Confirmed { decision } /
+Rejected { decision, winner }. Rejected episodes retain their winner and repeat
+clock across short/untrusted Standby runs. A trusted run reaching `rest_s` ends
+the rejected episode even before `boot_s`, allowing a subsequent real start.
 All direct samples date the query send, not its reply. Two consecutive
-Unreachable samples after Standby establish a start; only a configured On frame
-confirms it. Standby retracts unconfirmed evidence and `boot_s` expires it.
+Unreachable samples after a trusted Standby run lasting at least `probe.rest_s`
+(default 30, 5–300 seconds, measured at the first Unreachable send) establish a
+start; only a configured On frame confirms it. Standby retracts unconfirmed
+evidence and `boot_s` expires it.
 Warming/blocked roles defer retraction/expiry; warming deadlines clamp to
 `max(boot deadline, warm_until)`, blocked deadlines wait for usable identity.
 Reload/entering Shadow release unconfirmed early wakes before clearing evidence.
+An unchanged per-role probe configuration preserves its `probe_run` and rest
+baseline across reload. A changed probe resets both. Raw direct observations and
+start episodes are still cleared; reload cannot turn an old Standby run trustworthy.
 
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
@@ -399,7 +414,17 @@ the loser (including a still-On role; record its actual from state), and stops i
 per policy. Then broadcast `86 <winner PA>` if verified/known. Select the winner's
 different HA source only when no settle is pending for it. Parent standby
 verification/expectations to this row; source expectations require an emitted
-select. Preserve winner intent/settle/expectations. Rejected suppresses repeats.
+select. Preserve winner intent/settle; newer same-field expectations close older
+ones as specified below. After the initial reversal, allow three repeat sequences
+per episode within `boot_s`; fourth/later repeats are suppressed. Configured On
+frames less than `takeover_settle_ms` after the last reversal row belong to that
+same announcement: no additional hypothetical row or repeat count. Act suppresses
+its reversal actions; would still executes ordinary live takeover. The same live
+parity applies to over-cap frames. A genuine repeat's stop is deliberate.
+In act, repeats require another active role; if its winner has released, end the
+episode and accept an ordinary wake. Would can reuse its stored winner only while
+the losing console holds the live room; its rows remain hypothetical. After boot
+expiry, use ordinary arrival-order wake behavior.
 An unconfirmed evidence-only On role is also marked Off with actionless
 `taken_over` when displacement cannot send a stop because its LA is unknown.
 
@@ -503,6 +528,9 @@ Optional probe keys `start_wake = "off" | "would" | "act"` and `boot_s = 30`
 (5–120 seconds) control start evidence above. Unknown keys are rejected;
 these keys belong inside `probe`, so non-off policy requires a probe.
 There is no cross-bound between boot duration and window poll cadence.
+Quick rest-to-awake cycles may have no dark phase and therefore no start evidence;
+they retain ordinary CEC announcement ordering. `rest_s` filters rest-entry dark
+phases, not network faults or Remote Play.
 
 ### 5.5.1 Expectations and verdicts
 
@@ -536,18 +564,35 @@ Standby with only a CEC leg uses `takeover_settle_ms × (standby_retries + 1)`; 
 uses `verify.probe_window_s × 1000`. With both legs, use the greater deadline
 so independent confirmation can arrive after CEC retries exhaust. The CEC
 retry schedule and verification-slot lifetime are unchanged.
-At creation only, the newest sample before the decision across listed independent sources (`ha`, `tv_direct`, `denon`, or `ps5`, never `cec`) settles `met` with zero latency if it agrees and is in `[decision.at - deadline_ms, decision.at)`. For direct-sourced fields, skip pre-settlement while any same-field expectation is pending. If an opposite-value expectation is pending at creation, mark the new direct expectation contested: it can settle only at its deadline against the newest usable fresh sample. HA fields retain the earlier rule: the sample must postdate every pending decision carrying the same subject/field. If all expectations meet at creation, the decision is immediately `achieved`.
-Contested deadline evaluation retains the newest usable direct value and timestamp
-alongside each raw cache. A transient unusable sample cannot erase that evidence:
-On at +30 s then one Unreachable at +44 s still meets at the TV's +45 s deadline.
-Only expired contested expectations consult these retained samples; ordinary
-expectations, pre-settlement, drift and UI continue to use the current raw sample.
-Reload clears both caches; pairing loss clears both TV caches.
+Before creating any newer subject/field expectation, close every older pending
+field, regardless of expected value. For TV/receiver direct evidence, use the
+current sustained run: three equal samples spanning at least four seconds, whose
+run start is strictly after the older decision. TV Unreachable instead requires
+two consecutive fresh samples, dated at the second; receiver Unreachable is
+unusable. Matching runs close met (latency from run start), contradicting runs
+close missed, and no qualifying run closes unknown. HA uses one fresh usable
+sample. CEC/probe fields retain cancellation semantics: checked CEC becomes
+cec_only, otherwise unknown; independent samples do not manufacture cancellation
+success, and completed legs stay completed. Closing reporting never changes
+CEC retry/control slots.
+At creation only, a recent matching independent sample in
+`[decision.at - deadline_ms, decision.at)` may pre-settle met/0. If an opposite
+direct field just closed unknown, the new field inherits contested shutdown-lag
+protection: no pre-settlement or single-sample met. It can meet early on a fresh
+sustained run, with latency dated at the run start, or settle at its deadline.
+Opposite fields closed met/missed on a run leave the new field ordinary; ordinary
+fields still meet on their first fresh match. No older field survives into a
+later same-field decision's cycle.
+Retain the newest usable direct value/timestamp beside raw caches for expired
+contested evaluation and intent-change drift closure only. Ordinary verdicts,
+pre-settlement, continuing drift and UI use current raw samples. Reload clears
+TV/receiver raw, retained and run caches; pairing loss clears all TV caches.
 On every event, evaluate pending fields against observations newer than the
 decision: HA power/playback uses `changed`, source attributes use `updated`,
-direct observations use their timestamps. Uncontested independent sources settle
-a fresh match immediately with actual latency; contested direct fields wait for
-their deadline. The CEC leg is confirmed only by the verification's due confirmed check,
+direct observations use their query-send timestamps. Uncontested independent
+sources settle a fresh match immediately with actual latency; contested direct
+fields require a sustained run before deadline. The CEC leg is confirmed only by
+the verification's due confirmed check,
 with fresh Standby/Transition still present, never by raw frame sampling.
 A brief Standby followed by On before that check is not success; exhaustion with
 fresh On is missed, and without usable evidence is unknown. With a probe, retain
@@ -623,8 +668,10 @@ per onset; further disagreement emits nothing until resolution.
 Intent changes close the old drift immediately and reset grace before comparing
 the new intent. Reload resets all grace clocks, retains the open set until
 re-evaluation, and delays evaluation through the existing three-second warm-up.
-Entering Shadow resolves every open drift using the current usable observation
-or `unknown`, and clears grace in the command pass before cancelling expectations.
+Entering Shadow resolves every open drift using the current raw usable observation
+or `unknown` (never retained fallback), and clears grace in the command pass
+before cancelling expectations. Retained fallback belongs only to intent-change
+closure, not Shadow entry.
 Shadow never starts drift. Grace deadlines join `next_deadline`; clearing
 grace on unusable evidence also prevents expired-deadline Tick loops.
 
