@@ -139,7 +139,7 @@ it without webOS or after pairing loss. TV `unreachable` becomes evidence only
 after two consecutive failures, agreeing with Off and refuting On. A single
 failure and receiver/probe Unreachable are unusable. Pairing loss clears the
 frozen cache; reload restores direct observation and resets the failure streak.
-Polling never sends corrective actions and is disabled in shadow mode.
+TV/receiver polling never sends corrective actions and is disabled in shadow mode.
 Room intent is separate from observations: an Off intent always sends the next
 TV/receiver wake even if HA still reports On from before the off request.
 Intent and direct observations are not persisted.
@@ -150,9 +150,26 @@ evidence because its HTTP service remains reachable in standby. Receiver
 control and source observation stay on HA; raw function codes are traced only.
 An optional per-device `probe = { kind = "ps5", host = "console.lan", port = 9302 }`
 adds a read-only Sony console power source. Remote Play must be enabled and UDP
-9302 reachable from the Choregos host. After its wake or dispatched CEC stop,
-the runtime polls until Awake/Standby or the configured window expires.
+9302 reachable from the Choregos host. Poll immediately and every `idle_poll_s`
+(default 2 seconds); wake/dispatched CEC stop replaces idle with a full
+`verify.probe_window_s` window at `probe_poll_ms`, then idle resumes.
 Unreachable is not proof of standby. Role cards retain the last direct reading.
+
+Console `start_wake = "off"` tracks boot ordering only; `"would"` records inert
+early-wake/reversal decisions for observation before enabling `"act"`.
+Direct samples date query send, not reply. Two Unreachable samples after Standby
+bound a boot to `(last Standby send, first Unreachable send]`.
+Only a configured CEC On frame confirms it. Standby retracts an unconfirmed
+start; `boot_s` (default 30 seconds) expires it. Act uses normal wake and release,
+including room-off delay. Remote Play can look like a start and wake the room.
+A console is newer only if its last Standby is newer than the active remote
+press; ambiguous intervals favor the active device. Idle cadence is ordering
+resolution (choose one second for finer ordering). Would uses act's eligibility
+without executing its plan and preserves today's ordinary arrival-order takeover.
+Warming/blocked evidence defers expiry; reload/entering Shadow releases an
+unconfirmed early wake before clearing it.
+At startup, resync announcements cannot wake an Unknown room unless receiver
+power is known On within five seconds; bus identity learning still proceeds.
 
 Start in `shadow` mode (the default in the example), watch the **Decisions**
 page through a few evenings, then switch to `active` from the UI or over MQTT.
@@ -188,7 +205,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
 | `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV deadline covers boot-to-service (observed 17–30 s), not HA reconnect lag; latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Continuous TV idle cadence: `tv_idle_poll_s = 15` (5–120 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
-| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302}` |
+| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302, idle_poll_s=2, start_wake="off", boot_s=30}`. Probe idle bounds 1–60 seconds; boot bounds 5–120; start policy `off` / `would` / `act`, live-reloadable. |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
 
 Direct receiver cadence is `receiver_poll_ms = 1000` (500–10000 ms),

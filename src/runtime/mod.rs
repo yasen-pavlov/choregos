@@ -101,7 +101,9 @@ impl Adapters {
             .filter(|device| device.probe.is_some())
         {
             let wake = engine.decisions.iter().any(|decision| {
-                decision.role.as_deref() == Some(&device.role) && decision.to == Some(RolePower::On)
+                !decision.would
+                    && decision.role.as_deref() == Some(&device.role)
+                    && decision.to == Some(RolePower::On)
             });
             let stopped = engine.identity.roles.get(&device.role).is_some_and(|la| {
                 sent.iter()
@@ -684,7 +686,7 @@ impl Runtime {
                     .map(|action| {
                         format!(
                             "{}{}",
-                            if executor::suppressed(self.engine.mode(), action) {
+                            if decision.would || executor::suppressed(self.engine.mode(), action) {
                                 "would: "
                             } else {
                                 ""
@@ -694,7 +696,8 @@ impl Runtime {
                     })
                     .collect(),
                 // A service-start boundary is an observed fact, not a shadow intent.
-                would: self.engine.mode() == Mode::Shadow && decision.reason != "service_started",
+                would: decision.would
+                    || (self.engine.mode() == Mode::Shadow && decision.reason != "service_started"),
                 expectations: decision.expectations.clone(),
                 verdict: decision.verdict,
                 drift: decision.drift.clone(),

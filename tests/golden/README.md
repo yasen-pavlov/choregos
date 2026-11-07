@@ -1,5 +1,60 @@
 # Golden replay corpus
 
+## 2026-11-07 — Console start evidence and startup source guard
+
+Five original cases stay byte-identical. In `aether-restart-mid-takeover` only
+the first wake's provenance changes: at 09:15:40.768 UTC, id 1 now records
+`ActiveSource` / frame `822300` instead of `ReportPhysicalAddress` / `84230004`.
+The startup guard holds the earlier activation through identity verification,
+then adopts it with receiver On. Its timestamp, role, transition, empty actions,
+expectations and verdict are unchanged, as are all remaining eighteen rows.
+The other intentional original-corpus change is the unbound discard below.
+Core `would` is omitted when false, preserving every other row's bytes.
+
+Accepted review amendments add one actionless `startup_source_ignored` row to
+`aether-streamer-to-console-pause-standby`: at 2026-11-01 22:07:28.095 UTC,
+trigger frame LA 1 → 0 `9000`, role None. Its LA remains unbound at the startup
+window's deadline with no known-On receiver. Previously that held input was
+silently lost. The original eighteen rows are otherwise identical after
+subtracting one from each new `id`, non-null `parent`, and `verdict_for`.
+No original timestamp, action, reason, expectation or verdict changes.
+The review round changes no other case's expected bytes; the E1 case rename
+below does not change its inputs or expected stream.
+
+**`aether-console-late-takeover-baseline` — 7 decisions + 4 verdict lines.**
+2026-11-07 12:57:30–12:59:30 UTC, with probe `start_wake = "would"`.
+Captured before continuous probing; the start-evidence rules are covered by
+injected replay tests with the independently measured timings. The trace has
+no idle Standby baseline or early Unreachable pair: its first probe sample is
+12:58:26.156, after Console B's CEC activation at 12:58:25.153.
+Do not invent the independent loop's missing second sample. Consequently this
+authentic golden proves would mode changes nothing live on this historical
+late takeover, rather than claiming early-start detection. No early-wake
+would row is expected without a baseline. The identity seed is unverified, so
+the first Streamer wake is reconstructed as ActiveSource at 12:58:17.529,
+not the earlier live power report.
+Console B then takes over, Streamer stops, Console B releases, and the room shuts
+off. Full would/act/off ordering and retraction/expiry are injected tests.
+
+**`aether-startup-resync-ignored` — 3 decisions + 1 verdict line.**
+2026-11-06 09:49:00–09:50:30 UTC. MQTT reconnect at 09:49:11.690 and retained
+status at 11.693 trigger resync. Kodi's `82 2200` arrives at 12.866, before its
+physical verification at 13.306. HA receiver Off at 11.704 is already known;
+the first direct receiver Off is at 13.345 (1.652 seconds after resync).
+The replay records actionless `startup_source_ignored` at verification time
+13.306, preserving the original `82` trigger and Unknown room intent.
+An authentic repeated `82` at 24.268 is outside the five-second guard and wakes
+normally, followed by source settle and a TV verdict. This second announcement
+at +12.6 seconds is the recorded world's reaction to the real wake: powering up
+the receiver re-enumerated the bus. Recorded receiver On and TV On are consequences
+of the old live controller's erroneous wake, not counterfactual observations;
+they are retained, not rewritten. This case proves
+the initial discard path, not that all later announcements are suppressed.
+
+Both cases use the ordinary `extract` window/availability/identity seeding,
+generic config derived from the captured behavior, and the standard public
+renames (including Console B role, while keeping `ps5` as the transport/via).
+
 ## 2026-11-06 — Direct TV truth source
 
 All seven configs use webOS: TV legs now list only `tv_direct`. HA remains
@@ -214,7 +269,7 @@ takes over with directed Standby/Give Device Power Status (`36`/`8F`). Streamer
 standby/wake cycles exercise delayed room-off and takeover-settled actions.
 The reason sequence matches the live ring for this window.
 
-**`aether-streamer-to-console-pause-standby` — 11 decisions.**
+**`aether-streamer-to-console-pause-standby` — 12 decisions + 7 verdict lines.**
 2026-11-01 22:05–23:50 UTC: Streamer wakes, enters standby quickly, wakes again,
 and yields to Console B. The takeover sends Play: Still/Standby/Give Device
 Power Status (`41 25`/`36`/`8F`); Console B's Inactive Source starts the off timer.

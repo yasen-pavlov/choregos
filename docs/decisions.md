@@ -2,6 +2,57 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-07 — Console start evidence and startup source guard
+
+- A console's discovery responder went from rest-mode Standby to Unreachable
+  9.6 seconds before its first CEC activation; Awake followed CEC by 3.5 seconds.
+  Two consecutive Unreachable samples after Standby establish a boot interval
+  `(last Standby send, first Unreachable send]`; time all direct samples at query
+  send, not reply. Expiry uses the first Unreachable send. Awake cannot confirm.
+  Only a configured On frame confirms; Standby retracts and `boot_s` expires
+  unconfirmed evidence. No evidence is persisted, restored or created in shadow.
+- Share immediate-first-read idle/action-window/idle polling across consoles,
+  TV and receiver. Console `idle_poll_s` defaults to 2 seconds (1–60);
+  `boot_s` defaults to 30 seconds (5–120). Windows run their full duration.
+- `start_wake` defaults to `off`: track ordering without early wake rows.
+  Roll out `would` first, inspecting inert `console_start` rows, before `act`.
+  Would rows carry full hypothetical actions but never mutate control slots,
+  intent, power, or expectations, and never enter the returned action vector.
+  Act uses the ordinary wake/release paths; a network blip or full shutdown can
+  retract/expire it. Remote Play is an explicit caveat, not another gate.
+- A console is newer only if its last Standby send is newer than the active
+  role's `on_since`; ambiguous intervals favor the active role. Idle cadence is
+  ordering resolution; one-second polling provides one-second resolution.
+  Would and act share eligibility (including warming, blocked, already On and
+  nonempty immediate plan) and do not require an LA. Ineligible starts are
+  silently Superseded; would never records an empty early-wake row.
+  Eligibility uses the actual preview action plan, not a duplicate effect predicate.
+- Displacement releases an unconfirmed evidence-only On role even before its
+  LA is known. Real late announcements release a still-On loser and report the
+  actual from state. Preserve the winner's intent, settle and expectations:
+  reassert its verified stream path, but skip HA source selection while its
+  settle owns it. Would keeps today's real arrival-order takeover.
+- Defer retraction/expiry while warming or blocked. Clamp boot deadlines to
+  warm-up completion and exclude blocked deadlines to avoid spinning.
+  Reload/entering Shadow releases unconfirmed early wakes before clearing them.
+  Keep evidence private, omit unused wall timestamps, and model confirmation/
+  rejection in the lifecycle enum rather than an independent flag.
+  Would starts also get a parented, actionless would expiry row on reload/Shadow.
+  Forget replay and receiver-On startup adoption pass configured signals through
+  the evidence-confirming path, preventing contradictory later expiry rows.
+- A startup Request Active Source was answered by an always-on player while
+  the room was off. Learn `82`, `90 00` and `84` replies without ordinary signal
+  buffering for five seconds while intent is Unknown. Adopt held signals only
+  when receiver power is On (direct first, else HA); discard for Off or unknown
+  at the deadline, recording `startup_source_ignored` once per resync.
+  Holding masks only the current signal, not role reconciliation of earlier
+  explicit wakes. At deadline, unbound holds return to ordinary buffers only
+  with receiver On; otherwise discard with role None. A second resync reports
+  discards before clearing its old window.
+- This is observed start evidence, not phase-4 prediction/anticipatory wake.
+  HA actuation is unchanged. Core `Decision.would` omits false on serialization;
+  existing replay rows keep their schema bytes.
+
 ## 2026-11-06 — Device truth sources for TV and receiver
 
 - HA webostv observes the same SSAP service as direct webOS, but 8–33 seconds

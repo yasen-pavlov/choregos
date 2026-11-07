@@ -1,0 +1,117 @@
+mode = "active"
+
+[mqtt]
+host = "192.0.2.50"
+port = 1883
+username = "choregos"
+client_id = "choregos"
+
+[bridge]
+kind = "aether"
+node = "cec-bridge"
+logical_address = 0
+
+[home_assistant]
+url = "http://192.0.2.50:8123"
+
+[tv]
+entity = "media_player.tv"
+
+
+wake = { kind = "wol", mac = "AA:BB:CC:DD:EE:FF", broadcast = "192.0.2.255", port = 9 }
+off = { kind = "webos", host = "192.0.2.40", key_env = "CHOREGOS_TV_KEY" }
+
+[receiver]
+entity = "media_player.receiver"
+select_source = true
+observe = { kind = "denon", host = "192.0.2.30", port = 8080 }
+
+[presets]
+timezone = "Europe/Berlin"
+[[presets.slot]]
+from = "09:00"
+to = "21:00"
+script = "script.listening_day"
+[[presets.slot]]
+from = "21:00"
+to = "24:00"
+script = "script.listening_evening"
+[[presets.slot]]
+from = "00:00"
+to = "09:00"
+script = "script.listening_night"
+
+[sonos]
+entity = "media_player.speakers"
+mute_switch = "switch.speakers_mute"
+volume_from = ["streamer"]
+
+[timing]
+off_delay_s = 3
+takeover_settle_ms = 2000
+presence_poll_s = 5
+presence_misses = 2
+identify_retry_s = 10
+
+[fake_tv]
+replies = false
+power_status = "always_on"
+cec_version = "1.4"
+osd_name = "TV"
+
+[[device]]
+role = "streamer"
+name = "Streamer"
+kind = "playback"
+match = { vendor = "0010FA" }
+source = "Streamer"
+on = ["image_view_on", "text_view_on", "active_source", "power_on"]
+off = ["standby", "inactive_source", "power_standby"]
+takeover = "cec_pause_standby"
+presence = "events"
+
+[[device]]
+role = "kodi"
+name = "Kodi (kodi)"
+kind = "recording"
+match = { osd = "Kodi" }
+source = "Kodi"
+on = ["image_view_on", "active_source"]
+off = ["standby", "inactive_source", "power_standby"]
+takeover = "ha_media_stop"
+media_player = "media_player.kodi"
+presence = "events"
+
+[[device]]
+role = "console_b"
+name = "Console B"
+kind = "playback"
+match = { vendor = "080046", osd = "Console B" }
+source = "Console B"
+on = ["image_view_on", "text_view_on", "active_source"]
+off = ["standby", "inactive_source", "power_standby"]
+takeover = "cec_standby"
+verify_standby = false
+presence = "events"
+probe = { kind = "ps5", host = "192.0.2.20" }
+
+[[device]]
+role = "console_a"
+name = "Console A"
+kind = "playback"
+match = { vendor = "0009BF", osd = "Console A" }
+source = "Console A"
+on = ["report_physical_address", "image_view_on", "active_source"]
+off = ["standby", "inactive_source"]
+takeover = "cec_standby"
+verify_standby = false
+presence = "poll"
+
+[web]
+bind = "0.0.0.0:8095"
+public_url = "https://choregos.example.com"
+[web.oidc]
+issuer = "https://auth.example.com/application/o/choregos/"
+client_id = "choregos"
+[web.local_login]
+username = "admin"

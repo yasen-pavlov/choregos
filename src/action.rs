@@ -72,6 +72,7 @@ pub enum TimerKind {
     StandbyVerification,
     Warmup,
     DriftGrace,
+    ConsoleBoot,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -218,6 +219,8 @@ pub struct Decision {
     pub to: Option<RolePower>,
     pub reason: String,
     pub actions: Vec<Action>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub would: bool,
     pub expectations: Vec<Expectation>,
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -71,7 +71,7 @@ receiver_poll_ms = 1000           # direct receiver action-window cadence, 500�
 receiver_window_s = 30            # full duration, 5–300 s; >= max(receiver_s, receiver_off_s)
 receiver_idle_poll_s = 15         # continuous direct receiver idle polling, 5–120 seconds
 probe_poll_ms = 2000              # configured console probes, 500–10000 ms
-probe_window_s = 45               # stop at target or deadline, 5–300 seconds
+probe_window_s = 45               # full action window, never stops at target, 5–300 seconds
 tv_s = 45                        # TV boot-to-service window (observed 17–30 s), not HA reconnect allowance
 receiver_s = 10                  # receiver on deadline; direct latency measures the device itself
 receiver_off_s = 20              # receiver off deadline; with direct observation not an HA polling allowance
@@ -119,7 +119,9 @@ off = ["standby", "inactive_source", "power_standby"]
 takeover = "cec_standby"
 presence = "events"
 # Optional Sony console truth source; Remote Play and UDP reachability required:
-# probe = { kind = "ps5", host = "console.lan", port = 9302 }
+# probe = { kind = "ps5", host = "console.lan", port = 9302, idle_poll_s = 2, start_wake = "off", boot_s = 30 }
+# start_wake: off (ordering only), would (observe first), act (early room wake).
+# Unconfirmed starts retract on Standby or expire after boot_s; Remote Play can wake the room.
 
 [[device]]
 role = "console_a"
