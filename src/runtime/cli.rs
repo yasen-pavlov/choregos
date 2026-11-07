@@ -815,7 +815,7 @@ mod tests {
                 },
             ),
             (
-                4000,
+                6000,
                 TraceEntry::Received {
                     bridge,
                     frame: Frame::from_hex(8, 15, "84230004").unwrap(),
@@ -849,7 +849,7 @@ mod tests {
             .filter(|row| row.get("verdict_for").is_some())
             .collect();
         assert_eq!(verdicts.len(), 2);
-        assert_eq!(verdicts.last().unwrap()["at"], "2026-10-30T12:00:49Z");
+        assert_eq!(verdicts.last().unwrap()["at"], "2026-10-30T12:00:51Z");
     }
 
     #[test]
@@ -1055,10 +1055,10 @@ mod tests {
         runner.finish(&mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("streamer"), "{text}");
-        assert!(text.contains("takeover_settled"), "{text}");
+        assert!(text.contains("startup_source_ignored"), "{text}");
         assert!(!text.contains("command_standby"), "{text}");
         let engine = runner.engine.unwrap();
-        assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+        assert_eq!(engine.intent.active_role, None);
         assert_eq!(engine.bus.entries[&4].vendor, Some(0x0010fa));
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("takeover_settled"), "{text}");
+        assert!(text.contains("startup_source_ignored"), "{text}");
         assert!(text.contains(r#""observed":"absent""#), "{text}");
     }
 

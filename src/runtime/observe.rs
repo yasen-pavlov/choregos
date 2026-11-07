@@ -1,4 +1,4 @@
-//! Continuous direct power observation and action-scoped console windows.
+//! Continuous direct power observation with full-duration action windows.
 use super::{Input, denon, probe, webos};
 use crate::{
     config::{Config, ProbeConfig, ReceiverObserveConfig, TvOffConfig},
@@ -16,13 +16,14 @@ use std::{
 };
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 
+type ConsoleTask = (Option<(ConsoleState, Instant)>, JoinHandle<()>);
 pub(super) struct Observer {
     tx: mpsc::Sender<Input>,
     active: Arc<AtomicBool>,
     pairing_blocked: Arc<AtomicBool>,
     task: Mutex<Option<JoinHandle<()>>>,
     receiver_task: Mutex<Option<JoinHandle<()>>>,
-    consoles: Mutex<BTreeMap<String, (ConsoleState, JoinHandle<()>)>>,
+    consoles: Mutex<BTreeMap<String, ConsoleTask>>,
 }
 
 impl Observer {
@@ -40,7 +41,12 @@ impl Observer {
     /// Start continuous observation after adapters start (including reload).
     pub fn start(&self, config: Arc<Config>) {
         self.start_tv(config.clone(), false);
-        self.receiver(config, false);
+        self.receiver(config.clone(), false);
+        for device in &config.device {
+            if device.probe.is_some() {
+                self.start_console(config.clone(), &device.role, None);
+            }
+        }
     }
 
     pub fn set_mode(&self, mode: Mode, config: &Config) {
@@ -91,6 +97,7 @@ impl Observer {
                         .tv_webos_key
                         .as_ref()
                         .expect("checked before spawning");
+                    let at = Utc::now();
                     let state = match webos::power_state(host, *port, key).await {
                         Ok(state) => state,
                         Err(error) if error.is::<webos::PairingRequired>() => {
@@ -104,10 +111,7 @@ impl Observer {
                         }
                         Err(_) => DirectPower::Unreachable,
                     };
-                    Ok(Event::TvPower {
-                        state,
-                        at: Utc::now(),
-                    })
+                    Ok(Event::TvPower { state, at })
                 },
             )
             .await;
@@ -141,10 +145,11 @@ impl Observer {
                 PollCadence::receiver(&config.verify),
                 window,
                 || async {
+                    let at = Utc::now();
                     let status = client.poll().await;
                     Ok(Event::ReceiverPower {
                         state: status.state,
-                        at: Utc::now(),
+                        at,
                         source_code: status.source_code,
                     })
                 },
@@ -154,6 +159,10 @@ impl Observer {
     }
 
     pub fn console(&self, config: Arc<Config>, role: &str, target: ConsoleState) {
+        self.start_console(config, role, Some(target));
+    }
+
+    fn start_console(&self, config: Arc<Config>, role: &str, target: Option<ConsoleState>) {
         if config.mode != Mode::Active || !self.active.load(Ordering::Acquire) {
             return;
         }
@@ -169,8 +178,9 @@ impl Observer {
             .consoles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((previous, task)) = consoles.get(role)
-            && *previous == target
+        if let Some((Some((previous, deadline)), task)) = consoles.get(role)
+            && Some(*previous) == target
+            && Instant::now() < *deadline
             && !task.is_finished()
         {
             return;
@@ -181,28 +191,27 @@ impl Observer {
         let tx = self.tx.clone();
         let active = self.active.clone();
         let role_name = role.to_owned();
-        let task = tokio::spawn(async move {
-            let ProbeConfig::Ps5 { host, port } = probe;
-            poll_window(
-                &tx,
-                &active,
-                config.verify.probe_poll_ms,
-                config.verify.probe_window_s,
-                || async {
-                    let state = probe::power_state(&host, port).await;
-                    Ok((
-                        Event::ConsolePower {
-                            role: role_name.clone(),
-                            state,
-                            at: Utc::now(),
-                        },
-                        state == target,
-                    ))
-                },
+        let window = target.map(|target| {
+            (
+                target,
+                Instant::now() + Duration::from_secs(config.verify.probe_window_s),
             )
+        });
+        let task = tokio::spawn(async move {
+            let cadence = PollCadence::console(&config.verify, &probe);
+            let ProbeConfig::Ps5 { host, port, .. } = probe;
+            poll_direct(&tx, &active, cadence, target.is_some(), || async {
+                let at = Utc::now();
+                let state = probe::power_state(&host, port).await;
+                Ok(Event::ConsolePower {
+                    role: role_name.clone(),
+                    state,
+                    at,
+                })
+            })
             .await;
         });
-        consoles.insert(role.to_owned(), (target, task));
+        consoles.insert(role.to_owned(), (window, task));
     }
 
     pub fn stop(&self) {
@@ -267,6 +276,13 @@ impl PollCadence {
             idle_s: verify.receiver_idle_poll_s,
         }
     }
+    fn console(verify: &crate::config::VerifyConfig, probe: &ProbeConfig) -> Self {
+        Self {
+            poll_ms: verify.probe_poll_ms,
+            window_s: verify.probe_window_s,
+            idle_s: probe.idle_poll_s(),
+        }
+    }
 }
 
 /// Window completion returns to idle without spawning another task. Replacing
@@ -282,17 +298,15 @@ async fn poll_direct<F, Fut>(
     Fut: Future<Output = anyhow::Result<Event>>,
 {
     if window {
-        let completed = poll_window(tx, active, cadence.poll_ms, cadence.window_s, || {
-            let query = query();
-            async move { query.await.map(|event| (event, false)) }
-        })
-        .await;
+        let completed =
+            poll_window(tx, active, cadence.poll_ms, cadence.window_s, &mut query).await;
         if !completed {
             return;
         }
     }
     let period = Duration::from_secs(cadence.idle_s);
-    let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+    let first = Instant::now() + if window { period } else { Duration::ZERO };
+    let mut interval = tokio::time::interval_at(first, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while active.load(Ordering::Acquire) && !tx.is_closed() {
         interval.tick().await;
@@ -318,7 +332,7 @@ async fn poll_window<F, Fut>(
 ) -> bool
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = anyhow::Result<(Event, bool)>>,
+    Fut: Future<Output = anyhow::Result<Event>>,
 {
     let deadline = Instant::now() + Duration::from_secs(window_s);
     let mut interval = tokio::time::interval(Duration::from_millis(poll_ms));
@@ -336,7 +350,7 @@ where
         if !active.load(Ordering::Acquire) || Instant::now() >= deadline {
             break;
         }
-        let (event, reached) = match tokio::time::timeout_at(deadline, query()).await {
+        let event = match tokio::time::timeout_at(deadline, query()).await {
             Ok(Ok(sample)) => sample,
             Ok(Err(_)) => return false,
             Err(_) => break,
@@ -350,7 +364,7 @@ where
         {
             break;
         }
-        if reached || tx.is_closed() {
+        if tx.is_closed() {
             break;
         }
     }
@@ -409,6 +423,7 @@ mod tests {
         };
         replace_task(slot, spawn_poll(false));
         tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_ok(), "idle reads immediately");
         tokio::time::advance(Duration::from_secs(14)).await;
         assert!(rx.try_recv().is_err());
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -600,6 +615,9 @@ mod tests {
         config.device[0].probe = Some(ProbeConfig::Ps5 {
             host: "127.0.0.1".into(),
             port: server.local_addr().unwrap().port(),
+            idle_poll_s: 2,
+            start_wake: crate::config::StartWake::Off,
+            boot_s: 30,
         });
         let config = Arc::new(config);
         let (tx, mut rx) = mpsc::channel(8);
@@ -623,6 +641,9 @@ mod tests {
         replacement_config.device[0].probe = Some(ProbeConfig::Ps5 {
             host: "127.0.0.1".into(),
             port: replacement.local_addr().unwrap().port(),
+            idle_poll_s: 2,
+            start_wake: crate::config::StartWake::Off,
+            boot_s: 30,
         });
         let config = Arc::new(replacement_config);
         observer.console(config.clone(), "streamer", ConsoleState::Standby);
@@ -631,6 +652,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        let query_received_at = Utc::now();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !old.is_finished() {
                 tokio::task::yield_now().await;
@@ -650,13 +672,17 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            sample,
-            Input::Event(Event::ConsolePower {
-                state: ConsoleState::Standby,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                sample,
+                Input::Event(Event::ConsolePower {
+                    state: ConsoleState::Standby,
+                    at,
+                    ..
+                }) if at <= query_received_at
+            ),
+            "the observation is dated before its reply, when the query was sent"
+        );
         observer.console(config, "streamer", ConsoleState::Awake);
         let (_, sender) =
             tokio::time::timeout(Duration::from_secs(1), replacement.recv_from(&mut request))
@@ -687,30 +713,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn console_window_stops_on_target_at_poll_cadence() {
-        let (tx, mut rx) = mpsc::channel(8);
+    async fn console_window_keeps_fresh_samples_after_target_at_poll_cadence() {
+        let (tx, mut rx) = mpsc::channel(32);
         let active = AtomicBool::new(true);
         let calls = AtomicUsize::new(0);
         let start = Instant::now();
         poll_window(&tx, &active, 2000, 45, || {
             let call = calls.fetch_add(1, Ordering::Relaxed);
-            std::future::ready(Ok((
-                Event::ConsolePower {
-                    role: "streamer".into(),
-                    state: if call == 2 {
-                        ConsoleState::Standby
-                    } else {
-                        ConsoleState::Unreachable
-                    },
-                    at: Utc::now(),
+            std::future::ready(Ok(Event::ConsolePower {
+                role: "streamer".into(),
+                state: if call >= 2 {
+                    ConsoleState::Standby
+                } else {
+                    ConsoleState::Unreachable
                 },
-                call == 2,
-            )))
+                at: Utc::now(),
+            }))
         })
         .await;
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
-        assert_eq!(start.elapsed(), Duration::from_secs(4));
-        for _ in 0..3 {
+        assert_eq!(calls.load(Ordering::Relaxed), 23);
+        assert_eq!(start.elapsed(), Duration::from_secs(45));
+        for _ in 0..23 {
             assert!(matches!(
                 rx.try_recv(),
                 Ok(Input::Event(Event::ConsolePower { .. }))
@@ -727,20 +750,17 @@ mod tests {
         let start = Instant::now();
         poll_window(&tx, &active, 2000, 5, || {
             calls.fetch_add(1, Ordering::Relaxed);
-            std::future::ready(Ok((
-                Event::TvPower {
-                    state: DirectPower::Off,
-                    at: Utc::now(),
-                },
-                false,
-            )))
+            std::future::ready(Ok(Event::TvPower {
+                state: DirectPower::Off,
+                at: Utc::now(),
+            }))
         })
         .await;
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert_eq!(start.elapsed(), Duration::from_secs(5));
         let start = Instant::now();
         poll_window(&tx, &active, 2000, 5, || {
-            std::future::pending::<anyhow::Result<(Event, bool)>>()
+            std::future::pending::<anyhow::Result<Event>>()
         })
         .await;
         assert_eq!(start.elapsed(), Duration::from_secs(5));
@@ -765,11 +785,70 @@ mod tests {
             )
             .await;
             assert_eq!(calls.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                start.elapsed(),
-                Duration::from_secs(if window { 0 } else { 15 })
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn console_idle_window_and_replacement_keep_reading_at_target() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let active = Arc::new(AtomicBool::new(true));
+        let slot = Mutex::new(None);
+        let probe: ProbeConfig =
+            toml::from_str("kind='ps5'\nhost='console.example'\nidle_poll_s=2").unwrap();
+        let cadence = PollCadence::console(&crate::config::VerifyConfig::default(), &probe);
+        let run = |window| {
+            let tx = tx.clone();
+            let active = active.clone();
+            async move {
+                poll_direct(&tx, &active, cadence, window, || {
+                    std::future::ready(Ok(Event::ConsolePower {
+                        role: "console_b".into(),
+                        state: ConsoleState::Standby,
+                        at: Utc::now(),
+                    }))
+                })
+                .await;
+            }
+        };
+        replace_task(&slot, run(false));
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "startup reads immediately while logically off"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_ok(), "idle cadence");
+        replace_task(&slot, run(true));
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_ok(), "window replaces idle immediately");
+        for _ in 1..23 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                rx.try_recv().is_ok(),
+                "Standby target never stops the window"
             );
         }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "window ends at 45 seconds");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_ok(), "idle resumes");
+        replace_task(&slot, run(true));
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "a later action replaces resumed idle"
+        );
+        slot.lock().unwrap().take().unwrap().abort();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(rx.try_recv().is_err(), "shutdown aborts both cadences");
     }
 
     #[tokio::test(start_paused = true)]

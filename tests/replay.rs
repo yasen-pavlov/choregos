@@ -19,11 +19,12 @@ fn setup() -> (Engine, Instant) {
     let now = Instant::now();
     let mut engine = Engine::new(
         Config::parse(include_str!("../choregos.example.toml")).unwrap(),
-        now,
+        now - Duration::from_secs(5),
         vec![],
         1,
     );
-    engine.handle(Event::BridgeOnline, now, wall());
+    // Ordinary behavior tests begin outside the startup resync guard.
+    engine.handle(Event::BridgeOnline, now - Duration::from_secs(5), wall());
     (engine, now)
 }
 fn frame(engine: &mut Engine, now: Instant, from: u8, to: u8, data: &str) -> Vec<Action> {
@@ -1260,14 +1261,6 @@ fn taken_over_sources_cannot_hold_the_room_on_without_standby_reports() {
     assert_eq!(
         actions,
         [
-            Action::Identify {
-                la: 1,
-                queries: IdentifyQueries {
-                    physical: true,
-                    vendor: true,
-                    osd: false
-                },
-            },
             Action::TvOff,
             Action::ha("media_player", "turn_off", &engine.config.receiver.entity)
         ]
@@ -1893,6 +1886,15 @@ fn restored_identity_buffers_power_until_confirming_physical_report() {
     assert!(!engine.bus.entries[&4].verified);
     assert_eq!(engine.bus.entries[&4].last_seen, None);
     assert_eq!(engine.bus.entries[&4].power, BusPower::Unknown);
+    engine.handle(
+        Event::ReceiverPower {
+            state: DirectPower::On,
+            at: wall(),
+            source_code: None,
+        },
+        now,
+        wall(),
+    );
     let resync = engine.handle(Event::BridgeOnline, now, wall());
     assert!(resync.contains(&Action::Identify {
         la: 4,
@@ -3182,6 +3184,15 @@ fn console_before_physical_change(mode: Mode) -> (Engine, Instant) {
     let mut config = console_physical_change_config();
     config.mode = mode;
     let mut engine = Engine::new(config, now, vec![], 1);
+    engine.handle(
+        Event::ReceiverPower {
+            state: DirectPower::On,
+            at: wall(),
+            source_code: None,
+        },
+        now,
+        wall(),
+    );
     engine.handle(Event::BridgeOnline, now, wall());
     for data in ["84230004", "870009BF", "47436F6E736F6C652041", "822300"] {
         frame(&mut engine, now, 8, 15, data);
@@ -3199,6 +3210,15 @@ fn physical_address_flap_during_receiver_power_up_keeps_role_on() {
     identity.vendor = Some(0x0009bf);
     identity.osd = Some("Console A".into());
     let mut engine = Engine::new(console_physical_change_config(), now, vec![identity], 1);
+    engine.handle(
+        Event::ReceiverPower {
+            state: DirectPower::On,
+            at: wall(),
+            source_code: None,
+        },
+        now,
+        wall(),
+    );
     engine.handle(Event::BridgeOnline, now, wall());
     assert!(
         engine
@@ -4377,6 +4397,9 @@ fn takeover_standby_uses_independent_console_evidence_or_honest_cec_only() {
         config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
             host: "console.example".into(),
             port: 9302,
+            idle_poll_s: 2,
+            start_wake: choregos::config::StartWake::Off,
+            boot_s: 30,
         });
         identify_atv(&mut engine, start);
         verdict_event(
@@ -4695,6 +4718,9 @@ fn all_off_keeps_creation_met_rows_when_attaching_an_already_off_role() {
     config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
         host: "console.example".into(),
         port: 9302,
+        idle_poll_s: 2,
+        start_wake: choregos::config::StartWake::Off,
+        boot_s: 30,
     });
     identify_atv(&mut engine, start);
     frame(&mut engine, start, 8, 15, "84240004");
@@ -4895,6 +4921,9 @@ fn already_standby_probe_settles_an_attached_command_expectation_at_creation() {
     config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
         host: "console.example".into(),
         port: 9302,
+        idle_poll_s: 2,
+        start_wake: choregos::config::StartWake::Off,
+        boot_s: 30,
     });
     identify_atv(&mut engine, start);
     verdict_event(
@@ -5171,6 +5200,9 @@ fn opted_out_cec_standby_uses_only_a_configured_probe() {
         console.probe = Some(ProbeConfig::Ps5 {
             host: "console.example".into(),
             port: 9302,
+            idle_poll_s: 2,
+            start_wake: choregos::config::StartWake::Off,
+            boot_s: 30,
         });
         identify_atv(&mut engine, start);
         verdict_event(
@@ -5360,6 +5392,9 @@ fn review_p7_confirmed_verification_releases_suppression_at_its_check() {
     config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
         host: "console.example".into(),
         port: 9302,
+        idle_poll_s: 2,
+        start_wake: choregos::config::StartWake::Off,
+        boot_s: 30,
     });
     identify_atv(&mut engine, start);
     for (ms, event) in [
@@ -5646,6 +5681,9 @@ fn bridge_offline_cancels_cec_only_but_preserves_independent_probe_expectations(
             config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
                 host: "console.example".into(),
                 port: 9302,
+                idle_poll_s: 2,
+                start_wake: choregos::config::StartWake::Off,
+                boot_s: 30,
             });
         }
         identify_atv(&mut engine, start);
@@ -5772,6 +5810,9 @@ fn review_q6_only_checked_cec_confirmation_survives_a_later_user_wake() {
         config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
             host: "console.example".into(),
             port: 9302,
+            idle_poll_s: 2,
+            start_wake: choregos::config::StartWake::Off,
+            boot_s: 30,
         });
         identify_atv(&mut engine, start);
         verdict_event(
@@ -5847,6 +5888,9 @@ fn probe_standby_verdict(cec: bool, probe_window_s: u64, settle_ms: u64) -> (Eng
     config.device[0].probe = Some(choregos::config::ProbeConfig::Ps5 {
         host: "console.example".into(),
         port: 9302,
+        idle_poll_s: 2,
+        start_wake: choregos::config::StartWake::Off,
+        boot_s: 30,
     });
     identify_atv(&mut engine, start);
     verdict_event(
@@ -7578,6 +7622,1115 @@ fn receiver_retains_last_usable_sample_only_for_contested_deadline_evaluation() 
             } else {
                 Outcome::Unknown { observed: None }
             }
+        );
+    }
+}
+
+fn console_start_engine(policy: choregos::config::StartWake) -> (Engine, Instant) {
+    let now = Instant::now();
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    config.mode = Mode::Active;
+    config.tv.off = choregos::config::TvOffConfig::Ha;
+    config.device[0].takeover = Takeover::CecPauseStandby;
+    let console = config
+        .device
+        .iter_mut()
+        .find(|d| d.role == "console_b")
+        .unwrap();
+    console.probe = Some(choregos::config::ProbeConfig::Ps5 {
+        host: "console.example".into(),
+        port: 9302,
+        idle_poll_s: 2,
+        start_wake: policy,
+        boot_s: 30,
+    });
+    console.verify_standby = false;
+    console
+        .on
+        .retain(|event| *event != choregos::config::PowerEvent::PowerOn);
+    let mut engine = Engine::new(config, now, vec![], 1);
+    verdict_event(&mut engine, now, 3000, Event::Tick);
+    identify_atv(&mut engine, now + Duration::from_secs(3));
+    frame(&mut engine, now + Duration::from_secs(3), 8, 15, "84240004");
+    frame(&mut engine, now + Duration::from_secs(3), 8, 15, "87080046");
+    frame(
+        &mut engine,
+        now + Duration::from_secs(3),
+        8,
+        0,
+        "47436F6E736F6C652042",
+    );
+    (engine, now)
+}
+
+fn console_sample(
+    engine: &mut Engine,
+    start: Instant,
+    ms: u64,
+    state: choregos::state::ConsoleState,
+) -> Vec<Action> {
+    verdict_event(
+        engine,
+        start,
+        ms,
+        Event::ConsolePower {
+            role: "console_b".into(),
+            state,
+            at: wall() + chrono::Duration::milliseconds(ms as i64),
+        },
+    )
+}
+
+fn console_frame(
+    engine: &mut Engine,
+    start: Instant,
+    ms: u64,
+    from: u8,
+    to: u8,
+    data: &str,
+) -> Vec<Action> {
+    verdict_event(
+        engine,
+        start,
+        ms,
+        Event::Frame(Frame::from_hex(from, to, data).unwrap()),
+    )
+}
+
+#[test]
+fn console_start_e1_would_suppresses_the_older_start_but_preserves_live_takeover() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Would);
+    // First Unreachable is t=0 at 60 s; the last Standby baseline is t=-54 s.
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_frame(&mut engine, start, 60530, 4, 15, "9000");
+    let winner = engine.intent.clone();
+    let winner_on = engine.roles["streamer"].on_since;
+    assert!(console_sample(&mut engine, start, 61000, Unreachable).is_empty());
+    assert!(
+        engine.decisions.is_empty(),
+        "act would not wake an older/ambiguous start"
+    );
+    assert_eq!(engine.intent.active_role, winner.active_role);
+    assert_eq!(engine.roles["streamer"].on_since, winner_on);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    let actions = console_frame(&mut engine, start, 69600, 8, 0, "0D");
+    assert!(!actions.is_empty());
+    let late = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "late_announcement")
+        .unwrap();
+    assert!(late.would);
+    assert!(late.expectations.is_empty());
+    assert!(late.actions.contains(&Action::CecSend {
+        to: 8,
+        data: vec![0x36]
+    }));
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.role.as_deref() == Some("console_b") && row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(wake.parent, None, "there was no early-wake would row");
+    assert!(!wake.would);
+    assert_eq!(engine.intent.active_role.as_deref(), Some("console_b"));
+    console_sample(&mut engine, start, 73100, Awake);
+    console_sample(&mut engine, start, 75000, Standby);
+    assert!(
+        engine.decisions.is_empty(),
+        "a confirmed start cannot retract"
+    );
+}
+
+#[test]
+fn console_start_e1_act_reverses_the_late_announcement_only_once() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_frame(&mut engine, start, 60530, 4, 15, "9000");
+    let winner_on = engine.roles["streamer"].on_since;
+    assert!(console_sample(&mut engine, start, 61000, Unreachable).is_empty());
+    assert!(engine.decisions.is_empty());
+    // The receiver has followed the late source on the wire, not in intent.
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_event(
+        &mut engine,
+        start,
+        69000,
+        Event::HaState {
+            entity: receiver,
+            state: "on".into(),
+            attrs: BTreeMap::from([("source".into(), Value::String("Console B".into()))]),
+            changed: None,
+            updated: None,
+        },
+    );
+    let actions = console_frame(&mut engine, start, 69600, 8, 0, "0D");
+    assert_eq!(
+        &actions[..3],
+        &[
+            Action::CecSend {
+                to: 8,
+                data: vec![0x36]
+            },
+            Action::CecSend {
+                to: 8,
+                data: vec![0x8f]
+            },
+            Action::CecSend {
+                to: 15,
+                data: vec![0x86, 0x21, 0x00]
+            },
+        ]
+    );
+    assert!(actions.iter().any(|a| matches!(a, Action::HaCall { service, data, .. } if service == "select_source" && data["source"] == "Streamer")));
+    let row = engine
+        .decisions
+        .iter()
+        .find(|r| r.reason == "late_announcement")
+        .unwrap();
+    let late_id = row.id;
+    assert!(!row.would);
+    assert!(
+        row.expectations
+            .iter()
+            .any(|e| e.subject == "role:console_b" && e.via == [Via::Ps5])
+    );
+    assert!(
+        row.expectations
+            .iter()
+            .any(|e| e.subject == "receiver" && e.field == choregos::action::Field::Source)
+    );
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+    assert_eq!(engine.roles["streamer"].on_since, winner_on);
+    assert!(console_frame(&mut engine, start, 80000, 8, 15, "822400").is_empty());
+    assert!(engine.decisions.is_empty());
+    console_sample(&mut engine, start, 100000, Standby);
+    assert!(
+        engine
+            .expectations(late_id)
+            .unwrap()
+            .iter()
+            .any(|e| e.subject == "role:console_b"
+                && matches!(e.outcome, Outcome::Met { via: Via::Ps5, .. }))
+    );
+}
+
+#[test]
+fn console_start_act_alone_confirms_without_a_second_wake_and_settles_normally() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    let actions = console_sample(&mut engine, start, 61000, Unreachable);
+    assert!(actions.contains(&Action::WakeTv));
+    assert!(actions.iter().any(|a| service(a, "turn_on")));
+    let row = engine.decisions.last().unwrap();
+    let id = row.id;
+    assert_eq!(row.reason, "console_start");
+    assert!(
+        row.expectations
+            .iter()
+            .all(|e| e.subject != "role:console_b")
+    );
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 62000, tv, "on");
+    verdict_ha(&mut engine, start, 62001, receiver, "on");
+    let actions = verdict_event(&mut engine, start, 63000, Event::Tick);
+    assert!(actions.iter().any(|a| service(a, "select_source")));
+    assert_eq!(engine.decisions.last().unwrap().parent, Some(id));
+    assert!(console_frame(&mut engine, start, 69600, 8, 0, "0D").is_empty());
+    assert!(engine.decisions.is_empty());
+    console_sample(&mut engine, start, 73100, Awake);
+    verdict_event(&mut engine, start, 91000, Event::Tick);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert!(
+        !engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "console_start_expired")
+    );
+}
+
+#[test]
+fn console_start_retraction_and_expiry_release_only_real_early_wakes() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    for policy in [StartWake::Act, StartWake::Would, StartWake::Off] {
+        for retract in [true, false] {
+            let (mut engine, start) = console_start_engine(policy);
+            console_sample(&mut engine, start, 6000, Standby);
+            console_sample(&mut engine, start, 60000, Unreachable);
+            console_sample(&mut engine, start, 61000, Unreachable);
+            // Network 200 is not a confirming frame (Remote Play caveat).
+            console_sample(&mut engine, start, 62000, Awake);
+            if retract {
+                console_sample(&mut engine, start, 63000, Standby);
+            } else {
+                assert!(engine.next_deadline().unwrap() <= start + Duration::from_secs(90));
+                verdict_event(&mut engine, start, 90000, Event::Tick);
+            }
+            let reason = if retract {
+                "console_start_retracted"
+            } else {
+                "console_start_expired"
+            };
+            if policy == StartWake::Off {
+                assert!(engine.decisions.iter().all(|row| row.reason != reason));
+            } else {
+                let row = engine
+                    .decisions
+                    .iter()
+                    .find(|row| row.reason == reason)
+                    .unwrap();
+                assert_eq!(row.would, policy == StartWake::Would);
+                assert!(row.actions.is_empty());
+                if !retract {
+                    assert_eq!(
+                        row.trigger,
+                        Trigger::Timer {
+                            name: TimerKind::ConsoleBoot
+                        }
+                    );
+                }
+            }
+            assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            let at = if retract { 66000 } else { 93000 };
+            let actions = verdict_event(&mut engine, start, at, Event::Tick);
+            assert_eq!(actions.contains(&Action::TvOff), policy == StartWake::Act);
+            assert!(
+                !engine
+                    .decisions
+                    .iter()
+                    .any(|row| row.reason == "late_announcement")
+            );
+        }
+    }
+}
+
+#[test]
+fn console_start_act_older_boot_cannot_take_back_a_newer_remote_press() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    console_frame(&mut engine, start, 65000, 4, 0, "04");
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    let actions = console_frame(&mut engine, start, 69600, 8, 0, "0D");
+    assert!(actions.contains(&Action::CecSend {
+        to: 8,
+        data: vec![0x36]
+    }));
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+    // Once the boot window has elapsed, the same frame is a fresh user intent.
+    console_frame(&mut engine, start, 91000, 8, 0, "0D");
+    assert_eq!(engine.intent.active_role.as_deref(), Some("console_b"));
+}
+
+#[test]
+fn console_start_off_still_orders_frames_and_probe_free_roles_keep_arrival_order() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Off);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_frame(&mut engine, start, 60530, 4, 0, "04");
+    console_sample(&mut engine, start, 61000, Unreachable);
+    assert!(engine.decisions.is_empty());
+    console_frame(&mut engine, start, 69600, 8, 0, "0D");
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "late_announcement")
+    );
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+    console_frame(&mut engine, start, 70000, 11, 15, "84230004");
+    assert_eq!(engine.intent.active_role.as_deref(), Some("console_a"));
+}
+
+#[test]
+fn console_start_needs_a_standby_baseline_and_reload_and_shadow_clear_it() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    for (ms, sample) in [
+        (60000, Unreachable),
+        (61000, Unreachable),
+        (62000, Awake),
+        (63000, Unreachable),
+        (64000, Unreachable),
+    ] {
+        assert!(console_sample(&mut engine, start, ms, sample).is_empty());
+        assert!(engine.decisions.is_empty());
+    }
+    console_sample(&mut engine, start, 65000, Standby);
+    console_sample(&mut engine, start, 66000, Unreachable);
+    let config = engine.config.clone();
+    verdict_event(&mut engine, start, 66500, Event::ConfigReloaded(config));
+    console_sample(&mut engine, start, 67000, Unreachable);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    verdict_event(
+        &mut engine,
+        start,
+        70000,
+        Event::Command(Command::SetMode(Mode::Shadow)),
+    );
+    for (ms, sample) in [(71000, Standby), (72000, Unreachable), (73000, Unreachable)] {
+        console_sample(&mut engine, start, ms, sample);
+        assert!(engine.decisions.is_empty());
+    }
+}
+
+#[test]
+fn startup_resync_e2_adopts_only_a_known_on_receiver_and_never_replays_ignored_source() {
+    for power in [Some(DirectPower::Off), Some(DirectPower::On), None] {
+        let now = Instant::now();
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        config.mode = Mode::Active;
+        let mut engine = Engine::new(config, now, vec![], 1);
+        verdict_event(&mut engine, now, 0, Event::BridgeOnline);
+        if let Some(state) = power {
+            verdict_event(
+                &mut engine,
+                now,
+                900,
+                Event::ReceiverPower {
+                    state,
+                    at: wall() + chrono::Duration::milliseconds(900),
+                    source_code: None,
+                },
+            );
+        }
+        console_frame(&mut engine, now, 1000, 1, 15, "84220001");
+        console_frame(&mut engine, now, 1100, 1, 0, "474B6F6469");
+        let actions = console_frame(&mut engine, now, 1600, 1, 15, "822200");
+        assert_eq!(engine.bus.active_source, Some(0x2200));
+        if power == Some(DirectPower::On) {
+            assert_eq!(engine.intent.active_role.as_deref(), Some("kodi"));
+            assert!(actions.contains(&Action::WakeTv));
+        } else {
+            assert!(actions.iter().all(|a| !matches!(a, Action::WakeTv)));
+            verdict_event(&mut engine, now, 5000, Event::Tick);
+            assert_eq!(engine.intent.power, RoomPower::Unknown);
+            assert_eq!(engine.roles["kodi"].power, RolePower::Off);
+        }
+        let actions = console_frame(&mut engine, now, 6000, 1, 15, "822200");
+        assert_eq!(engine.intent.active_role.as_deref(), Some("kodi"));
+        assert_eq!(
+            actions.contains(&Action::WakeTv),
+            power != Some(DirectPower::On)
+        );
+    }
+}
+
+#[test]
+fn late_console_announcement_preserves_the_winners_pending_settle_and_expectations() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 62000, tv, "on");
+    verdict_ha(&mut engine, start, 62001, receiver, "on");
+    console_frame(&mut engine, start, 65000, 4, 0, "04");
+    let winner_id = engine
+        .decisions
+        .iter()
+        .find(|row| row.role.as_deref() == Some("streamer") && row.to == Some(RolePower::On))
+        .unwrap()
+        .id;
+    let pending = engine.expectations(winner_id).unwrap().to_vec();
+    let intent = engine.intent.clone();
+    let reverse = console_frame(&mut engine, start, 65900, 8, 0, "0D");
+    assert!(
+        !reverse
+            .iter()
+            .any(|action| service(action, "select_source"))
+    );
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .filter(|row| row.reason == "late_announcement")
+            .flat_map(|row| &row.expectations)
+            .all(|expectation| expectation.field != choregos::action::Field::Source)
+    );
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "late_announcement")
+    );
+    assert_eq!(engine.intent.active_role, intent.active_role);
+    assert_eq!(engine.intent.receiver_source, intent.receiver_source);
+    assert_eq!(engine.expectations(winner_id).unwrap(), pending);
+    let actions = verdict_event(&mut engine, start, 67000, Event::Tick);
+    assert!(actions.iter().any(|action| matches!(action, Action::HaCall { service, data, .. } if service == "select_source" && data["source"] == "Streamer")));
+    let settle = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "takeover_settled")
+        .unwrap();
+    assert_eq!(settle.parent, Some(winner_id));
+    assert_eq!(settle.role.as_deref(), Some("streamer"));
+}
+
+#[test]
+fn startup_resync_ha_on_resolves_the_held_source_without_redundant_power_actions() {
+    let start = Instant::now();
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    config.mode = Mode::Active;
+    let mut engine = Engine::new(config, start, vec![], 1);
+    verdict_event(&mut engine, start, 0, Event::BridgeOnline);
+    console_frame(&mut engine, start, 1000, 1, 15, "84220001");
+    console_frame(&mut engine, start, 1100, 1, 0, "474B6F6469");
+    console_frame(&mut engine, start, 1600, 1, 15, "822200");
+    assert_eq!(engine.intent.power, RoomPower::Unknown);
+    let tv = engine.config.tv.entity.clone();
+    let receiver = engine.config.receiver.entity.clone();
+    verdict_ha(&mut engine, start, 1700, tv, "on");
+    verdict_ha(&mut engine, start, 1900, receiver, "on");
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(
+        wake.trigger,
+        Trigger::Frame {
+            from: 1,
+            to: 15,
+            data: "822200".into()
+        }
+    );
+    assert!(wake.actions.is_empty());
+    assert!(wake.expectations.is_empty());
+    assert_eq!(engine.intent.active_role.as_deref(), Some("kodi"));
+}
+
+#[test]
+fn startup_resync_discards_once_and_does_not_lose_activation_behind_other_replies() {
+    let start = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, start, vec![], 1);
+    verdict_event(&mut engine, start, 0, Event::BridgeOnline);
+    verdict_event(
+        &mut engine,
+        start,
+        900,
+        Event::ReceiverPower {
+            state: DirectPower::Off,
+            at: wall() + chrono::Duration::milliseconds(900),
+            source_code: None,
+        },
+    );
+    // Activation precedes verification; the following power/physical replies
+    // are not configured Kodi wake signals and must not overwrite the held 82.
+    console_frame(&mut engine, start, 1200, 1, 15, "822200");
+    console_frame(&mut engine, start, 1300, 1, 0, "9000");
+    console_frame(&mut engine, start, 1400, 1, 15, "84220001");
+    console_frame(&mut engine, start, 1500, 1, 0, "474B6F6469");
+    let ignored = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "startup_source_ignored")
+        .unwrap();
+    assert_eq!(
+        ignored.trigger,
+        Trigger::Frame {
+            from: 1,
+            to: 15,
+            data: "822200".into()
+        }
+    );
+    assert!(ignored.actions.is_empty());
+    assert_eq!(ignored.verdict, Verdict::None);
+    for ms in [1600, 1700, 3000, 5000] {
+        if ms < 2000 {
+            console_frame(&mut engine, start, ms, 1, 15, "822200");
+        } else {
+            verdict_event(&mut engine, start, ms, Event::Tick);
+        }
+        assert!(
+            !engine
+                .decisions
+                .iter()
+                .any(|row| row.reason == "startup_source_ignored" || row.to == Some(RolePower::On))
+        );
+    }
+    assert_eq!(engine.intent.power, RoomPower::Unknown);
+    assert_eq!(engine.roles["kodi"].power, RolePower::Off);
+}
+
+#[test]
+fn console_start_orders_by_last_standby_not_the_delayed_unreachable_reply() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    for policy in [StartWake::Act, StartWake::Would] {
+        for (remote_ms, newer_console) in [(59700, true), (60100, false)] {
+            let (mut engine, start) = console_start_engine(policy);
+            if remote_ms < 60000 {
+                console_frame(&mut engine, start, remote_ms, 4, 0, "04");
+            }
+            console_sample(&mut engine, start, 60000, Standby);
+            if remote_ms > 60000 {
+                console_frame(&mut engine, start, remote_ms, 4, 0, "04");
+            }
+            // Query sent at 60.2 s, timeout delivered after the remote press.
+            verdict_event(
+                &mut engine,
+                start,
+                61200,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Unreachable,
+                    at: wall() + chrono::Duration::milliseconds(60200),
+                },
+            );
+            verdict_event(
+                &mut engine,
+                start,
+                62200,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Unreachable,
+                    at: wall() + chrono::Duration::milliseconds(61200),
+                },
+            );
+            assert_eq!(
+                engine
+                    .decisions
+                    .iter()
+                    .any(|row| row.reason == "console_start"),
+                newer_console
+            );
+            assert_eq!(
+                engine.roles["console_b"].power == RolePower::On,
+                newer_console && policy == StartWake::Act
+            );
+            console_frame(&mut engine, start, 69800, 8, 0, "0D");
+            assert_eq!(
+                engine
+                    .decisions
+                    .iter()
+                    .any(|row| row.reason == "late_announcement"),
+                !newer_console
+            );
+            assert_eq!(
+                engine.intent.active_role.as_deref(),
+                Some(if newer_console || policy == StartWake::Would {
+                    "console_b"
+                } else {
+                    "streamer"
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn console_start_would_eligible_row_is_inert_and_parents_the_later_real_wake() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Would);
+    console_sample(&mut engine, start, 60000, Standby);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    assert!(console_sample(&mut engine, start, 62000, Unreachable).is_empty());
+    let row = engine.decisions.last().unwrap();
+    let parent = row.id;
+    assert_eq!(row.reason, "console_start");
+    assert!(row.would);
+    assert_eq!(row.trigger, Trigger::Observation { source: Via::Ps5 });
+    assert!(row.actions.contains(&Action::WakeTv));
+    assert!(row.actions.iter().any(|action| service(action, "turn_on")));
+    assert!(row.expectations.is_empty());
+    assert_eq!(row.verdict, Verdict::None);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert_eq!(engine.intent.power, RoomPower::Unknown);
+    console_frame(&mut engine, start, 65000, 4, 0, "04");
+    console_frame(&mut engine, start, 70600, 8, 0, "0D");
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.role.as_deref() == Some("console_b") && row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(wake.parent, Some(parent));
+}
+
+#[test]
+fn console_start_expiry_uses_first_query_send_time_not_timeout_delivery() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 59000, Standby);
+    for (sent, delivered) in [(60000, 61000), (61000, 62000)] {
+        verdict_event(
+            &mut engine,
+            start,
+            delivered,
+            Event::ConsolePower {
+                role: "console_b".into(),
+                state: Unreachable,
+                at: wall() + chrono::Duration::milliseconds(sent),
+            },
+        );
+    }
+    verdict_event(&mut engine, start, 89999, Event::Tick);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    verdict_event(&mut engine, start, 90000, Event::Tick);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "console_start_expired")
+    );
+}
+
+#[test]
+fn unbound_early_console_is_displaced_even_without_stop_actions() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    verdict_event(&mut engine, start, 4000, Event::Command(Command::Forget(8)));
+    assert!(!engine.identity.roles.contains_key("console_b"));
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    console_frame(&mut engine, start, 65000, 4, 0, "04");
+    let displaced = engine
+        .decisions
+        .iter()
+        .find(|row| row.role.as_deref() == Some("console_b") && row.reason == "taken_over")
+        .unwrap();
+    assert!(displaced.actions.is_empty());
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    for (ms, to, data) in [
+        (69600, 0, "0D"),
+        (69700, 15, "84240004"),
+        (69800, 15, "87080046"),
+    ] {
+        console_frame(&mut engine, start, ms, 8, to, data);
+    }
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "late_announcement")
+    );
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+}
+
+#[test]
+fn late_announcement_releases_a_still_on_role_and_reports_the_actual_from_state() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    std::sync::Arc::make_mut(&mut engine.config)
+        .device
+        .iter_mut()
+        .find(|d| d.role == "console_b")
+        .unwrap()
+        .takeover = Takeover::None;
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    console_frame(&mut engine, start, 62000, 8, 0, "0D");
+    console_frame(&mut engine, start, 65000, 4, 0, "04");
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    console_frame(&mut engine, start, 69600, 8, 0, "0D");
+    let late = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "late_announcement")
+        .unwrap();
+    assert_eq!(late.from, Some(RolePower::On));
+    assert_eq!(late.to, Some(RolePower::Off));
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+}
+
+#[test]
+fn unconfirmed_console_expiry_and_retraction_wait_for_warmup_without_spinning() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    verdict_event(&mut engine, start, 89000, Event::BridgeOnline);
+    assert_eq!(
+        engine.next_deadline(),
+        Some(start + Duration::from_millis(92000))
+    );
+    verdict_event(&mut engine, start, 90000, Event::Tick);
+    console_sample(&mut engine, start, 91000, Standby);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert!(
+        !engine
+            .decisions
+            .iter()
+            .any(|row| row.reason.starts_with("console_start_"))
+    );
+    verdict_event(&mut engine, start, 92000, Event::Tick);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "console_start_expired")
+    );
+    assert!(
+        engine
+            .next_deadline()
+            .is_none_or(|deadline| deadline > start + Duration::from_millis(92000))
+    );
+}
+
+#[test]
+fn reload_and_shadow_release_unconfirmed_early_wakes_before_clearing_evidence() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    for shadow in [false, true] {
+        let (mut engine, start) = console_start_engine(StartWake::Act);
+        console_sample(&mut engine, start, 6000, Standby);
+        console_sample(&mut engine, start, 60000, Unreachable);
+        console_sample(&mut engine, start, 61000, Unreachable);
+        verdict_event(&mut engine, start, 61500, Event::BridgeOnline);
+        let event = if shadow {
+            Event::Command(Command::SetMode(Mode::Shadow))
+        } else {
+            Event::ConfigReloaded(engine.config.clone())
+        };
+        verdict_event(&mut engine, start, 62000, event);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert_eq!(engine.intent.active_role, None);
+        let release = engine
+            .decisions
+            .iter()
+            .find(|row| row.reason == "console_start_expired")
+            .unwrap();
+        assert_eq!(release.from, Some(RolePower::On));
+        assert!(release.actions.is_empty());
+        verdict_event(&mut engine, start, 65000, Event::Tick);
+        assert_eq!(engine.intent.power, RoomPower::Off);
+    }
+}
+
+#[test]
+fn would_and_act_share_warmup_blocked_already_on_and_empty_plan_eligibility() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    for policy in [StartWake::Would, StartWake::Act] {
+        for gate in ["warming", "blocked", "already_on", "empty_plan"] {
+            let (mut engine, start) = console_start_engine(policy);
+            if gate == "already_on" {
+                console_frame(&mut engine, start, 55000, 8, 0, "0D");
+            }
+            if gate == "empty_plan" {
+                let tv = engine.config.tv.entity.clone();
+                let receiver = engine.config.receiver.entity.clone();
+                verdict_ha(&mut engine, start, 55000, tv, "on");
+                verdict_ha(&mut engine, start, 55001, receiver, "on");
+            }
+            console_sample(&mut engine, start, 58000, Standby);
+            if gate == "warming" {
+                verdict_event(&mut engine, start, 59000, Event::BridgeOnline);
+            }
+            if gate == "blocked" {
+                console_frame(&mut engine, start, 59000, 11, 15, "84250004");
+                console_frame(&mut engine, start, 59001, 11, 15, "87080046");
+                assert!(engine.identity.blocked.contains("console_b"));
+            }
+            console_sample(&mut engine, start, 60000, Unreachable);
+            console_sample(&mut engine, start, 61000, Unreachable);
+            assert!(
+                !engine
+                    .decisions
+                    .iter()
+                    .any(|row| row.reason == "console_start"),
+                "{policy:?} {gate}"
+            );
+            assert_eq!(
+                engine.roles["console_b"].power == RolePower::On,
+                gate == "already_on"
+            );
+        }
+    }
+}
+
+fn startup_unbound_source(power: Option<DirectPower>) -> (Engine, Instant) {
+    let start = Instant::now();
+    let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    config.mode = Mode::Active;
+    let mut engine = Engine::new(config, start, vec![], 1);
+    verdict_event(&mut engine, start, 0, Event::BridgeOnline);
+    if let Some(state) = power {
+        verdict_event(
+            &mut engine,
+            start,
+            900,
+            Event::ReceiverPower {
+                state,
+                at: wall() + chrono::Duration::milliseconds(900),
+                source_code: None,
+            },
+        );
+    }
+    console_frame(&mut engine, start, 1000, 4, 15, "822100");
+    assert!(!engine.identity.roles.contains_key("streamer"));
+    (engine, start)
+}
+
+#[test]
+fn startup_unbound_held_source_buffers_only_for_a_known_on_receiver_at_the_deadline() {
+    for power in [Some(DirectPower::On), Some(DirectPower::Off), None] {
+        let (mut engine, start) = startup_unbound_source(power);
+        verdict_event(&mut engine, start, 5000, Event::Tick);
+        if power == Some(DirectPower::On) {
+            assert!(
+                !engine
+                    .decisions
+                    .iter()
+                    .any(|row| row.reason == "startup_source_ignored")
+            );
+        } else {
+            let row = engine
+                .decisions
+                .iter()
+                .find(|row| row.reason == "startup_source_ignored")
+                .unwrap();
+            assert_eq!(row.role, None);
+            assert!(row.actions.is_empty());
+            assert_eq!(
+                row.trigger,
+                Trigger::Frame {
+                    from: 4,
+                    to: 15,
+                    data: "822100".into()
+                }
+            );
+        }
+        let mut actions = console_frame(&mut engine, start, 6000, 4, 15, "870010FA");
+        actions.extend(console_frame(&mut engine, start, 6100, 4, 15, "84210004"));
+        assert_eq!(
+            engine.roles["streamer"].power == RolePower::On,
+            power == Some(DirectPower::On)
+        );
+        assert_eq!(
+            actions.contains(&Action::WakeTv),
+            power == Some(DirectPower::On)
+        );
+    }
+}
+
+#[test]
+fn second_resync_reports_held_source_discard_before_starting_a_new_window() {
+    let (mut engine, start) = startup_unbound_source(None);
+    let actions = verdict_event(&mut engine, start, 2000, Event::BridgeOnline);
+    assert!(actions.contains(&Action::Resync));
+    let ignored = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "startup_source_ignored")
+        .unwrap();
+    assert_eq!(ignored.role, None);
+    assert_eq!(
+        ignored.trigger,
+        Trigger::Frame {
+            from: 4,
+            to: 15,
+            data: "822100".into()
+        }
+    );
+    console_frame(&mut engine, start, 3000, 4, 15, "822100");
+    console_frame(&mut engine, start, 3100, 4, 15, "870010FA");
+    console_frame(&mut engine, start, 3200, 4, 15, "84210004");
+    verdict_event(
+        &mut engine,
+        start,
+        3300,
+        Event::ReceiverPower {
+            state: DirectPower::Off,
+            at: wall() + chrono::Duration::milliseconds(3300),
+            source_code: None,
+        },
+    );
+    let ignored = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == "startup_source_ignored")
+        .unwrap();
+    assert_eq!(ignored.role.as_deref(), Some("streamer"));
+    assert_eq!(engine.intent.power, RoomPower::Unknown);
+}
+
+#[test]
+fn guarded_identification_still_replays_an_explicit_buffered_user_wake() {
+    let start = Instant::now();
+    let config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+    let mut engine = Engine::new(config, start, vec![restored_identity(4, 0x2100)], 1);
+    verdict_event(&mut engine, start, 0, Event::BridgeOnline);
+    console_frame(&mut engine, start, 1000, 4, 0, "04");
+    console_frame(&mut engine, start, 1100, 4, 15, "870010FA");
+    let actions = console_frame(&mut engine, start, 1200, 4, 15, "84210004");
+    assert!(actions.contains(&Action::WakeTv));
+    assert_eq!(engine.intent.active_role.as_deref(), Some("streamer"));
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "ImageViewOn")
+    );
+}
+
+#[test]
+fn blocked_unconfirmed_start_keeps_its_deadline_until_identity_is_usable_again() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Act);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    console_frame(&mut engine, start, 88000, 11, 15, "84250004");
+    console_frame(&mut engine, start, 88001, 11, 15, "87080046");
+    assert!(engine.identity.blocked.contains("console_b"));
+    console_sample(&mut engine, start, 91000, Standby);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert!(
+        !engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "console_start_expired")
+    );
+    assert!(
+        engine
+            .next_deadline()
+            .is_none_or(|deadline| deadline > start + Duration::from_millis(91000))
+    );
+    verdict_event(
+        &mut engine,
+        start,
+        92000,
+        Event::Command(Command::Forget(11)),
+    );
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "console_start_expired")
+    );
+}
+
+#[test]
+fn forget_replay_confirms_a_blocked_consoles_buffered_on_signal() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    for policy in [StartWake::Act, StartWake::Would] {
+        let (mut engine, start) = console_start_engine(policy);
+        console_sample(&mut engine, start, 6000, Standby);
+        console_sample(&mut engine, start, 60000, Unreachable);
+        console_sample(&mut engine, start, 61000, Unreachable);
+        console_frame(&mut engine, start, 63000, 11, 15, "84250004");
+        console_frame(&mut engine, start, 63001, 11, 15, "87080046");
+        assert!(engine.identity.blocked.contains("console_b"));
+        console_frame(&mut engine, start, 64200, 8, 0, "0D");
+        verdict_event(
+            &mut engine,
+            start,
+            65000,
+            Event::Command(Command::Forget(11)),
+        );
+        assert!(!engine.identity.blocked.contains("console_b"));
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        verdict_event(&mut engine, start, 90000, Event::Tick);
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert!(
+            !engine
+                .decisions
+                .iter()
+                .any(|row| row.reason == "console_start_expired"),
+            "Forget adopted a configured On frame, not an unconfirmed boot"
+        );
+    }
+}
+
+#[test]
+fn startup_adoption_confirms_would_start_without_a_contradictory_expiry() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    let (mut engine, start) = console_start_engine(StartWake::Would);
+    console_sample(&mut engine, start, 6000, Standby);
+    console_sample(&mut engine, start, 60000, Unreachable);
+    console_sample(&mut engine, start, 61000, Unreachable);
+    let start_id = engine.decisions.last().unwrap().id;
+    verdict_event(&mut engine, start, 62000, Event::BridgeOnline);
+    console_frame(&mut engine, start, 63000, 8, 15, "822400");
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    verdict_event(
+        &mut engine,
+        start,
+        64000,
+        Event::ReceiverPower {
+            state: DirectPower::On,
+            at: wall() + chrono::Duration::milliseconds(64000),
+            source_code: None,
+        },
+    );
+    let wake = engine
+        .decisions
+        .iter()
+        .find(|row| row.role.as_deref() == Some("console_b") && row.to == Some(RolePower::On))
+        .unwrap();
+    assert_eq!(wake.parent, Some(start_id));
+    assert_eq!(
+        wake.trigger,
+        Trigger::Frame {
+            from: 8,
+            to: 15,
+            data: "822400".into()
+        }
+    );
+    assert!(!wake.would);
+    verdict_event(&mut engine, start, 90000, Event::Tick);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert!(
+        !engine
+            .decisions
+            .iter()
+            .any(|row| row.reason == "console_start_expired")
+    );
+}
+
+#[test]
+fn reload_and_shadow_close_unconfirmed_would_start_rows_without_control_effects() {
+    use choregos::{config::StartWake, state::ConsoleState::*};
+    for shadow in [false, true] {
+        let (mut engine, start) = console_start_engine(StartWake::Would);
+        console_sample(&mut engine, start, 6000, Standby);
+        console_sample(&mut engine, start, 60000, Unreachable);
+        console_sample(&mut engine, start, 61000, Unreachable);
+        let start_id = engine.decisions.last().unwrap().id;
+        let event = if shadow {
+            Event::Command(Command::SetMode(Mode::Shadow))
+        } else {
+            Event::ConfigReloaded(engine.config.clone())
+        };
+        assert!(verdict_event(&mut engine, start, 62000, event).is_empty());
+        let expiry = engine
+            .decisions
+            .iter()
+            .find(|row| row.reason == "console_start_expired")
+            .unwrap();
+        assert!(expiry.would);
+        assert_eq!(expiry.parent, Some(start_id));
+        assert!(expiry.actions.is_empty());
+        assert!(expiry.expectations.is_empty());
+        assert_eq!(expiry.verdict, Verdict::None);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert_eq!(engine.intent.power, RoomPower::Unknown);
+        verdict_event(&mut engine, start, 90000, Event::Tick);
+        assert!(
+            !engine
+                .decisions
+                .iter()
+                .any(|row| row.reason == "console_start_expired")
         );
     }
 }

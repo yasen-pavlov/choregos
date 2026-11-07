@@ -133,6 +133,7 @@ src/cec/opcode.rs      const names for the opcodes used + name lookup for the UI
 src/cec/bus.rs         BusModel: per-LA device table, active source, vendor/osd/physical learning [core]
 src/identity.rs        role resolution (config match rules × bus table)  [core]
 src/engine.rs          pure state machine: Event → Vec<Action> (+ timers) [core]
+src/engine/start.rs    console boot evidence, ordering and startup guard [core]
 src/action.rs          Action enum + Decision log entry                  [core]
 src/runtime/mod.rs     event loop: channels → engine → executor          [core]
 src/runtime/mqtt.rs    rumqttc client; HA discovery; state topics; hands bridge topics to src/runtime/bridge [core]
@@ -347,9 +348,19 @@ decision, exposes it in the UI/HA, and takes **no power actions** for the
 roles involved until resolved. Unmatched LAs appear as "unidentified" devices.
 
 ### 5.3 Role power state
-Per role: `Off | On`, derived from the bus entry of the LA it currently maps
-to, using the role's `on`/`off` event lists. State changes produce decisions;
+Per role: `Off | On`, derived from configured `on`/`off` bus signals, commands,
+or opt-in console start evidence. State changes produce decisions;
 duplicates (same state) are ignored (replaces today's `rbe` nodes).
+`RoleState.on_since: Option<Instant>` records each Off→On transition.
+Probe roles keep private, non-persisted `start: Option<StartEvidence>` with
+first-Unreachable query-send `at`, `last_standby: Instant`, and lifecycle state
+Pending / Woke { decision } / Superseded / Confirmed { decision } / Rejected.
+All direct samples date the query send, not its reply. Two consecutive
+Unreachable samples after Standby establish a start; only a configured On frame
+confirms it. Standby retracts unconfirmed evidence and `boot_s` expires it.
+Warming/blocked roles defer retraction/expiry; warming deadlines clamp to
+`max(boot deadline, warm_until)`, blocked deadlines wait for usable identity.
+Reload/entering Shadow release unconfirmed early wakes before clearing evidence.
 
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
@@ -378,6 +389,36 @@ an unknown fallback with `observed: "absent"` only when
 and a fresh disagreement at the reporting deadline is missed. Sequence ACK/NACK
 accounting, address-move retargeting and cancellation on bridge offline/reload/
 shadow are unchanged; independent probe confirmation does not stop retries.
+
+Boot evidence bounds start time to `(last Standby send, first Unreachable send]`.
+A console is provably newer only if `last_standby > active_role.on_since`;
+older or ambiguous intervals favor the active role. Idle cadence is the ordering
+resolution (one-second polling provides one-second resolution).
+Within `boot_s`, a losing On announcement records `late_announcement`, releases
+the loser (including a still-On role; record its actual from state), and stops it
+per policy. Then broadcast `86 <winner PA>` if verified/known. Select the winner's
+different HA source only when no settle is pending for it. Parent standby
+verification/expectations to this row; source expectations require an emitted
+select. Preserve winner intent/settle/expectations. Rejected suppresses repeats.
+An unconfirmed evidence-only On role is also marked Off with actionless
+`taken_over` when displacement cannot send a stop because its LA is unknown.
+
+Probe `start_wake = "off"` (default) tracks ordering with no early rows.
+Both policies share eligibility: warming, blocked, already On, an older/ambiguous
+start, or an empty immediate wake plan silently marks Superseded. No LA is
+required for early room wake. Would never emits an empty `console_start` row.
+`"would"` records `console_start` Off→Off with exactly the ordinary wake actions,
+`would = true`, no expectations/verdict or control mutation; those actions
+never enter the engine's return vector. Frame confirmation parents the real
+wake to it. Retraction/expiry records actionless would rows
+`console_start_retracted` / `console_start_expired` (timer `console_boot`).
+Its late-announcement row is hypothetical too: ordinary arrival-order takeover
+still executes. `"act"` runs the ordinary On transition on evidence unless
+a newer role already won; frame confirmation then causes no duplicate wake.
+Retraction/expiry of an unconfirmed early wake releases it through normal Off
+and room-off scheduling. TV/receiver expectations match ordinary wakes, never
+the console's own power. Remote Play can trigger an early wake; there is no gate.
+This is evidence, not phase-4 anticipatory prediction.
 
 ### 5.5 Release (role turns Off)
 Start/restart `off_delay_s` timer. On expiry, if no role is On: `TvOff` and `HaCall{media_player.turn_off, receiver}`. `TvOff` uses HA by default, or native webOS SSAP over TLS (default port 3001) with an environment-only pairing key. Native off has one five-second connect/register/request/close deadline per attempt, three attempts one second apart, and no HA fallback. If a role turned On meanwhile the timer is cancelled.
@@ -448,14 +489,20 @@ one second. First reply line `HTTP/1.1 200 …` maps to Awake, `620 …` to Stan
 silence, transport errors or unsupported replies map to Unreachable.
 Active wake transitions start an Awake window; dispatched CEC stop sequences
 for that role start a Standby window. Poll immediately then every
-`verify.probe_poll_ms` (default 2000, 500–10000), until target or
-`probe_window_s` (default 45, 5–300 seconds). A new target cancels the previous
-role window; duplicate stop retries do not extend a pending window. Shutdown
-and adapter reload cancel all windows, including in-flight queries.
+`verify.probe_poll_ms` (default 2000, 500–10000), for the full
+`probe_window_s` (default 45, 5–300 seconds), never stopping at a target.
+A new target cancels the previous role window; duplicate stop retries do not
+extend a pending window. Idle reads resume afterward every probe `idle_poll_s`
+(default 2, 1–60 seconds), including while logically Off. All direct observers
+sample immediately on startup. Shutdown/reload cancel in-flight reads.
 `Event::ConsolePower { role, state: Awake|Standby|Unreachable, at }` updates
 the role's separate, non-persisted `direct` observation; `RoleView` exposes
 `direct: Option<(ConsoleState, DateTime<Utc>)>` and `probe_configured: bool`.
 Remote Play must be enabled and UDP reachability provided by the operator.
+Optional probe keys `start_wake = "off" | "would" | "act"` and `boot_s = 30`
+(5–120 seconds) control start evidence above. Unknown keys are rejected;
+these keys belong inside `probe`, so non-off policy requires a probe.
+There is no cross-bound between boot duration and window poll cadence.
 
 ### 5.5.1 Expectations and verdicts
 
@@ -601,8 +648,20 @@ expectation-only tail.
 
 
 ### 5.6 Startup / resync
-On start and on bridge online (Tasmota LWT `Online`; aether `status.online:true` or a `boot` change): send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 (and any LA in config `match.physical` tables); the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
+On start and on bridge online (Tasmota LWT `Online`; aether `status.online:true` or a `boot` change): send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 plus currently bound role LAs; the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
 Resync additionally sends `83` immediately to each unverified restored LA. This counts as its first query; without identification progress, the next `83` waits `identify_retry_s`, not merely the one-second send slot.
+
+Every emitted Resync records `resync_at`. For five seconds thereafter, while
+intent is Unknown, hold role signals from broadcast `82`, `90 00`, and `84`:
+learn bus/identity without buffering those frame signals during the window,
+but still reconcile previously buffered explicit wakes when identities bind.
+Resolve on receiver power (direct first, otherwise HA). On adopts held sources;
+Off discards; unknown at the deadline discards. If an LA is still unbound at
+the deadline, On returns its held signals to normal replay-on-bind buffers;
+otherwise record `startup_source_ignored` with role None. Record once per resync,
+with the original frame trigger. A second resync reports discards before reset.
+Warm-up completion never replays still-held inputs.
+Outside that window or after intent becomes known, normal role signals apply.
 
 #### Persisted state
 
@@ -616,6 +675,10 @@ None). Source-settle rows link to their wake
 decision; standby mechanics and outcomes belong to the decision dispatching
 the stop, including across address moves. Timer rows retain their timer
 trigger even when another input processes the deadline.
+Core rows additionally carry `would: bool`, omitted when false; views combine
+it with shadow suppression. Reasons `console_start`, `console_start_retracted`,
+`console_start_expired`, `late_announcement`, `startup_source_ignored` use
+`observation/ps5`, `frame`, or timer `console_boot` provenance as appropriate.
 Version 1 is
 atomically migrated in place: ring-order ids start at 1, parents are null,
 triggers are `service {name:"migrated"}`, and the next counter is ring length
@@ -712,7 +775,7 @@ it is captured as `tv/unavailable` with an empty object payload.
 `ReceiverPower{state: DirectPower, at: DateTime<Utc>, source_code: Option<String>}` updates only the
 receiver direct cache. TV uses the same shared `DirectPower` enum.
 `ConsolePower{role, state: Awake|Standby|Unreachable, at: DateTime<Utc>}`
-updates only the role's direct observation, never its CEC-derived logical power.
+updates the role's direct observation and start-evidence classifier (§5.3–5.4).
 `Frame.ack` (observed ACK bit) and `Frame.t_us` (bridge-monotonic µs) are
 `None` on Tasmota; the engine never reads them — the aether adapter already reduced a NACK-cut directed `rx` to header-only before the engine sees it (§1).
 `SendResult.status: SendStatus = Ack | Nack | ArbLost | LineError | Busy`,

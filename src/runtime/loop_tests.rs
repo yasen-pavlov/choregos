@@ -1296,6 +1296,7 @@ async fn native_retained_status_resync_and_id_correlated_outcomes_reach_the_engi
         (4, 15, "84210004"),
         (4, 15, "870010FA"),
         (4, 0, "4753747265616D6572"),
+        (4, 0, "04"), // Explicit user wake, not a startup resync announcement.
         (4, 15, "822100"),
     ] {
         seq += 1;
@@ -1457,7 +1458,8 @@ async fn saved_bridge_kind_switch_subscribes_to_native_status_and_bus_and_resync
         (1, 15, "84210004"),
         (2, 15, "870010FA"),
         (3, 0, "4753747265616D6572"),
-        (4, 15, "822100"),
+        (4, 0, "04"),
+        (5, 15, "822100"),
     ] {
         harness.peer.publish("aether/cec-bridge/bus", false,
             json!({"ev":"rx","seq":seq,"from":4,"to":to,"data":data,"ack":true,"t_us":seq*1000}).to_string()).await;
@@ -1582,11 +1584,15 @@ async fn console_observation_windows_follow_wake_and_dispatched_stop() {
     config.device[0].probe = Some(ProbeConfig::Ps5 {
         host: "127.0.0.1".into(),
         port: server.local_addr().unwrap().port(),
+        idle_poll_s: 2,
+        start_wake: crate::config::StartWake::Off,
+        boot_s: 30,
     });
     let now = Instant::now();
-    let wall = chrono::Utc::now();
+    let wall: chrono::DateTime<chrono::Utc> = "2026-11-07T12:00:00Z".parse().unwrap();
     let mut engine = Engine::new(config, now, vec![], 1);
     let now = now + Duration::from_secs(4);
+    let wall = wall + chrono::Duration::seconds(4);
     for data in ["84210004", "870010FA"] {
         engine.handle(
             Event::Frame(Frame::from_hex(4, 15, data).unwrap()),

@@ -307,7 +307,9 @@ impl Engine {
                             receiver_power_sources(&self.config).to_vec(),
                             self.config.verify.receiver_off_s * 1000,
                         )),
-                        "select_source" if reason == "takeover_settled" => {
+                        "select_source"
+                            if matches!(reason, "takeover_settled" | "late_announcement") =>
+                        {
                             data.get("source").and_then(Value::as_str).map(|source| {
                                 self.expectation(
                                     "receiver",
@@ -354,7 +356,7 @@ impl Engine {
                     expectations.extend(self.role_expectation(&device.role));
                 }
             }
-        } else if matches!(reason, "all_off" | "manual_standby")
+        } else if matches!(reason, "all_off" | "manual_standby" | "late_announcement")
             && let Some(role) = role
             && self.stopped_roles.iter().any(|stopped| stopped == role)
         {

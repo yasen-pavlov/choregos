@@ -48,9 +48,9 @@ Decision
   role / from / to / reason / actions / would   unchanged
   trigger       {"kind":"frame","from":u8,"to":u8,"data":"HEX"}
               | {"kind":"command","command":<Command with kind and optional data>}
-              | {"kind":"timer","name":"room_off"|"takeover_settle"|"presence"|"standby_verification"|"warmup"|"drift_grace"}
+              | {"kind":"timer","name":"room_off"|"takeover_settle"|"presence"|"standby_verification"|"warmup"|"drift_grace"|"console_boot"}
               | {"kind":"service","name":"started"|"migrated"}
-              | {"kind":"observation","source":"ha"|"tv_direct"}
+              | {"kind":"observation","source":"ha"|"tv_direct"|"denon"|"ps5"}
   parent        Option<id>   for takeover_settled follow-ups
   expectations  [Expectation]   empty for rows with no observable effect
   verdict       pending | achieved | partial | missed | unknown | none
@@ -91,6 +91,9 @@ Latency on the verdict = the slowest `met` expectation.
 | `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct with webOS, otherwise ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (denon with observe, otherwise ha; 20 s) |
 | `all_off`, `manual_standby` | Same standby eligibility: CEC policies with verification enabled, or probe-only for a stopped role with a probe; no CEC expectation for HA media-stop/none policies |
 | everything else | none |
+| `console_start` in act | Ordinary wake expectations; never the initiating console's own power |
+| real `late_announcement` | Stopped console standby under normal takeover eligibility, plus receiver source only if selected; winner's pending expectations stay untouched |
+| any core `would` row | None, verdict `none`; full hypothetical actions stay on the row, never dispatched |
 
 Receiver power uses `denon` when `[receiver].observe` is configured, otherwise
 `ha`. Receiver source remains HA in either configuration. Deadlines remain
@@ -202,6 +205,55 @@ New:
   Cached On is current only if its HA change timestamp is newer than the last
   room-off request; the timestamp remains across repeated wakes during HA lag.
   All-off changes power intent only when its room-off timer expires.
+
+Console probes now share immediate idle → full action window → idle scheduling,
+regardless of logical role power. Per-probe `idle_poll_s = 2` (1–60) governs idle;
+`verify.probe_poll_ms` / `probe_window_s` govern windows after On or directed
+Standby dispatch. Targets never stop a window; same-target retries do not extend
+it. Startup, reload and entering active mode start idle immediately. TV and
+receiver idle also sample at t=0. Each console sample remains `probe/state`.
+All direct `at` timestamps date query send, not reply delivery. Thus timeout
+latency cannot make an older console start appear newer than a remote press.
+
+## Start evidence
+
+Standby followed by two consecutive Unreachable samples identifies a console
+start bounded by `(last Standby send, first Unreachable send]`. Expiry is dated
+to the first Unreachable send. Only a configured CEC On frame confirms; Awake
+does not, because Remote Play looks the same. Standby retracts unconfirmed starts,
+and `boot_s = 30` (5–120 seconds) expires them. Warming/blocked roles defer both;
+warming deadlines clamp to warm-up completion, blocked deadlines do not spin.
+Reload/entering Shadow release unconfirmed early wakes before clearing evidence.
+
+Per-probe `start_wake` defaults to `off` (ordering only). Enable `would` first:
+`console_start` Off→Off lists the ordinary wake actions without executing or
+mutating control state, expectations or intent. Its later ordinary wake is
+parented to that row. Actionless `console_start_retracted` and
+`console_start_expired` would rows report the experiment's outcome.
+Would and act share eligibility: older/ambiguous start, warming, blocked,
+already On or an empty immediate action plan suppresses the early start silently.
+No LA is needed. Would never records an empty `console_start` action plan.
+`act` runs the normal wake immediately, or releases it normally on retraction/
+expiry (`timer/console_boot`). Remote Play can wake the room; no extra gate.
+
+A console wins only when its last Standby is newer than the active role's
+`on_since`; older/ambiguous boot intervals lose. Ordering resolution is idle
+cadence (one-second polling gives one-second resolution). `late_announcement`
+releases/stops the loser, even if still On, then reasserts the winner's verified
+stream path. Skip HA source selection/its expectation while the winner's settle
+is pending; preserve its intent/settle/expectations. Suppress the repeated burst.
+Displacement releases evidence-only On roles even when their LA is not yet known.
+In would mode the reversal is inert and today's arrival-order takeover executes.
+These are observed starts, not phase-4 predictive/anticipatory wake.
+
+A five-second startup-resync guard holds `82`, `90 00`, and `84` role signals
+while room intent is Unknown, learning the bus without buffering those signals.
+Still reconcile older explicit buffered wakes on identity binding. Receiver
+direct power (otherwise HA) On adopts; Off/unknown discards, recording actionless
+`startup_source_ignored` once per resync. At the deadline, unbound-LA holds return
+to normal replay-on-bind buffers only for receiver On; otherwise discard with
+role None. A second resync reports the discard of existing holds before reset.
+Warm-up completion never replays still-held inputs.
 
 ## Room intent and drift
 

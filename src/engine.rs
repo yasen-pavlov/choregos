@@ -13,7 +13,7 @@ use crate::{
             SET_OSD_NAME, STANDBY, TEXT_VIEW_ON, USER_CONTROL_PRESSED,
         },
     },
-    config::{Config, PowerEvent, Presence, Takeover},
+    config::{Config, PowerEvent, Presence, StartWake, Takeover},
     identity::{self, Resolution},
     state::{BusPower, Command, ConsoleState, DirectPower, Mode, RolePower, RoomIntent, RoomPower},
 };
@@ -26,6 +26,7 @@ use std::{
 };
 
 mod expectations;
+mod start;
 use expectations::PendingDecision;
 /// HA attributes read by the decision engine and therefore needed in replay traces.
 pub const HA_ATTRS: &[&str] = &["source"];
@@ -82,6 +83,10 @@ pub struct RoleState {
     pub power: RolePower,
     pub last_event: Option<String>,
     pub direct: Option<(ConsoleState, DateTime<Utc>)>,
+    pub on_since: Option<Instant>,
+    start: Option<StartEvidence>,
+    start_baseline: Option<Instant>,
+    start_first: Option<Instant>,
     poll_at: Option<Instant>,
     awaiting: bool,
     misses: u32,
@@ -92,11 +97,31 @@ impl Default for RoleState {
             power: RolePower::Off,
             last_event: None,
             direct: None,
+            on_since: None,
+            start: None,
+            start_baseline: None,
+            start_first: None,
             poll_at: None,
             awaiting: false,
             misses: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StartEvidence {
+    at: Instant,
+    last_standby: Instant,
+    state: StartState,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StartState {
+    Pending,
+    Woke { decision: u64 },
+    Superseded,
+    Confirmed { decision: Option<u64> },
+    Rejected,
 }
 #[derive(Clone, Debug, Default)]
 pub struct HaState {
@@ -169,12 +194,12 @@ impl DecisionTrigger {
             }
             Event::Command(command) => Some(Self::Command(command.clone())),
             Event::ServiceStarted => Some(Self::Service(ServiceKind::Started)),
+            Event::ConsolePower { .. } => Some(Self::Observation(Via::Ps5)),
             Event::Tick
             | Event::HaState { .. }
             | Event::TvPower { .. }
             | Event::TvDirectUnavailable
             | Event::ReceiverPower { .. }
-            | Event::ConsolePower { .. }
             | Event::SendResult { .. }
             | Event::BridgeOnline
             | Event::ConfigReloaded(_)
@@ -323,6 +348,9 @@ pub struct Engine {
     settle: Option<(Instant, String, bool, u64)>,
     standby_verifications: Vec<StandbyVerification>,
     signals: BTreeMap<u8, Vec<PowerEvent>>,
+    resync_at: Option<Instant>,
+    startup_held: BTreeMap<(u8, u8), Frame>,
+    startup_ignored: bool,
 }
 impl Engine {
     pub fn new(
@@ -372,6 +400,9 @@ impl Engine {
             settle: None,
             standby_verifications: vec![],
             signals: BTreeMap::new(),
+            resync_at: None,
+            startup_held: BTreeMap::new(),
+            startup_ignored: false,
         }
     }
     fn required_queries(config: &Config) -> IdentifyQueries {
@@ -394,15 +425,20 @@ impl Engine {
             .then(|| self.bus.next_identify_deadline())
             .flatten();
         if self.warming {
-            return [Some(self.warm_until), identify]
-                .into_iter()
-                .flatten()
-                .chain(
-                    self.pending_decisions
-                        .values()
-                        .flat_map(|pending| pending.deadlines()),
-                )
-                .min();
+            return [
+                Some(self.warm_until),
+                identify,
+                self.start_deadline(),
+                self.resync_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(
+                self.pending_decisions
+                    .values()
+                    .flat_map(|pending| pending.deadlines()),
+            )
+            .min();
         }
         self.roles
             .iter()
@@ -422,6 +458,8 @@ impl Engine {
                     .flat_map(|pending| pending.deadlines()),
             )
             .chain(self.drift_deadlines())
+            .chain(self.start_deadline())
+            .chain(self.resync_deadline())
             .min()
     }
     pub fn handle(&mut self, event: Event, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
@@ -460,12 +498,7 @@ impl Engine {
                 self.observe_receiver_power(state, at);
                 vec![]
             }
-            Event::ConsolePower { role, state, at } => {
-                if let Some(role) = self.roles.get_mut(&role) {
-                    role.direct = Some((state, at));
-                }
-                vec![]
-            }
+            Event::ConsolePower { role, state, at } => self.observe_console(&role, state, at),
             Event::HaState {
                 entity,
                 state,
@@ -503,28 +536,34 @@ impl Engine {
             && !actions.is_empty()
             && self.decisions.is_empty()
         {
-            let id = self.record(
-                None,
-                None,
-                None,
-                reason,
-                command_stops.as_ref().unwrap_or(&actions).clone(),
-                None,
-            );
-            for pending in &mut self.standby_verifications {
-                let matches = match &self.trigger {
-                    Some(DecisionTrigger::Command(Command::AllOff)) => true,
-                    Some(DecisionTrigger::Command(Command::Standby(role))) => pending.role == *role,
-                    _ => false,
-                };
-                if matches && pending.parent.is_none() {
-                    pending.parent = Some(id);
-                }
-            }
+            self.record_command_actions(reason, command_stops.as_ref().unwrap_or(&actions).clone());
         }
         self.attach_command_stops(command_stops.as_deref().unwrap_or(&[]));
+        actions.extend(self.resolve_startup_signal());
+        actions.extend(self.expire_console_starts());
         actions.extend(self.timers(now, wall));
-        for action in &actions {
+        self.note_sent_actions(&actions);
+        self.evaluate_expectations(now);
+        self.evaluate_drift(now, drift_input);
+        actions
+    }
+
+    fn record_command_actions(&mut self, reason: &str, actions: Vec<Action>) {
+        let id = self.record(None, None, None, reason, actions, None);
+        for pending in &mut self.standby_verifications {
+            let matches = match &self.trigger {
+                Some(DecisionTrigger::Command(Command::AllOff)) => true,
+                Some(DecisionTrigger::Command(Command::Standby(role))) => pending.role == *role,
+                _ => false,
+            };
+            if matches && pending.parent.is_none() {
+                pending.parent = Some(id);
+            }
+        }
+    }
+
+    fn note_sent_actions(&mut self, actions: &[Action]) {
+        for action in actions {
             if let Action::CecSend { to, data } = action
                 && let Some(pending) = self
                     .standby_verifications
@@ -534,9 +573,6 @@ impl Engine {
                 pending.sent = pending.sent.saturating_add(1);
             }
         }
-        self.evaluate_expectations(now);
-        self.evaluate_drift(now, drift_input);
-        actions
     }
 
     fn handle_tv_direct_unavailable(&mut self) {
@@ -629,12 +665,15 @@ impl Engine {
     }
 
     fn handle_config_reloaded(&mut self, config: Arc<Config>, now: Instant) -> Vec<Action> {
+        self.release_unconfirmed_starts();
         self.cancel_reconfigured_expectations(&config);
         let bridge_changed = self.config.bridge != config.bridge;
         self.config = config;
         self.intent.receiver_source = None;
         self.tv_direct = None;
         self.receiver_direct = None;
+        self.startup_held.clear();
+        self.resync_at = None;
         self.tv_last_usable = None;
         self.receiver_last_usable = None;
         self.tv_direct_unavailable = false;
@@ -649,6 +688,9 @@ impl Engine {
         for device in &self.config.device {
             let role = self.roles.entry(device.role.clone()).or_default();
             role.direct = None;
+            role.start = None;
+            role.start_baseline = None;
+            role.start_first = None;
             role.poll_at = (role.power == RolePower::On && device.presence == Presence::Poll)
                 .then_some(now + Duration::from_secs(self.config.timing.presence_poll_s));
             role.awaiting = false;
@@ -797,12 +839,13 @@ impl Engine {
         {
             return;
         }
-        for role in previous_roles.keys() {
-            if !self.identity.roles.contains_key(role) && !self.identity.blocked.contains(role) {
-                actions.extend(self.transition(role, RolePower::Off, "identity_lost", now));
-            }
-        }
+        self.release_lost_roles(previous_roles, now, actions);
         let signal = self.signal(frame);
+        let signal = if self.hold_startup_signal(frame, signal) {
+            None
+        } else {
+            signal
+        };
         if let Some(signal) = signal {
             let signals = self.signals.entry(frame.from).or_default();
             signals.retain(|s| *s != signal);
@@ -823,7 +866,20 @@ impl Engine {
             if let Some((signal, target)) =
                 self.role_power_event(&role, la, previous_roles.get(&role).copied(), frame, signal)
             {
-                actions.extend(self.transition(&role, target, &format!("{signal:?}"), now));
+                actions.extend(self.apply_role_signal(&role, target, &format!("{signal:?}"), now));
+            }
+        }
+    }
+
+    fn release_lost_roles(
+        &mut self,
+        previous: &BTreeMap<String, u8>,
+        now: Instant,
+        actions: &mut Vec<Action>,
+    ) {
+        for role in previous.keys() {
+            if !self.identity.roles.contains_key(role) && !self.identity.blocked.contains(role) {
+                actions.extend(self.transition(role, RolePower::Off, "identity_lost", now));
             }
         }
     }
@@ -917,11 +973,19 @@ impl Engine {
         let mut actions = vec![];
         match command {
             Command::SetMode(mode) => {
+                if mode == Mode::Shadow {
+                    self.release_unconfirmed_starts();
+                }
                 Arc::make_mut(&mut self.config).mode = mode;
                 if mode == Mode::Shadow {
                     self.close_drifts();
                     self.cancel_expectations();
                     self.standby_verifications.clear();
+                    for state in self.roles.values_mut() {
+                        state.start = None;
+                        state.start_baseline = None;
+                        state.start_first = None;
+                    }
                 }
                 self.record(None, None, None, "command_set_mode", vec![], None);
             }
@@ -962,7 +1026,12 @@ impl Engine {
                         })
                         .collect();
                     for (role, signal, power) in newly_bound {
-                        actions.extend(self.transition(&role, power, &format!("{signal:?}"), now));
+                        actions.extend(self.apply_role_signal(
+                            &role,
+                            power,
+                            &format!("{signal:?}"),
+                            now,
+                        ));
                     }
                     self.record(None, None, None, "command_forget", vec![], None);
                 }
@@ -1018,11 +1087,15 @@ impl Engine {
             })
             .collect();
         for (role, power) in pending {
-            actions.extend(self.transition(&role, power, "resync_complete", now));
+            actions.extend(self.apply_role_signal(&role, power, "resync_complete", now));
         }
     }
     fn resync(&mut self, now: Instant) -> Vec<Action> {
+        self.discard_startup_holds();
         self.warming = true;
+        self.resync_at = Some(now);
+        self.startup_held.clear();
+        self.startup_ignored = false;
         self.warm_until = now + Duration::from_secs(3);
         let unverified = self.bus.reset_identification(now);
         for role in self.roles.values_mut() {
@@ -1077,12 +1150,27 @@ impl Engine {
         if self.warming || self.identity.blocked.contains(role) || !self.roles.contains_key(role) {
             return vec![];
         }
+        self.transition_role(role, target, reason, now)
+    }
+
+    /// Lifecycle release must also work during warm-up or identity conflicts.
+    /// Ordinary control transitions enter through `transition` above.
+    fn transition_role(
+        &mut self,
+        role: &str,
+        target: RolePower,
+        reason: &str,
+        now: Instant,
+    ) -> Vec<Action> {
         let state = self.roles.get_mut(role).expect("configured role");
         if state.power == target {
             return vec![];
         }
         let previous = state.power;
         state.power = target;
+        if target == RolePower::On {
+            state.on_since = Some(now);
+        }
         state.last_event = Some(reason.into());
         state.misses = 0;
         state.awaiting = false;
@@ -1097,39 +1185,7 @@ impl Engine {
         let first_decision = self.decisions.len();
         let mut scheduled_settle = None;
         if target == RolePower::On {
-            self.off_at = None;
-            if self.intent.power == RoomPower::Off || !self.power_is_on(&self.config.tv.entity) {
-                actions.push(Action::WakeTv);
-            }
-            self.stop_displaced_roles(role, now, &mut actions);
-            if self.is_state(&self.config.sonos.entity, "playing") {
-                actions.push(Action::ha(
-                    "media_player",
-                    "media_stop",
-                    &self.config.sonos.entity,
-                ));
-            }
-            let receiver_was_off = self.intent.power == RoomPower::Off
-                || !self.power_is_on(&self.config.receiver.entity);
-            if receiver_was_off {
-                actions.push(Action::ha(
-                    "media_player",
-                    "turn_on",
-                    &self.config.receiver.entity,
-                ));
-            }
-            let preset = receiver_was_off || self.intent.active_role.as_deref() != Some(role);
-            self.intent.power = RoomPower::On;
-            self.intent.active_role = Some(role.into());
-            self.intent.receiver_source = self.config.receiver.select_source.then(|| {
-                self.config
-                    .device
-                    .iter()
-                    .find(|device| device.role == role)
-                    .expect("configured role")
-                    .source
-                    .clone()
-            });
+            let preset = self.begin_wake(role, now, &mut actions);
             scheduled_settle = Some((
                 now + Duration::from_millis(self.config.timing.takeover_settle_ms),
                 role.into(),
@@ -1144,13 +1200,50 @@ impl Engine {
             Some(target),
             reason,
             actions.clone(),
-            None,
+            self.start_parent(role, target),
         );
         if let Some((deadline, role, preset)) = scheduled_settle {
             self.settle = Some((deadline, role, preset, id));
         }
         self.parent_transition_verifications(role, target, reason, first_decision, id);
         actions
+    }
+
+    fn begin_wake(&mut self, role: &str, now: Instant, actions: &mut Vec<Action>) -> bool {
+        self.off_at = None;
+        if self.intent.power == RoomPower::Off || !self.power_is_on(&self.config.tv.entity) {
+            actions.push(Action::WakeTv);
+        }
+        self.stop_displaced_roles(role, now, actions);
+        if self.is_state(&self.config.sonos.entity, "playing") {
+            actions.push(Action::ha(
+                "media_player",
+                "media_stop",
+                &self.config.sonos.entity,
+            ));
+        }
+        let receiver_was_off =
+            self.intent.power == RoomPower::Off || !self.power_is_on(&self.config.receiver.entity);
+        if receiver_was_off {
+            actions.push(Action::ha(
+                "media_player",
+                "turn_on",
+                &self.config.receiver.entity,
+            ));
+        }
+        let preset = receiver_was_off || self.intent.active_role.as_deref() != Some(role);
+        self.intent.power = RoomPower::On;
+        self.intent.active_role = Some(role.into());
+        self.intent.receiver_source = self.config.receiver.select_source.then(|| {
+            self.config
+                .device
+                .iter()
+                .find(|device| device.role == role)
+                .expect("configured role")
+                .source
+                .clone()
+        });
+        preset
     }
     fn stop_displaced_roles(&mut self, role: &str, now: Instant, actions: &mut Vec<Action>) {
         for other in self
@@ -1162,16 +1255,8 @@ impl Engine {
         {
             if self.roles[&other].power == RolePower::On {
                 let stop = self.stop_role(&other, now);
-                if !stop.is_empty() {
-                    let state = self.roles.get_mut(&other).expect("configured role");
-                    state.power = RolePower::Off;
-                    state.last_event = Some("taken_over".into());
-                    state.poll_at = None;
-                    state.awaiting = false;
-                    state.misses = 0;
-                    if let Some(la) = self.identity.roles.get(&other) {
-                        self.signals.remove(la);
-                    }
+                if !stop.is_empty() || self.roles[&other].unconfirmed_start_wake() {
+                    self.mark_role_off(&other, "taken_over");
                     self.record(
                         Some(other.clone()),
                         Some(RolePower::On),
@@ -1184,6 +1269,20 @@ impl Engine {
                 }
             }
         }
+    }
+
+    fn mark_role_off(&mut self, role: &str, reason: &str) -> RolePower {
+        let state = self.roles.get_mut(role).expect("configured role");
+        let previous = state.power;
+        state.power = RolePower::Off;
+        state.last_event = Some(reason.into());
+        state.poll_at = None;
+        state.awaiting = false;
+        state.misses = 0;
+        if let Some(la) = self.identity.roles.get(role) {
+            self.signals.remove(la);
+        }
+        previous
     }
 
     fn schedule_room_off(&mut self, role: &str, now: Instant) {
@@ -1233,15 +1332,7 @@ impl Engine {
                 };
                 self.standby_verifications
                     .retain(|pending| pending.la != la);
-                let frames: &[&[u8]] = if device.takeover == Takeover::CecPauseStandby {
-                    &[
-                        &[PLAY, PLAY_MODE_STILL],
-                        &[STANDBY],
-                        &[GIVE_DEVICE_POWER_STATUS],
-                    ]
-                } else {
-                    &[&[STANDBY], &[GIVE_DEVICE_POWER_STATUS]]
-                };
+                let frames = Self::stop_frames(device.takeover);
                 let actions = StandbyVerification::actions(la, frames);
                 if self.config.mode == Mode::Active && device.verify_standby {
                     self.standby_verifications.push(StandbyVerification {
@@ -1723,6 +1814,7 @@ impl Engine {
             to,
             reason: reason.into(),
             actions,
+            would: false,
             expectations,
             verdict,
             drift: None,

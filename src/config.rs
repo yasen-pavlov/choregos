@@ -313,11 +313,54 @@ pub enum ProbeConfig {
         host: String,
         #[serde(default = "default_probe_port")]
         port: u16,
+        #[serde(default = "default_probe_idle")]
+        idle_poll_s: u64,
+        #[serde(default)]
+        start_wake: StartWake,
+        #[serde(default = "default_probe_boot")]
+        boot_s: u64,
     },
 }
 
 fn default_probe_port() -> u16 {
     9302
+}
+
+fn default_probe_idle() -> u64 {
+    2
+}
+
+fn default_probe_boot() -> u64 {
+    30
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartWake {
+    #[default]
+    Off,
+    Would,
+    Act,
+}
+
+impl ProbeConfig {
+    pub fn start_wake(&self) -> StartWake {
+        match self {
+            Self::Ps5 { start_wake, .. } => *start_wake,
+        }
+    }
+
+    pub fn boot_s(&self) -> u64 {
+        match self {
+            Self::Ps5 { boot_s, .. } => *boot_s,
+        }
+    }
+
+    pub fn idle_poll_s(&self) -> u64 {
+        match self {
+            Self::Ps5 { idle_poll_s, .. } => *idle_poll_s,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -631,7 +674,7 @@ impl Config {
                 return invalid("device sources must be nonempty and unique");
             }
             device.validate_matching_and_policy()?;
-            if let Some(ProbeConfig::Ps5 { host, port }) = &device.probe
+            if let Some(ProbeConfig::Ps5 { host, port, .. }) = &device.probe
                 && (host.trim().is_empty()
                     || host.contains('/')
                     || host.chars().any(char::is_whitespace)
@@ -732,6 +775,14 @@ impl DeviceConfig {
             return invalid(
                 "CEC takeover with verify_standby = false requires removing power_on from on events: the stop/query reply could wake the role",
             );
+        }
+        if let Some(probe) = &self.probe {
+            if !(1..=60).contains(&probe.idle_poll_s()) {
+                return invalid("probe idle_poll_s must be in 1..=60 seconds");
+            }
+            if !(5..=120).contains(&probe.boot_s()) {
+                return invalid("probe boot_s must be in 5..=120 seconds");
+            }
         }
         Ok(())
     }
@@ -886,6 +937,9 @@ mod tests {
             config.device[0].probe = Some(ProbeConfig::Ps5 {
                 host: host.into(),
                 port,
+                idle_poll_s: 2,
+                start_wake: StartWake::Off,
+                boot_s: 30,
             });
             assert_eq!(config.validate().is_ok(), valid);
         }
@@ -1375,5 +1429,63 @@ mod receiver_observation_tests {
                 valid
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod console_start_tests {
+    use super::*;
+
+    #[test]
+    fn probe_start_policy_parses_old_files_and_validates_bounds_and_placement() {
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        let old: ProbeConfig = toml::from_str("kind='ps5'\nhost='console.example'").unwrap();
+        assert_eq!(
+            (old.idle_poll_s(), old.boot_s(), old.start_wake()),
+            (2, 30, StartWake::Off)
+        );
+        for (idle, boot, valid) in [
+            (1, 5, true),
+            (60, 120, true),
+            (0, 30, false),
+            (61, 30, false),
+            (2, 4, false),
+            (2, 121, false),
+        ] {
+            config.device[0].probe = Some(ProbeConfig::Ps5 {
+                host: "console.example".into(),
+                port: 9302,
+                idle_poll_s: idle,
+                start_wake: StartWake::Act,
+                boot_s: boot,
+            });
+            assert_eq!(
+                Config::parse(&toml::to_string(&config).unwrap()).is_ok(),
+                valid
+            );
+        }
+        // Boot timing is independent of the action-window poll interval.
+        config.verify.probe_poll_ms = 10000;
+        config.device[0].probe = Some(
+            toml::from_str("kind='ps5'\nhost='console.example'\nboot_s=5\nstart_wake='would'")
+                .unwrap(),
+        );
+        assert!(config.validate().is_ok());
+        for suffix in ["start_wake='maybe'", "unknown=1"] {
+            assert!(
+                toml::from_str::<ProbeConfig>(&format!(
+                    "kind='ps5'\nhost='console.example'\n{suffix}"
+                ))
+                .is_err()
+            );
+        }
+        let text = include_str!("../choregos.example.toml").replace(
+            "role = \"streamer\"",
+            "start_wake = \"act\"\nrole = \"streamer\"",
+        );
+        assert!(
+            Config::parse(&text).is_err(),
+            "a start policy outside probe is rejected"
+        );
     }
 }
