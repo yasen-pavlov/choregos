@@ -1,5 +1,54 @@
 # Golden replay corpus
 
+## 2026-11-07 (evening) — Probe trust and same-field closure
+
+Initial golden test passed before implementation. Three existing settlement
+rows change; every creation row, action, parent and expectation definition is
+unchanged, and the other six existing cases remain byte-identical:
+
+- `aether-restart-mid-takeover`, verdict 11: settlement moves from
+  09:40:30.142 to 09:40:04.595 UTC, when wake 12 closes its older TV Off field.
+  TV unknown, receiver met/6360 ms and aggregate partial are unchanged.
+- `aether-streamer-to-console-pause-standby`, verdict 2: settlement moves from
+  22:09:18.254 to 22:09:00.104 UTC, when room-off 5 closes TV On. Unknown
+  outcome/verdict are unchanged; this trace contains no direct TV samples.
+- `aether-console-late-takeover-baseline`, verdict 1: settlement moves from
+  12:58:32.624 to 12:58:25.153 UTC, when Console B wake 4 creates a newer TV On
+  expectation. The old TV field changes met/15095 ms → unknown (no fresh
+  sustained On run before closure), achieved → partial. Receiver met/0 remains.
+  The later TV On belongs to the newer command, not to both wakes.
+
+In particular `aether-receiver-off-first` and `aether-console-swap-probe` do not
+change. The invariant compares every creation byte and all other fields/rows,
+allowing only the three listed settlement timestamps and verdict 1's TV outcome
+and aggregate verdict. No added/removed decisions exist in these nine cases;
+normalizing ids/parents/verdict_for therefore leaves the same comparison.
+
+**`aether-quick-cycles` — 12 decisions + 7 verdict lines.**
+Authentic 2026-11-07 20:53:10–20:55:05 UTC extraction with the standard public
+renames, receiver direct observation, `start_wake = "would"`, `rest_s = 30`
+and one-second console idle probing. The initial identity seed is unverified:
+the first Kodi activation binds at 20:53:19.642 from buffered Active Source,
+with HA/direct observations already On; no cold-start wake is invented.
+No early console-start rows are expected in this window.
+
+Live ring → replay decision mapping: 891→4, 892→5, 895→8, 896→9, 899→12.
+Their TV legs are respectively unknown, missed/unreachable, met/0, met/4002 ms,
+and met/6109 ms. Wake 5 is closed at 20:53:53.433: the shutdown command landed,
+and the TV stayed unreachable for about thirty seconds. Its eventual On at
+20:54:00 belongs after the user's next Off/On cycle, not to that old wake.
+Off 8 is already satisfied by current sustained unreachability and pre-settles.
+Wake 9 meets on its first fresh On query at 20:54:00.630 (delivery 00.804).
+Final Off 12 meets on the second fresh Unreachable query at 20:54:31.375.
+These exact query-send timings replace the initial approximate delivery-time
+estimates. The replay regression asserts each outcome and that no TV field's
+settlement is later than the next same-field decision.
+
+The accepted review fixes (rejected-episode retention, per-frame wake trust,
+probe-preserving reloads, winner release, announcement coalescing and raw Shadow
+closure) leave every golden byte unchanged. Their new boundary cases use injected
+replay tests; no additional rows or re-blessing are required.
+
 ## 2026-11-07 — Console start evidence and startup source guard
 
 Five original cases stay byte-identical. In `aether-restart-mid-takeover` only

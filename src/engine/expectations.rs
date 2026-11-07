@@ -64,6 +64,13 @@ struct Observation<'a> {
     latency_ms: u64,
 }
 
+#[derive(Clone, Copy)]
+enum EvidenceMode {
+    Current,
+    Run,
+    Retained,
+}
+
 #[derive(Default)]
 struct ExpectationProgress {
     cec_disagreement_at: Option<u64>,
@@ -120,6 +127,24 @@ fn direct_sample(
     Some((value, at))
 }
 impl Engine {
+    pub(super) fn drift_closure_sample(
+        &self,
+        subject: &str,
+        field: Field,
+        sources: &[Via],
+    ) -> Option<(Via, &str, DateTime<Utc>)> {
+        self.newest_independent_sample(subject, field, sources, None)
+            .or_else(|| {
+                sources.iter().find_map(|&via| {
+                    let cache = match via {
+                        Via::TvDirect => self.tv_last_usable,
+                        Via::Denon => self.receiver_last_usable,
+                        _ => None,
+                    };
+                    direct_sample(cache, via == Via::TvDirect).map(|(value, at)| (via, value, at))
+                })
+            })
+    }
     pub fn next_expectation_deadline(&self) -> Option<Instant> {
         self.pending_decisions
             .values()
@@ -204,7 +229,7 @@ impl Engine {
         via: Vec<Via>,
         deadline_ms: u64,
     ) -> Expectation {
-        let mut expectation = Expectation {
+        Expectation {
             subject: subject.into(),
             field,
             expect: expect.into(),
@@ -212,9 +237,7 @@ impl Engine {
             deadline_ms,
             attempts: 0,
             outcome: Outcome::Pending,
-        };
-        self.settle_already_satisfied(&mut expectation);
-        expectation
+        }
     }
 
     fn tv_expectation(&self, value: &str) -> Expectation {
@@ -381,26 +404,7 @@ impl Engine {
         let expectations: Vec<_> = self
             .stopped_roles
             .iter()
-            .filter(|role| {
-                self.config
-                    .device
-                    .iter()
-                    .find(|device| device.role == **role)
-                    .is_some_and(|device| {
-                        actions.iter().any(|action| match action {
-                            Action::CecSend { to, data } => {
-                                data == &[STANDBY] && self.identity.roles.get(*role) == Some(to)
-                            }
-                            Action::HaCall {
-                                entity, service, ..
-                            } => {
-                                service == "media_stop"
-                                    && device.media_player.as_ref() == Some(entity)
-                            }
-                            _ => false,
-                        })
-                    })
-            })
+            .filter(|role| self.command_stop_dispatched(role, actions))
             .filter(|role| {
                 !self.decisions.iter().any(|decision| {
                     decision.expectations.iter().any(|expectation| {
@@ -416,49 +420,77 @@ impl Engine {
         if expectations.is_empty() {
             return;
         }
-        let index = if let Some(index) = self.decisions.iter().position(|decision| {
-            matches!(
-                decision.reason.as_str(),
-                "all_off" | "manual_standby" | "command_all_off" | "command_standby"
-            )
-        }) {
-            index
-        } else {
-            let reason = match self.trigger {
-                Some(DecisionTrigger::Command(Command::AllOff)) => "command_all_off",
-                _ => "command_standby",
-            };
-            self.record(None, None, None, reason, actions.to_vec(), None);
-            self.decisions.len() - 1
-        };
+        let index = self.command_stop_row(actions);
         let id = self.decisions[index].id;
-        for (role, expectation) in expectations {
-            if !self.decisions[index]
-                .expectations
-                .iter()
-                .any(|existing| existing.subject == expectation.subject)
-            {
-                self.decisions[index].expectations.push(expectation.clone());
-                self.decisions[index].verdict = verdict(&self.decisions[index].expectations);
-                if self.decisions[index].verdict == Verdict::Pending {
-                    self.pending_decisions
-                        .entry(id)
-                        .and_modify(|pending| pending.push(expectation))
-                        .or_insert_with(|| {
-                            PendingDecision::new(
-                                self.now,
-                                self.wall,
-                                self.decisions[index].expectations.clone(),
-                                |_| false,
-                            )
-                        });
-                }
-            }
+        for (role, mut expectation) in expectations {
+            let _ = self.prepare_expectations(std::slice::from_mut(&mut expectation));
+            self.attach_role_expectation(index, expectation);
             for pending in &mut self.standby_verifications {
                 if pending.role == role && pending.parent.is_none() {
                     pending.parent = Some(id);
                 }
             }
+        }
+    }
+
+    fn command_stop_dispatched(&self, role: &str, actions: &[Action]) -> bool {
+        let device = self
+            .config
+            .device
+            .iter()
+            .find(|device| device.role == role)
+            .expect("configured role");
+        actions.iter().any(|action| match action {
+            Action::CecSend { to, data } => {
+                data == &[STANDBY] && self.identity.roles.get(role) == Some(to)
+            }
+            Action::HaCall {
+                entity, service, ..
+            } => service == "media_stop" && device.media_player.as_ref() == Some(entity),
+            _ => false,
+        })
+    }
+
+    fn command_stop_row(&mut self, actions: &[Action]) -> usize {
+        if let Some(index) = self.decisions.iter().position(|decision| {
+            matches!(
+                decision.reason.as_str(),
+                "all_off" | "manual_standby" | "command_all_off" | "command_standby"
+            )
+        }) {
+            return index;
+        }
+        let reason = match self.trigger {
+            Some(DecisionTrigger::Command(Command::AllOff)) => "command_all_off",
+            _ => "command_standby",
+        };
+        self.record(None, None, None, reason, actions.to_vec(), None);
+        self.decisions.len() - 1
+    }
+
+    fn attach_role_expectation(&mut self, index: usize, expectation: Expectation) {
+        if self.decisions[index]
+            .expectations
+            .iter()
+            .any(|existing| existing.subject == expectation.subject)
+        {
+            return;
+        }
+        self.decisions[index].expectations.push(expectation.clone());
+        self.decisions[index].verdict = verdict(&self.decisions[index].expectations);
+        if self.decisions[index].verdict == Verdict::Pending {
+            let id = self.decisions[index].id;
+            self.pending_decisions
+                .entry(id)
+                .and_modify(|pending| pending.push(expectation))
+                .or_insert_with(|| {
+                    PendingDecision::new(
+                        self.now,
+                        self.wall,
+                        self.decisions[index].expectations.clone(),
+                        |_| false,
+                    )
+                });
         }
     }
 
@@ -471,56 +503,53 @@ impl Engine {
         match via {
             Via::TvDirect => direct_sample(self.tv_direct, self.tv_unreachable_streak >= 2),
             Via::Denon => direct_sample(self.receiver_direct, false),
-            Via::Ps5 => subject
-                .strip_prefix("role:")
-                .and_then(|role| self.roles.get(role))
-                .and_then(|role| role.direct)
-                .and_then(|(state, at)| match state {
+            Via::Ps5 => {
+                let role = self.roles.get(subject.strip_prefix("role:")?)?;
+                let (state, at) = role.direct?;
+                match state {
                     ConsoleState::Awake => Some(("on", at)),
-                    ConsoleState::Standby => Some(("standby", at)),
-                    ConsoleState::Unreachable => None,
-                }),
-            Via::Ha => {
-                let entity = match subject {
-                    "tv" => Some(&self.config.tv.entity),
-                    "receiver" => Some(&self.config.receiver.entity),
-                    "speakers" => Some(&self.config.sonos.entity),
+                    ConsoleState::Standby if role.probe_standby_trusted() => Some(("standby", at)),
                     _ => None,
-                };
-                entity
-                    .and_then(|entity| self.ha.get(entity))
-                    .and_then(|state| {
-                        if matches!(state.state.as_str(), "unknown" | "unavailable") {
-                            return None;
-                        }
-                        let value = match field {
-                            Field::Source => state.attrs.get("source")?.as_str()?,
-                            Field::Power => match state.state.as_str() {
-                                "on" | "playing" | "paused" | "idle" | "buffering" => "on",
-                                "off" | "standby" => "off",
-                                other => other,
-                            },
-                            Field::Playback
-                                if matches!(
-                                    state.state.as_str(),
-                                    "idle" | "paused" | "off" | "stopped" | "standby"
-                                ) =>
-                            {
-                                "stopped"
-                            }
-                            _ => &state.state,
-                        };
-                        Some((
-                            value,
-                            match field {
-                                Field::Source => state.updated?,
-                                Field::Power | Field::Playback => state.changed?,
-                            },
-                        ))
-                    })
+                }
             }
+            Via::Ha => self.ha_sample(subject, field),
             Via::Cec => None,
         }
+    }
+
+    fn ha_sample(&self, subject: &str, field: Field) -> Option<(&str, DateTime<Utc>)> {
+        let entity = match subject {
+            "tv" => &self.config.tv.entity,
+            "receiver" => &self.config.receiver.entity,
+            "speakers" => &self.config.sonos.entity,
+            _ => return None,
+        };
+        let state = self.ha.get(entity)?;
+        if matches!(state.state.as_str(), "unknown" | "unavailable") {
+            return None;
+        }
+        let value = match field {
+            Field::Source => state.attrs.get("source")?.as_str()?,
+            Field::Power => match state.state.as_str() {
+                "on" | "playing" | "paused" | "idle" | "buffering" => "on",
+                "off" | "standby" => "off",
+                other => other,
+            },
+            Field::Playback
+                if matches!(
+                    state.state.as_str(),
+                    "idle" | "paused" | "off" | "stopped" | "standby"
+                ) =>
+            {
+                "stopped"
+            }
+            _ => &state.state,
+        };
+        let at = match field {
+            Field::Source => state.updated?,
+            Field::Power | Field::Playback => state.changed?,
+        };
+        Some((value, at))
     }
 
     /// Select by the sample's timestamp, not adapter preference or arrival time.
@@ -547,11 +576,12 @@ impl Engine {
         wall: DateTime<Utc>,
         expectation: &Expectation,
         via: Via,
-        last_usable: bool,
+        mode: EvidenceMode,
     ) -> Option<Observation<'a>> {
-        let sample = match (via, last_usable) {
-            (Via::TvDirect, true) => direct_sample(self.tv_last_usable, true),
-            (Via::Denon, true) => direct_sample(self.receiver_last_usable, false),
+        let direct = matches!(via, Via::TvDirect | Via::Denon);
+        let sample = match mode {
+            EvidenceMode::Run if direct => self.direct_run_sample(via, wall),
+            EvidenceMode::Retained if direct => self.retained_direct_sample(via, wall),
             _ => self.independent_sample(&expectation.subject, expectation.field, via),
         };
         let (value, observed_at) = sample?;
@@ -564,6 +594,144 @@ impl Engine {
             value,
             latency_ms: (observed_at - wall).num_milliseconds() as u64,
         })
+    }
+
+    fn retained_direct_sample(
+        &self,
+        via: Via,
+        wall: DateTime<Utc>,
+    ) -> Option<(&'static str, DateTime<Utc>)> {
+        self.direct_run_sample(via, wall)
+            .filter(|(_, at)| *at > wall)
+            .or_else(|| {
+                let cache = match via {
+                    Via::TvDirect => self.tv_last_usable,
+                    Via::Denon => self.receiver_last_usable,
+                    _ => None,
+                };
+                direct_sample(cache, via == Via::TvDirect)
+            })
+    }
+
+    fn direct_run_sample(
+        &self,
+        via: Via,
+        wall: DateTime<Utc>,
+    ) -> Option<(&'static str, DateTime<Utc>)> {
+        let run = match via {
+            Via::TvDirect => self.tv_run,
+            Via::Denon => self.receiver_run,
+            _ => None,
+        }?;
+        if !run.sustained(via == Via::TvDirect)
+            || run.state == DirectPower::Unreachable && run.previous.is_none_or(|at| at <= wall)
+        {
+            return None;
+        }
+        direct_sample(Some((run.state, run.evidence_at())), via == Via::TvDirect)
+    }
+
+    /// Close before pre-settlement so no new cycle inherits pending ownership.
+    pub(super) fn prepare_expectations(
+        &mut self,
+        expectations: &mut [Expectation],
+    ) -> Vec<(String, Field)> {
+        let mut contested = vec![];
+        let mut pending = std::mem::take(&mut self.pending_decisions);
+        for old in pending.values_mut() {
+            self.close_matching_fields(old, expectations, &mut contested);
+        }
+        self.pending_decisions = pending;
+        self.publish_completed_expectations();
+        for expectation in expectations {
+            if !contested.iter().any(|(subject, field)| {
+                subject == &expectation.subject && *field == expectation.field
+            }) {
+                self.settle_already_satisfied(expectation);
+            }
+        }
+        contested
+    }
+
+    fn close_matching_fields(
+        &self,
+        old: &mut PendingDecision,
+        expectations: &[Expectation],
+        contested: &mut Vec<(String, Field)>,
+    ) {
+        for (expectation, progress) in old.expectations.iter_mut().zip(&old.progress) {
+            if expectation.outcome != Outcome::Pending {
+                continue;
+            }
+            let Some(new) = expectations
+                .iter()
+                .find(|new| new.subject == expectation.subject && new.field == expectation.field)
+            else {
+                continue;
+            };
+            self.close_expectation(old.wall, expectation, progress);
+            if self.direct_field(new)
+                && new.expect != expectation.expect
+                && matches!(expectation.outcome, Outcome::Unknown { .. })
+            {
+                contested.push((new.subject.clone(), new.field));
+            }
+        }
+    }
+
+    fn close_expectation(
+        &self,
+        wall: DateTime<Utc>,
+        expectation: &mut Expectation,
+        progress: &ExpectationProgress,
+    ) {
+        if expectation
+            .via
+            .iter()
+            .any(|via| matches!(via, Via::Cec | Via::Ps5))
+        {
+            progress.cancel(expectation);
+            return;
+        }
+        let newest = expectation
+            .via
+            .iter()
+            .filter_map(|&via| {
+                self.observation(wall, expectation, via, EvidenceMode::Run)
+                    .map(|sample| (via, sample))
+            })
+            .max_by_key(|(_, sample)| sample.latency_ms);
+        expectation.outcome = match newest {
+            Some((via, sample)) if sample_agrees(via, sample.value, &expectation.expect) => {
+                Outcome::Met {
+                    via,
+                    observed: sample.value.into(),
+                    latency_ms: sample.latency_ms,
+                }
+            }
+            Some((_, sample)) => Outcome::Missed {
+                observed: sample.value.into(),
+            },
+            None => Outcome::Unknown { observed: None },
+        };
+    }
+
+    fn publish_completed_expectations(&mut self) {
+        self.pending_decisions.retain(|&id, pending| {
+            if pending
+                .expectations
+                .iter()
+                .any(|e| e.outcome == Outcome::Pending)
+            {
+                return true;
+            }
+            self.verdicts.push(VerdictUpdate {
+                id,
+                verdict: verdict(&pending.expectations),
+                expectations: std::mem::take(&mut pending.expectations),
+            });
+            false
+        });
     }
 
     pub(super) fn cancel_woken_role_expectations(&mut self, role: &str) {
@@ -638,11 +806,6 @@ impl Engine {
     /// Creation alone may use a recent matching independent observation.
     /// CEC still requires its fresh, due verification check.
     fn settle_already_satisfied(&self, expectation: &mut Expectation) {
-        if self.direct_field(expectation)
-            && self.field_expectation_pending(&expectation.subject, expectation.field)
-        {
-            return;
-        }
         let newest = self.newest_independent_sample(
             &expectation.subject,
             expectation.field,
@@ -653,10 +816,7 @@ impl Engine {
             return;
         };
         let oldest = self.wall - chrono::Duration::milliseconds(expectation.deadline_ms as i64);
-        if !sample_agrees(via, value, &expectation.expect)
-            || at < oldest
-            || self.pending_sample_contested(expectation, at)
-        {
+        if !sample_agrees(via, value, &expectation.expect) || at < oldest {
             return;
         }
         expectation.outcome = Outcome::Met {
@@ -671,27 +831,6 @@ impl Engine {
             .via
             .iter()
             .any(|via| matches!(via, Via::TvDirect | Via::Denon))
-    }
-
-    pub(super) fn expectation_contested(&self, expectation: &Expectation) -> bool {
-        self.direct_field(expectation)
-            && self.pending_decisions.values().any(|pending| {
-                pending.expectations.iter().any(|previous| {
-                    previous.outcome == Outcome::Pending
-                        && previous.subject == expectation.subject
-                        && previous.field == expectation.field
-                        && previous.expect != expectation.expect
-                })
-            })
-    }
-
-    fn pending_sample_contested(&self, expectation: &Expectation, at: DateTime<Utc>) -> bool {
-        self.pending_decisions.values().any(|pending| {
-            pending.wall >= at
-                && pending.expectations.iter().any(|previous| {
-                    previous.subject == expectation.subject && previous.field == expectation.field
-                })
-        })
     }
 
     pub(super) fn refresh_tv_sources(&mut self) {
@@ -713,32 +852,23 @@ impl Engine {
         progress: &ExpectationProgress,
         expired: bool,
     ) {
-        if progress.contested && !expired {
+        let mode = match (progress.contested, expired) {
+            (true, false) => EvidenceMode::Run,
+            (true, true) => EvidenceMode::Retained,
+            (false, _) => EvidenceMode::Current,
+        };
+        let (matched, mut disagreement) = self.independent_outcome(wall, expectation, mode);
+        if let Some(outcome) = matched {
+            expectation.outcome = outcome;
             return;
         }
-        // Only current independent samples count; probe Unreachable remains unusable.
-        let mut disagreement = progress.cec_disagreement_at.map(|latency_ms| Observation {
-            value: "on",
-            latency_ms,
-        });
-        for &via in &expectation.via {
-            let Some(observation) =
-                self.observation(wall, expectation, via, progress.contested && expired)
-            else {
-                continue;
-            };
-            if sample_agrees(via, observation.value, &expectation.expect) {
-                expectation.outcome = Outcome::Met {
-                    via,
-                    observed: observation.value.into(),
-                    latency_ms: observation.latency_ms,
-                };
-                return;
-            } else if disagreement
-                .is_none_or(|previous| observation.latency_ms >= previous.latency_ms)
-            {
-                disagreement = Some(observation);
-            }
+        if let Some(latency_ms) = progress.cec_disagreement_at
+            && disagreement.is_none_or(|sample| latency_ms >= sample.latency_ms)
+        {
+            disagreement = Some(Observation {
+                value: "on",
+                latency_ms,
+            });
         }
         if progress.cec_met && (!expectation.via.contains(&Via::Ps5) || expired) {
             expectation.outcome = Outcome::CecOnly {
@@ -754,6 +884,34 @@ impl Engine {
                 },
             };
         }
+    }
+
+    fn independent_outcome<'a>(
+        &'a self,
+        wall: DateTime<Utc>,
+        expectation: &Expectation,
+        mode: EvidenceMode,
+    ) -> (Option<Outcome>, Option<Observation<'a>>) {
+        let mut disagreement: Option<Observation<'a>> = None;
+        for &via in &expectation.via {
+            let Some(observation) = self.observation(wall, expectation, via, mode) else {
+                continue;
+            };
+            if sample_agrees(via, observation.value, &expectation.expect) {
+                return (
+                    Some(Outcome::Met {
+                        via,
+                        observed: observation.value.into(),
+                        latency_ms: observation.latency_ms,
+                    }),
+                    disagreement,
+                );
+            }
+            if disagreement.is_none_or(|previous| observation.latency_ms >= previous.latency_ms) {
+                disagreement = Some(observation);
+            }
+        }
+        (None, disagreement)
     }
 
     pub(super) fn cancel_cec_expectations(&mut self) {

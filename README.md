@@ -157,8 +157,12 @@ Unreachable is not proof of standby. Role cards retain the last direct reading.
 
 Console `start_wake = "off"` tracks boot ordering only; `"would"` records inert
 early-wake/reversal decisions for observation before enabling `"act"`.
-Direct samples date query send, not reply. Two Unreachable samples after Standby
-bound a boot to `(last Standby send, first Unreachable send]`.
+Direct samples date query send, not reply. Two Unreachable samples after a trusted
+Standby run lasting `rest_s` (default 30 seconds, bounds 5–300) bound a boot to
+`(last Standby send, first Unreachable send]`. Trust requires Standby to begin
+after both the role's latest On transition and every configured On frame, even
+one rejected as late. Quick re-wakes without darkness use ordinary announcement
+order. Same-probe reload preserves the run/rest clock; changed probe config resets it.
 Only a configured CEC On frame confirms it. Standby retracts an unconfirmed
 start; `boot_s` (default 30 seconds) expires it. Act uses normal wake and release,
 including room-off delay. Remote Play can look like a start and wake the room.
@@ -168,6 +172,14 @@ resolution (choose one second for finer ordering). Would uses act's eligibility
 without executing its plan and preserves today's ordinary arrival-order takeover.
 Warming/blocked evidence defers expiry; reload/entering Shadow releases an
 unconfirmed early wake before clearing it.
+Within `boot_s`, the initial late reversal may be followed by three repeat stop/
+stream-path/source sequences; fourth/later repeats are suppressed until expiry.
+On frames within `takeover_settle_ms` of the last reversal form one announcement.
+Short/untrusted Standby runs preserve the rejected episode; trusted rest reaching
+`rest_s` ends it, allowing a later dark phase to identify a fresh start. If its
+winner releases, act accepts the console's next frame as ordinary wake. Would
+keeps reversals hypothetical, using its stored winner only while the console
+holds the live room; coalesced/capped frames still use ordinary live takeover.
 At startup, resync announcements cannot wake an Unknown room unless receiver
 power is known On within five seconds; bus identity learning still proceeds.
 
@@ -205,7 +217,7 @@ accepted **only through environment variables**, never as TOML keys:
 | `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
 | `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV deadline covers boot-to-service (observed 17–30 s), not HA reconnect lag; latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Continuous TV idle cadence: `tv_idle_poll_s = 15` (5–120 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
-| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302, idle_poll_s=2, start_wake="off", boot_s=30}`. Probe idle bounds 1–60 seconds; boot bounds 5–120; start policy `off` / `would` / `act`, live-reloadable. |
+| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302, idle_poll_s=2, start_wake="off", boot_s=30, rest_s=30}`. Probe idle bounds 1–60 seconds; boot bounds 5–120; settled-rest bounds 5–300; start policy `off` / `would` / `act`, live-reloadable. |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
 
 Direct receiver cadence is `receiver_poll_ms = 1000` (500–10000 ms),
@@ -346,14 +358,18 @@ In active mode, sustained TV/receiver power or receiver-source disagreement with
 room intent adds actionless `drift` / `drift_resolved` rows after the configured
 grace. These do not replace the last-decision sensor; the dedicated HA problem
 sensor reports the current open set, separately from settled decision verdicts.
-Direct-sourced fields cannot pre-settle while a same-field expectation is pending.
-An opposite-value pending expectation makes the new direct expectation contested:
-it waits until its deadline even on a matching fresh read. HA fields retain the
-sample-must-postdate-pending-decision rule. Drift resolves only on agreeing evidence
-newer than its opening disagreement; stale agreement or lost evidence cannot close it.
-Expired contested expectations retain the last usable direct sample across
-transient unusable reads; this retained evidence is not used by ordinary
-expectations, pre-settlement, drift or the dashboard.
+New same-field expectations first close older pending fields, using current
+sustained direct runs (three equal samples over four seconds; TV Unreachable
+uses two fresh failures) or one fresh HA sample: met, missed or unknown.
+CEC/probe cancellation preserves checked CEC success without extending retries.
+If an opposite direct field closed unknown, shutdown-lag protection passes to
+the new field: no pre-settlement or single-sample success, only a fresh sustained
+run or deadline evaluation. Met run latency starts at the first sample, not the
+settlement time. Ordinary fields still meet on their first fresh matching read.
+Drift resolves only on agreeing evidence newer than its opening disagreement.
+Intent-change closure reports the newest usable value, including retained direct
+evidence across a single failed query. Expired contested deadlines also retain
+usable direct evidence; ordinary reporting and the dashboard stay raw.
 
 ![Decision log](docs/decisions.png)
 

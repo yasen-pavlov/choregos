@@ -319,6 +319,8 @@ pub enum ProbeConfig {
         start_wake: StartWake,
         #[serde(default = "default_probe_boot")]
         boot_s: u64,
+        #[serde(default = "default_probe_rest")]
+        rest_s: u64,
     },
 }
 
@@ -334,6 +336,10 @@ fn default_probe_boot() -> u64 {
     30
 }
 
+fn default_probe_rest() -> u64 {
+    30
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StartWake {
@@ -344,6 +350,19 @@ pub enum StartWake {
 }
 
 impl ProbeConfig {
+    fn validate_timing(&self) -> Result<(), ConfigError> {
+        if !(1..=60).contains(&self.idle_poll_s()) {
+            return invalid("probe idle_poll_s must be in 1..=60 seconds");
+        }
+        if !(5..=120).contains(&self.boot_s()) {
+            return invalid("probe boot_s must be in 5..=120 seconds");
+        }
+        if !(5..=300).contains(&self.rest_s()) {
+            return invalid("probe rest_s must be in 5..=300 seconds");
+        }
+        Ok(())
+    }
+
     pub fn start_wake(&self) -> StartWake {
         match self {
             Self::Ps5 { start_wake, .. } => *start_wake,
@@ -353,6 +372,12 @@ impl ProbeConfig {
     pub fn boot_s(&self) -> u64 {
         match self {
             Self::Ps5 { boot_s, .. } => *boot_s,
+        }
+    }
+
+    pub fn rest_s(&self) -> u64 {
+        match self {
+            Self::Ps5 { rest_s, .. } => *rest_s,
         }
     }
 
@@ -777,12 +802,7 @@ impl DeviceConfig {
             );
         }
         if let Some(probe) = &self.probe {
-            if !(1..=60).contains(&probe.idle_poll_s()) {
-                return invalid("probe idle_poll_s must be in 1..=60 seconds");
-            }
-            if !(5..=120).contains(&probe.boot_s()) {
-                return invalid("probe boot_s must be in 5..=120 seconds");
-            }
+            probe.validate_timing()?;
         }
         Ok(())
     }
@@ -940,6 +960,7 @@ mod tests {
                 idle_poll_s: 2,
                 start_wake: StartWake::Off,
                 boot_s: 30,
+                rest_s: 30,
             });
             assert_eq!(config.validate().is_ok(), valid);
         }
@@ -1458,6 +1479,7 @@ mod console_start_tests {
                 idle_poll_s: idle,
                 start_wake: StartWake::Act,
                 boot_s: boot,
+                rest_s: 30,
             });
             assert_eq!(
                 Config::parse(&toml::to_string(&config).unwrap()).is_ok(),

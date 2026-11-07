@@ -92,7 +92,7 @@ Latency on the verdict = the slowest `met` expectation.
 | `all_off`, `manual_standby` | Same standby eligibility: CEC policies with verification enabled, or probe-only for a stopped role with a probe; no CEC expectation for HA media-stop/none policies |
 | everything else | none |
 | `console_start` in act | Ordinary wake expectations; never the initiating console's own power |
-| real `late_announcement` | Stopped console standby under normal takeover eligibility, plus receiver source only if selected; winner's pending expectations stay untouched |
+| real `late_announcement` | Stopped console standby under normal takeover eligibility, plus receiver source only if selected; same-field closure applies, winner intent/settle remain owned by the winner |
 | any core `would` row | None, verdict `none`; full hypothetical actions stay on the row, never dispatched |
 
 Receiver power uses `denon` when `[receiver].observe` is configured, otherwise
@@ -133,27 +133,32 @@ CEC retry sequence exhausts; this does not extend or reschedule CEC retries.
 
 ## Evaluation
 
-At creation, an expectation settles `met` with `latency_ms: 0` if the newest
-sample before the decision across its listed independent sources (`ha`,
-`tv_direct`, `denon`, or `ps5`, never `cec`) matches and is timestamped in
-`[decision.at - deadline_ms, decision.at)`. A newer disagreeing sample blocks
-an older match. For direct-sourced fields only, skip pre-settlement while any
-same-field expectation is pending. An opposite-value pending expectation makes
-the new direct expectation contested: even fresh agreeing reads cannot meet it
-early; at its deadline the newest usable fresh sample decides met/missed/unknown.
-Retain the newest usable direct sample separately from the raw cache, solely for
-expired contested evaluation. A +30 s On sample survives a single unusable
-Unreachable at +44 s and meets the +45 s deadline. All ordinary reporting still
-uses current raw samples; reload clears both caches, pairing loss clears TV's.
-HA fields keep the previous timestamp rule: the sample must postdate every
-pending decision carrying the same subject/field.
-The deadline bounds sample age, not room-cycle duration. HA uses `changed`
-for power/playback and `updated` for source attributes; direct sources use
-their timestamps.
-If every expectation is already satisfied, the decision is `achieved` at
-creation. CEC still requires fresh evidence at its due verification check.
-Otherwise evaluation and deadline freshness remain unchanged: observations
-arriving after creation must be newer than the decision, not merely recent.
+Before a new decision creates any subject/field expectation (same or opposite
+value), close every older pending field. TV/receiver direct evidence needs a
+current sustained run: three equal samples spanning at least four seconds, with
+run start newer than the old decision. TV Unreachable uses two fresh consecutive
+samples, dated at the second; receiver Unreachable is unusable. A matching run
+closes met, a contradicting run missed, otherwise unknown. HA already debounces:
+one fresh usable sample is its run. Met latency dates the run start, not closure.
+CEC/probe fields use cancellation instead: preserve checked CEC as cec_only,
+otherwise unknown; keep completed legs and independent CEC control slots intact.
+
+At creation a recent independent sample (`ha`, `tv_direct`, `denon`, `ps5`, never
+`cec`) in `[decision.at - deadline_ms, decision.at)` can pre-settle met/0.
+An opposite direct field that closed unknown passes contested shutdown-lag
+protection to the new expectation: skip pre-settlement and single-sample matches.
+A fresh matching sustained run can meet it early, with run-start latency; at the
+deadline use newest usable evidence. Opposite fields closed met/missed on a run
+leave the new field ordinary, so its first fresh matching sample still counts.
+No later room cycle can retroactively confirm an older command.
+
+Retain newest usable direct samples for expired contested deadlines and drift
+closure on intent change. A transient single failure cannot erase that evidence.
+Entering Shadow uses current raw evidence or unknown, without retained fallback.
+Ordinary expectations, pre-settlement, ongoing drift and dashboard remain raw;
+reload clears TV/receiver caches/runs and pairing loss clears TV's.
+HA uses `changed` for power/playback and `updated` for source; direct timestamps
+date query send. If all fields pre-settle, the decision immediately achieves.
 
 Deadlines are per-field config under `[verify]` with the defaults above;
 calibration may change the defaults in a later release, not the schema.
@@ -217,13 +222,21 @@ latency cannot make an older console start appear newer than a remote press.
 
 ## Start evidence
 
-Standby followed by two consecutive Unreachable samples identifies a console
-start bounded by `(last Standby send, first Unreachable send]`. Expiry is dated
-to the first Unreachable send. Only a configured CEC On frame confirms; Awake
+A trusted Standby run lasting at least `probe.rest_s = 30` (bounds 5–300 seconds)
+at the first Unreachable send, followed by two consecutive Unreachable samples,
+identifies a start bounded by `(last Standby send, first Unreachable send]`.
+Standby trust requires the run to start strictly after `max(on_since, awake_at)`;
+`awake_at` records every configured On frame, including rejected/suppressed late
+announcements. With neither timestamp the baseline is trusted. Every Awake/
+Unreachable breaks the run; stale Standby cannot verify a later stop or new start.
+Expiry is dated to the first Unreachable send. Only a configured On frame confirms; Awake
 does not, because Remote Play looks the same. Standby retracts unconfirmed starts,
 and `boot_s = 30` (5–120 seconds) expires them. Warming/blocked roles defer both;
 warming deadlines clamp to warm-up completion, blocked deadlines do not spin.
 Reload/entering Shadow release unconfirmed early wakes before clearing evidence.
+Unchanged probe configuration preserves the probe run and settled-rest baseline
+across reload, including distrust from an earlier On frame. Changed probe
+configuration clears both; raw observations and start episodes are cleared either way.
 
 Per-probe `start_wake` defaults to `off` (ordering only). Enable `would` first:
 `console_start` Off→Off lists the ordinary wake actions without executing or
@@ -241,10 +254,23 @@ A console wins only when its last Standby is newer than the active role's
 cadence (one-second polling gives one-second resolution). `late_announcement`
 releases/stops the loser, even if still On, then reasserts the winner's verified
 stream path. Skip HA source selection/its expectation while the winner's settle
-is pending; preserve its intent/settle/expectations. Suppress the repeated burst.
+is pending; preserve winner intent/settle. Allow three repeat sequences after the
+initial reversal, suppressing fourth/later repeats until `boot_s`. On frames within
+`takeover_settle_ms` of the last reversal are one announcement, not another repeat.
+Coalesced/over-cap frames suppress only the hypothetical row in would mode;
+ordinary live takeover still runs. Short or untrusted Standby runs preserve a
+rejected episode/winner. Once a trusted run reaches `rest_s`, end the episode,
+even within a long `boot_s`, so the next dark phase can start a fresh episode.
+Act repeats require
+another current active role; if it released, end the episode and wake normally.
+Would may reuse the stored winner only while the losing console holds the live room.
+New same-field observations close older pending fields normally.
 Displacement releases evidence-only On roles even when their LA is not yet known.
 In would mode the reversal is inert and today's arrival-order takeover executes.
 These are observed starts, not phase-4 predictive/anticipatory wake.
+Quick rest-to-awake cycles without a dark phase cannot supply start evidence;
+their ordering falls back to ordinary CEC announcement order. Settled-rest
+filtering rejects the short Standby run seen while entering rest, not Remote Play.
 
 A five-second startup-resync guard holds `82`, `90 00`, and `84` role signals
 while room intent is Unknown, learning the bus without buffering those signals.

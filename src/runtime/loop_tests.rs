@@ -1587,6 +1587,7 @@ async fn console_observation_windows_follow_wake_and_dispatched_stop() {
         idle_poll_s: 2,
         start_wake: crate::config::StartWake::Off,
         boot_s: 30,
+        rest_s: 30,
     });
     let now = Instant::now();
     let wall: chrono::DateTime<chrono::Utc> = "2026-11-07T12:00:00Z".parse().unwrap();

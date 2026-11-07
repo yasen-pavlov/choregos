@@ -618,6 +618,7 @@ mod tests {
             idle_poll_s: 2,
             start_wake: crate::config::StartWake::Off,
             boot_s: 30,
+            rest_s: 30,
         });
         let config = Arc::new(config);
         let (tx, mut rx) = mpsc::channel(8);
@@ -644,6 +645,7 @@ mod tests {
             idle_poll_s: 2,
             start_wake: crate::config::StartWake::Off,
             boot_s: 30,
+            rest_s: 30,
         });
         let config = Arc::new(replacement_config);
         observer.console(config.clone(), "streamer", ConsoleState::Standby);
