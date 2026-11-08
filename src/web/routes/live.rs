@@ -1,4 +1,5 @@
-//! `/bus`: frames interleaved with decisions, filterable, live via SSE.
+//! `/recorder/live`: today's frames interleaved with decisions, filterable, live via SSE
+//! (`/recorder/live/events`) unless follow is off.
 
 use std::convert::Infallible;
 
@@ -34,6 +35,9 @@ pub(crate) struct FilterQuery {
     opcode: String,
     #[serde(default)]
     hide_decisions: Option<String>,
+    /// `off` renders the page without the stream (the list freezes).
+    #[serde(default)]
+    follow: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,12 +127,17 @@ impl BusRow {
 }
 
 #[derive(Template)]
-#[template(path = "bus.html")]
-struct BusTemplate {
+#[template(path = "live.html")]
+struct LiveTemplate {
     layout: Option<Layout>,
     rows: Vec<BusRow>,
     filter: Filter,
-    stream_url: String,
+    /// The SSE endpoint, absent while follow is off.
+    stream_url: Option<String>,
+    /// The same page with follow toggled.
+    follow_url: String,
+    frames: usize,
+    oldest: Option<DateTime<Utc>>,
 }
 
 /// The whole table body; sent as the `reset` event when the stream (re)connects.
@@ -184,15 +193,27 @@ pub(crate) async fn page(
     let filter = Filter::parse(&query)?;
     let snapshot = web.app.snapshot();
     let (rows, _) = history(&snapshot, filter);
-    let stream_url = match filter.query() {
-        query if query.is_empty() => "/bus/events".to_owned(),
-        query => format!("/bus/events?{query}"),
+    let with = |path: &str, extra: Option<&str>| {
+        let query = [filter.query(), extra.unwrap_or_default().to_owned()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("&");
+        if query.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{path}?{query}")
+        }
     };
-    render(&BusTemplate {
-        layout: Some(Layout::new(ctx, "bus", &snapshot)),
+    let follow = query.follow.as_deref() != Some("off");
+    render(&LiveTemplate {
+        layout: Some(Layout::new(ctx, "recorder", &snapshot)),
         rows,
         filter,
-        stream_url,
+        stream_url: follow.then(|| with("/recorder/live/events", None)),
+        follow_url: with("/recorder/live", follow.then_some("follow=off")),
+        frames: snapshot.recent_frames.len(),
+        oldest: snapshot.recent_frames.front().map(|frame| frame.timestamp),
     })
 }
 
@@ -293,6 +314,7 @@ mod tests {
             la: la.to_owned(),
             opcode: opcode.to_owned(),
             hide_decisions: None,
+            follow: None,
         }
     }
 

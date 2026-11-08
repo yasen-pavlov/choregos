@@ -1,0 +1,21 @@
+{% let oob = true -%}
+{%- for f in s.all_fields() %}
+{% include "partials/config_was.html" %}
+{% include "partials/config_err.html" %}
+{%- if f.restate %}{% include "partials/config_control.html" %}{% endif %}
+{%- endfor %}
+{% include "partials/config_invalid.html" %}
+{%- for role in s.roles %}
+{% include "partials/config_role_head.html" %}
+{% include "partials/config_role_problems.html" %}
+{% include "partials/config_bus.html" %}
+{% include "partials/config_takeover_note.html" %}
+{%- if !role.probe.is_empty() %}{% include "partials/config_wake_note.html" %}{% endif %}
+{% include "partials/config_words.html" %}
+{%- endfor %}
+{%- for slot in s.slots %}
+{% include "partials/config_slot_problems.html" %}
+{%- endfor %}
+{% include "partials/config_problems.html" %}
+{% include "partials/config_foot.html" %}
+{% include "partials/config_nav.html" %}

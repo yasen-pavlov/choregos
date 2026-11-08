@@ -1,0 +1,9 @@
+{% let oob = false -%}
+<form id="section" class="panel flush cfg-raw" novalidate>
+  <input type="hidden" name="opened" value="{{ raw.opened }}">
+  <div class="ph"><label for="raw-text" class="mono">choregos.toml</label><span class="grow"></span>{% include "partials/config_raw_status.html" %}<span class="note desk-only">checked on every typing pause (500 ms)</span></div>
+  <textarea id="raw-text" name="raw" class="mono" spellcheck="false" autocomplete="off" rows="40" aria-describedby="raw-problems" hx-post="/config/validate" hx-trigger="input changed delay:500ms" hx-swap="none">
+{{ raw.text }}</textarea>
+  {% include "partials/config_raw_problems.html" %}
+  {% include "partials/config_raw_foot.html" %}
+</form>

@@ -1,0 +1,53 @@
+<div class="window" id="window-{{ id }}">
+  <div class="window-h">
+    <span class="mono dim">{{ span() }}</span>
+    <button type="button" class="btn sm ghost" hx-get="{{ resize.1 }}" hx-target="closest .window-slot" hx-indicator="closest .window-slot">{{ resize.0 }}</button>
+    <form class="row" hx-get="/p/window/{{ id }}" hx-trigger="change" hx-target="closest .window-slot" hx-indicator="closest .window-slot">
+      <input type="hidden" name="from" value="{{ from_s }}">
+      <input type="hidden" name="to" value="{{ to_s }}">
+      <input type="hidden" name="set" value="1">
+      <label class="check"><input type="checkbox" name="polls"{% if polls %} checked{% endif %}> polls</label>
+      <label class="check"><input type="checkbox" name="obs"{% if obs %} checked{% endif %}> observations</label>
+    </form>
+    <span class="chip pend htmx-indicator">loading</span>
+  </div>
+  <p class="legend small desk-only"><span class="chip info">trigger</span> the frame that caused this decision <span class="chip ours">ours</span> sent by Choregos or the bridge <span class="chip ok">reply</span> an answer to ours <span class="chip dim">other</span> everything else <span class="chip obs">obs</span> device observation</p>
+  <div class="scroll-x">
+    <table class="tbl window-tbl">
+      <thead><tr><th scope="col">Time</th><th scope="col">Dir</th><th scope="col">From → to</th><th scope="col">Data</th><th scope="col">Meaning</th><th scope="col">Tag</th><th scope="col">Result</th></tr></thead>
+      <tbody>
+        {%- for entry in entries %}
+        {%- match entry.item %}
+        {%- when Item::Frame(frame) %}
+        <tr class="wf {{ frame.dir.word() }} tag-{{ frame.tag.word() }}">
+          <td class="mono num t" title="{{ view::iso(entry.at) }}"><span class="hm">{{ view::clock_hm(entry.at) }}</span>{{ view::clock_s(entry.at) }}</td>
+          <td class="mono dir">{{ frame.dir.word() }}</td>
+          <td class="mono"><span title="{{ frame.from_name }}">{{ frame.from }}</span> → <span title="{{ frame.to_name }}">{{ frame.to }}</span> <span class="dim small names">{{ frame.from_name }} → {{ frame.to_name }}</span></td>
+          <td class="mono">{{ frame.data() }}</td>
+          <td class="meaning">{{ frame.meaning() }}</td>
+          <td><span class="chip {{ frame.tag.tone() }}">{{ frame.tag.word() }}</span></td>
+          <td class="mono small">{% if let Some(result) = frame.result %}<span class="{% if result.starts_with("ack") %}ok-text{% else %}bad-text{% endif %}">{{ result }}</span>{% endif %}</td>
+        </tr>
+        {%- when Item::Obs(observation) %}
+        <tr class="wobs">
+          <td class="mono num t" title="{{ view::iso(entry.at) }}">{{ view::clock(entry.at) }}</td>
+          <td class="mono dir">obs</td>
+          <td class="mono" colspan="3">{{ observation.text() }}{% if let Some(note) = observation.note %} <strong>— {{ note }}</strong>{% endif %}</td>
+          <td><span class="chip obs">obs</span></td>
+          <td></td>
+        </tr>
+        {%- when Item::Decision(row) %}
+        <tr class="wdec{% if row.own %} own{% endif %}{% if row.would %} would{% endif %}">
+          <td class="mono num t" title="{{ view::iso(entry.at) }}">{{ view::clock(entry.at) }}</td>
+          <td class="mono dir">decision</td>
+          <td colspan="5">{% if row.linked %}<a class="mono" href="/recorder/{{ row.id }}">#{{ row.id }}</a>{% else %}<span class="mono">#{{ row.id }}</span>{% endif %}{% if let Some(parent) = row.parent %} <span class="dim">↳ {{ parent }}</span>{% endif %} {{ view::opt(row.role) }} · <span class="mono">{{ row.reason }}</span> {% if row.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(row.verdict) }}">{{ row.verdict }}</span>{% endif %}</td>
+        </tr>
+        {%- endmatch %}
+        {%- else %}
+        <tr><td colspan="7" class="empty">No frames, observations or decisions in this window{% if !polls || !obs %} with these toggles{% endif %}.</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="note window-foot">{{ footer }}{% if truncated %} <strong>Window truncated:</strong> the trace read stopped at its cap (5000 entries, or 64 MiB / 2 M lines scanned) with more input left, so later rows are missing.{% endif %} The Result column comes from the bridge, per frame; decision rows never carry ack/nack.</p>
+</div>

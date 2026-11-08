@@ -1,0 +1,6 @@
+<div id="raw-problems" class="raw-problems"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {%- for (line, message) in raw.problems %}
+  <p class="ferr mono">{% if let Some(line) = line %}line {{ line }}: {% endif %}{{ message }}</p>
+  {%- endfor %}
+  {%- if raw.problems.is_empty() %}<p class="note">A parse or validation error shows here with its line and blocks review. Secrets are never written here: the file names environment variables.</p>{% endif %}
+</div>

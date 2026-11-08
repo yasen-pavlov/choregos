@@ -1,0 +1,25 @@
+<tbody id="recorder-rows">
+{%- for item in list.items %}
+{%- match item %}
+{%- when ListItem::Day(label) %}
+  <tr class="day"><td colspan="9" title="UTC day (the server's clock)">{{ label }}</td></tr>
+{%- when ListItem::Restart(decision) %}
+  <tr class="sep" id="row-{{ decision.id }}"><td colspan="9"><a href="/recorder/{{ decision.id }}">#{{ decision.id }}</a> · {{ view::clock(decision.timestamp) }} · service started — Choregos restarted; rows below were made by the previous run</td></tr>
+{%- when ListItem::Row(row) %}
+  {%- let decision = row.decision %}
+  <tr id="row-{{ decision.id }}"{% if decision.would %} class="would"{% endif %}>
+    <td class="mono"><a href="/recorder/{{ decision.id }}">{{ decision.id }}</a>{% if let Some(parent) = decision.parent %} <a class="dim parent" href="/recorder/{{ parent }}" title="Follow-up of #{{ parent }}">↳ {{ parent }}</a>{% endif %}</td>
+    <td class="mono num" title="{{ view::iso(decision.timestamp) }}">{{ view::clock(decision.timestamp) }}</td>
+    <td>{% if let Some(name) = row.role_name %}{{ name }}{% else %}<span class="dim">room</span>{% endif %}</td>
+    <td class="mono">{{ row.change }}</td>
+    <td><span class="mono" title="{{ view::reason_title(decision.reason) }}">{{ decision.reason }}</span> <span class="grp">{{ row.group }}</span></td>
+    <td class="mono dim">{{ row.trigger }}</td>
+    <td class="mono">{{ row.actions }}</td>
+    <td>{% if decision.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(decision.verdict) }}">{{ decision.verdict }}</span>{% endif %}</td>
+    <td class="mono num r">{% if let Some(latency) = row.latency %}{{ latency }}{% else if let Some(lasted) = row.lasted %}<span class="dim">lasted {{ lasted }}</span>{% else %}<span class="dim">{% if decision.verdict == crate::action::Verdict::Pending %}…{% else %}—{% endif %}</span>{% endif %}</td>
+  </tr>
+{%- endmatch %}
+{%- else %}
+  <tr><td colspan="9" class="empty">{% if list.filter.is_filtered() %}No decisions match these filters. <a href="/recorder">Clear filters</a>{% else %}No decisions yet.{% endif %}</td></tr>
+{%- endfor %}
+</tbody>

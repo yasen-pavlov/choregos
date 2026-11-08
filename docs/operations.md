@@ -7,11 +7,21 @@ Use a matching local `choregos` CLI for offline replay and extraction.
 
 ## Files in the config volume
 
-- **`choregos.toml`** is the configuration source of truth. The UI validates
-  and atomically replaces the editor text, preserving comments and order.
-  Secrets are environment-only and are not serialized into the configuration;
-  saving is not a scrubber for secrets pasted into comments. Back up the file
-  before manual edits, and stop the service while editing it outside the UI.
+- **`choregos.toml`** is the configuration source of truth. The UI's Config page
+  (section forms, the role editor and the raw TOML editor) reads the file itself
+  and applies each edit to the file's own text, so comments, ordering and
+  formatting survive, and every save goes through a review of the line diff. A
+  section form writes only the fields you changed, never the others.
+  Right before writing, Choregos reads the file again and refuses the save (with
+  a fresh review of your changes against the file as it is now) if it changed
+  since the editor read it — a hand edit of the mounted file or a mode switch;
+  review again. This is a check, not a lock: a
+  writer outside Choregos landing in the last moment between that check and the
+  atomic rename is not caught, so stop the service while editing the file outside
+  the UI. Secrets are environment-only and are not serialized into the
+  configuration; the UI shows only their variable names and whether each is set,
+  and saving is not a scrubber for secrets pasted into comments. Back up the file
+  before manual edits.
 - **`choregos.state.json`** version 2 holds learned identities, the newest 2000
   decisions (newest last), and `next_decision_id`; version 1 is migrated in place.
   It contains no live power or active-source state. Deleting it while stopped
@@ -22,12 +32,17 @@ Use a matching local `choregos` CLI for offline replay and extraction.
   headers, CEC traffic/results, bridge availability, accepted commands and HA
   engine inputs. `[trace] keep_days` controls retention (default 30, range
   0–365; 0 disables capture). Startup and daily rollover prune old files.
-  Trace write failures warn without stopping control.
+  Trace write failures warn without stopping control. The web UI's Recorder
+  (`/recorder/<id>`) reads a decision's bus window from these files when
+  capture is on and the day's file exists, otherwise from the ~6 h of frames
+  held in memory; `/recorder/live` shows the in-memory frames as they arrive.
 
 Decision ids are unique within a state-file lineage, not globally: after a crash
 or failed asynchronous writes, restart resumes from the last persisted counter.
 Deleting or restoring state can also reuse ids already present in traces or logs;
-correlate trace decision rows by `(ts, id)`, not by id alone.
+correlate trace decision rows by `(ts, id)`, not by id alone. The Recorder's bus
+window does the same: a trace decision row links to its detail page only when
+the ring holds that id at that time.
 
 **The container runs as UID/GID 65532.** Both the directory and its files must
 be accessible to that user. A root-owned mode-0600 config causes `Permission
@@ -55,7 +70,7 @@ curl --fail --silent --show-error http://127.0.0.1:8095/healthz
 
 The unauthenticated JSON endpoint reports `mqtt_connected`, `ha_connected`,
 `bridge_online` and `mode`. The image health check tests that the web process
-answers, not that every external connection is healthy. The dashboard header's
+answers, not that every external connection is healthy. The top bar's
 `mqtt`, `ha` and `bridge` pills show these connections; the mode and warming
 badges explain whether power actions are enabled or deferred.
 
@@ -70,7 +85,7 @@ also leaves the bridge offline. This field is not a test of every CEC device.
 HA discovery provides `binary_sensor.choregos_bridge` and diagnostic sensors
 `sensor.choregos_bridge_signal` (dBm), `sensor.choregos_bridge_link_count`
 (Wi-Fi connections since boot) and `sensor.choregos_bridge_uptime` (seconds).
-HA may retain operator-renamed entity IDs. The dashboard additionally shows
+HA may retain operator-renamed entity IDs. The cockpit additionally shows
 telemetry age, weak/stale telemetry warnings and native bridge line faults;
 old telemetry is not proof of a current connection.
 
@@ -83,7 +98,7 @@ window (default 45 seconds, range 5–300). It ends at the requested state or
 deadline, and a newer TV action replaces the previous window. Shadow mode
 does not start direct polling. HA-only TV power-off has no direct source.
 
-The dashboard TV row keeps HA state and shows the last direct state and its age.
+The cockpit TV card shows the direct sample and the HA state side by side with their ages.
 `unreachable` means the direct query failed (for example, connection failure,
 timeout, unsupported power-state service or an unrecognized response); it
 does **not** prove the TV is off. A pairing-required warning stops direct polling
@@ -237,13 +252,14 @@ golden test runs compare decisions against those expectations.
 
 ## Mode changes and config edits
 
-`select.choregos_mode` and the dashboard switch persist `mode` in the TOML.
+`select.choregos_mode` and the top-bar switch persist `mode` in the TOML.
 Shadow mode still sends read-only identification/resync queries and presence
 polls: it is not a network-isolated diagnostic mode.
 
 A successful UI save restarts both MQTT and HA adapters. Retained bridge online
 availability then triggers a resync burst. Bridge settings are live-editable;
-`web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` changes require stopping,
+`web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` are read-only in the UI
+(the raw editor rejects changes to them at validation) and require stopping,
 editing the mounted file and restarting. Validate startup configuration with
 `choregos check-config --config ./choregos/choregos.toml` (required secret
 environment variables must be present; output is redacted).

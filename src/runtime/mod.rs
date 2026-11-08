@@ -36,7 +36,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) enum Request {
     Command(Command, Option<oneshot::Sender<Result<(), CommandError>>>),
-    SaveConfig(String, oneshot::Sender<Result<(), ConfigError>>),
+    /// The configuration file as it is on disk now.
+    ReadConfig(oneshot::Sender<Result<String, ConfigError>>),
+    /// Writes the text when the file's `config_hash` still equals the expected hash.
+    SaveConfig(String, u64, oneshot::Sender<Result<(), ConfigError>>),
 }
 pub(crate) enum Input {
     Event(Event),
@@ -479,6 +482,7 @@ impl Runtime {
                 vec![]
             }
             Input::Bridge { entry, decoded } => {
+                let aether_status = aether_status(&entry);
                 self.trace_entry(wall, entry);
                 // Local replies are UI-only: never engine inputs or host sends.
                 for frame in decoded.local {
@@ -495,9 +499,19 @@ impl Runtime {
                         ui_events.push(UiEvent::Frame(view));
                     }
                 }
+                // Only a status the adapter accepted (it emits BridgeOnline) names the board;
+                // a rejected, offline or duplicate one leaves the stored identity alone.
+                let accepted = decoded
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::BridgeOnline));
                 self.apply_events(decoded.events, now, wall, &mut ui_events);
                 if let Some(bus) = decoded.bus {
                     self.snapshot.bridge_bus = Some(bus);
+                }
+                if accepted && let Some((node, boot)) = aether_status {
+                    self.snapshot.bridge_node = Some(node);
+                    self.snapshot.bridge_boot = Some(boot);
                 }
                 self.publish_snapshot(now, wall, ui_events).await;
                 return Ok(());
@@ -520,8 +534,12 @@ impl Runtime {
             Input::Request(Request::Command(command, reply)) => {
                 self.handle_command(command, reply).await
             }
-            Input::Request(Request::SaveConfig(text, reply)) => {
-                self.handle_config_save(text, reply).await
+            Input::Request(Request::ReadConfig(reply)) => {
+                let _ = reply.send(read_config(&self.path).await);
+                return Ok(());
+            }
+            Input::Request(Request::SaveConfig(text, expected, reply)) => {
+                self.handle_config_save(text, expected, reply).await
             }
         };
         for event in &events {
@@ -581,9 +599,10 @@ impl Runtime {
     async fn handle_config_save(
         &mut self,
         text: String,
+        expected: u64,
         reply: oneshot::Sender<Result<(), ConfigError>>,
     ) -> Vec<Event> {
-        match reload(&text, &self.engine.config, &self.path).await {
+        match reload(&text, expected, &self.engine.config, &self.path).await {
             Ok(config) => {
                 self.state.replace_config_text(text);
                 self.restart_adapters(&config).await;
@@ -642,6 +661,8 @@ impl Runtime {
             if matches!(event, Event::BridgeOffline) {
                 self.snapshot.bridge_bus = None;
                 self.snapshot.bridge_telemetry = None;
+                self.snapshot.bridge_node = None;
+                self.snapshot.bridge_boot = None;
             }
             let actions = self.engine.handle(event, now, wall);
             self.record_decisions(wall, ui_events);
@@ -871,6 +892,7 @@ impl Runtime {
 
 pub async fn run(config: Config, config_text: String, path: PathBuf) -> anyhow::Result<()> {
     let state = AppState::new(config.clone(), config_text);
+    state.set_trace_directory(state_directory(&path).to_path_buf());
     let listener = tokio::net::TcpListener::bind(config.web.bind).await?;
     let (shutdown, mut stopped) = watch::channel(false);
     let mut server = tokio::spawn({
@@ -996,7 +1018,8 @@ fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandErr
     };
     error.map_or(Ok(()), |error| Err(CommandError::Invalid(error.into())))
 }
-fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError> {
+/// Rejects edits to restart-gated settings; the web config editor runs it on every validate.
+pub fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError> {
     for (name, changed) in [
         (
             "web/auth",
@@ -1027,10 +1050,33 @@ fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError>
     }
     Ok(())
 }
-async fn reload(text: &str, current: &Config, path: &Path) -> Result<Config, ConfigError> {
+/// Hash of a configuration text: the stale-file guard compares the file against the one an
+/// editor started from. Stable within one process, which is all the guard needs.
+pub(crate) fn config_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+pub(crate) async fn read_config(path: &Path) -> Result<String, ConfigError> {
+    Ok(tokio::fs::read_to_string(path).await?)
+}
+/// Validates `text` and writes it when the file still hashes to `expected`. The file is
+/// re-read right before the write, inside the runtime's serialized input loop, so an
+/// external edit or a mode switch since the editor read it is refused, not overwritten.
+/// Not a lock: a writer outside this process racing the final read→rename is not covered.
+pub(crate) async fn reload(
+    text: &str,
+    expected: u64,
+    current: &Config,
+    path: &Path,
+) -> Result<Config, ConfigError> {
     let mut config = Config::parse(text)?;
     validate_reload(&config, current)?;
     config.secrets = current.secrets.clone();
+    if config_hash(&read_config(path).await?) != expected {
+        return Err(ConfigError::Changed);
+    }
     persist_bytes(path, text.as_bytes()).await?;
     Ok(config)
 }
@@ -1126,30 +1172,64 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     let timestamp = |seen: Instant| {
         wall - chrono::Duration::from_std(now.saturating_duration_since(seen)).unwrap_or_default()
     };
-    snapshot.roles = engine
+    let previous: std::collections::BTreeMap<String, u8> = snapshot
+        .roles
+        .iter()
+        .filter_map(|role| Some((role.role.clone(), role.last_logical_address?)))
+        .collect();
+    let roles = engine
         .config
         .device
         .iter()
         .map(|device| {
             let la = engine.identity.roles.get(&device.role).copied();
             let entry = la.and_then(|la| engine.bus.entries.get(&la));
+            let restored_la = engine
+                .bus
+                .entries
+                .iter()
+                .find(|&(&address, entry)| {
+                    la.is_none()
+                        && !entry.verified
+                        && crate::identity::matches(device, address, entry, engine.bus.bridge)
+                })
+                .map(|(&address, _)| address);
+            // View only: the engine keeps no memory of an address it no longer binds.
+            let last_logical_address = la
+                .or(restored_la)
+                .or_else(|| previous.get(&device.role).copied())
+                .or_else(|| {
+                    snapshot
+                        .decisions
+                        .iter()
+                        .rev()
+                        .find(|row| {
+                            row.reason == "identity_lost"
+                                && row.role.as_deref() == Some(device.role.as_str())
+                        })
+                        .and_then(DecisionView::trigger_logical_address)
+                });
             RoleView {
                 role: device.role.clone(),
                 name: device.name.clone(),
                 source: device.source.clone(),
                 power: engine.roles[&device.role].power,
                 logical_address: la,
+                last_logical_address,
                 physical_address: entry.and_then(|e| e.physical).map(physical_address),
                 vendor: entry.and_then(|e| e.vendor).map(|v| format!("{v:06X}")),
                 osd: entry.and_then(|e| e.osd.clone()),
                 last_event: engine.roles[&device.role].last_event.clone(),
                 last_seen: entry.and_then(|e| e.last_seen).map(timestamp),
                 conflicted: engine.identity.blocked.contains(&device.role),
+                restored: restored_la.is_some(),
                 direct: engine.roles[&device.role].direct,
                 probe_configured: device.probe.is_some(),
+                media_player: device.media_player.clone(),
             }
         })
         .collect();
+    snapshot.roles = roles;
     snapshot.bus = engine
         .bus
         .entries
@@ -1170,6 +1250,15 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
                 .iter()
                 .find(|(_, addr)| **addr == la)
                 .map(|(r, _)| r.clone()),
+            confirmed_at: entry.confirmed_at,
+            next_identify_at: engine
+                .bridge_online
+                .then(|| engine.bus.next_identify_at(la))
+                .flatten()
+                .map(|due| {
+                    wall + chrono::Duration::from_std(due.saturating_duration_since(now))
+                        .unwrap_or_default()
+                }),
         })
         .collect();
     let entity = |id: &str| {
@@ -1195,6 +1284,14 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
             .map(entity)
             .collect(),
     };
+}
+/// The node and boot counter an aether status names, for the bridge drawer.
+fn aether_status(entry: &trace::TraceEntry) -> Option<(String, u32)> {
+    let trace::TraceEntry::AetherStatus { node, payload } = entry else {
+        return None;
+    };
+    let boot = payload.get("boot")?.as_u64()?;
+    Some((node.clone(), u32::try_from(boot).ok()?))
 }
 fn frame_view(
     frame: &Frame,
@@ -1234,6 +1331,8 @@ fn frame_view(
     }
 }
 
+#[cfg(test)]
+mod bridge_identity_tests;
 #[cfg(test)]
 mod loop_tests;
 #[cfg(test)]
@@ -1343,10 +1442,11 @@ mod tests {
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
         persist(&config, &path).await.unwrap();
         let original = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(reload("not valid = [", &config, &path).await.is_err());
+        let base = config_hash(&original);
+        assert!(reload("not valid = [", base, &config, &path).await.is_err());
         let mut changed_web = config.clone();
         changed_web.web.bind.set_port(9000);
-        let error = reload(&changed_web.redacted_text().unwrap(), &config, &path)
+        let error = reload(&changed_web.redacted_text().unwrap(), base, &config, &path)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("restart"));
@@ -1496,6 +1596,102 @@ mod tests {
         update_snapshot(&mut snapshot, &engine, now, Utc::now());
         assert_eq!(snapshot.bridge_logical_address, 0);
     }
+
+    #[test]
+    fn roles_matching_only_a_restored_unverified_entry_read_as_restored_not_bound() {
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let now = Instant::now();
+        let wall: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        // The streamer's vendor key, restored from the state file and not yet re-confirmed.
+        let identities = vec![LearnedIdentity {
+            la: 4,
+            physical: Some(0x2100),
+            vendor: Some(0x0010FA),
+            osd: Some("Streamer".into()),
+            device_type: Some(4),
+            confirmed_at: wall,
+        }];
+        let engine = Engine::new(config.clone(), now, identities, 1);
+        let mut snapshot = AppState::new(config, String::new()).snapshot();
+        update_snapshot(&mut snapshot, &engine, now, wall);
+        let role = |name: &str| {
+            snapshot
+                .roles
+                .iter()
+                .find(|role| role.role == name)
+                .unwrap()
+        };
+        let streamer = role("streamer");
+        assert_eq!(streamer.logical_address, None);
+        assert!(streamer.restored);
+        assert_eq!(streamer.last_logical_address, Some(4));
+        // Kodi matches by OSD name, which the restored entry does not carry.
+        assert!(!role("kodi").restored);
+    }
+
+    #[test]
+    fn a_role_keeps_its_last_address_after_forget_or_conflict_unbinds_it() {
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let now = Instant::now() + Duration::from_secs(4);
+        let wall: DateTime<Utc> = "2026-11-07T12:00:00Z".parse().unwrap();
+        let streamer = |snapshot: &Snapshot| {
+            snapshot
+                .roles
+                .iter()
+                .find(|role| role.role == "streamer")
+                .map(|role| (role.logical_address, role.last_logical_address))
+                .unwrap()
+        };
+        let bound = |la: u8| {
+            let mut engine = Engine::new(config.clone(), now - Duration::from_secs(4), vec![], 1);
+            let mut snapshot = AppState::new(config.clone(), String::new()).snapshot();
+            for data in ["84210004", "870010FA"] {
+                engine.handle(
+                    Event::Frame(Frame::from_hex(la, 15, data).unwrap()),
+                    now,
+                    wall,
+                );
+            }
+            update_snapshot(&mut snapshot, &engine, now, wall);
+            assert_eq!(streamer(&snapshot), (Some(la), Some(la)));
+            assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+            (engine, snapshot)
+        };
+
+        // Forget while Off: no transition, so no identity_lost row records the address.
+        let (mut engine, mut snapshot) = bound(4);
+        engine.handle(Event::Command(Command::Forget(4)), now, wall);
+        update_snapshot(&mut snapshot, &engine, now, wall);
+        assert_eq!(streamer(&snapshot), (None, Some(4)));
+
+        // A second verified match blocks the role; blocked roles never get identity_lost.
+        let (mut engine, mut snapshot) = bound(4);
+        for data in ["84220004", "870010FA"] {
+            engine.handle(
+                Event::Frame(Frame::from_hex(9, 15, data).unwrap()),
+                now,
+                wall,
+            );
+        }
+        update_snapshot(&mut snapshot, &engine, now, wall);
+        assert!(snapshot.conflicts.iter().any(|c| c.roles == ["streamer"]));
+        assert_eq!(streamer(&snapshot), (None, Some(4)));
+
+        // A fresh service (no previous snapshot) falls back to the ring's identity_lost row.
+        let mut fresh = AppState::new(config.clone(), String::new()).snapshot();
+        fresh.decisions.push_back(
+            serde_json::from_value(serde_json::json!({
+                "id": 7, "trigger": {"kind": "command", "command": {"kind": "forget", "data": 6}},
+                "parent": null, "timestamp": "2026-11-07T11:00:00Z", "role": "streamer",
+                "from": "on", "to": "off", "reason": "identity_lost", "actions": [],
+                "would": false
+            }))
+            .unwrap(),
+        );
+        let engine = Engine::new(config, now, vec![], 1);
+        update_snapshot(&mut fresh, &engine, now, wall);
+        assert_eq!(streamer(&fresh), (None, Some(6)));
+    }
 }
 
 #[cfg(test)]
@@ -1534,21 +1730,54 @@ mod review_tests {
                 }
                 _ => changed.mqtt.username = "other".into(),
             }
-            let error = reload(&changed.redacted_text().unwrap(), &current, &path)
-                .await
-                .unwrap_err();
+            let error = reload(
+                &changed.redacted_text().unwrap(),
+                config_hash(&original),
+                &current,
+                &path,
+            )
+            .await
+            .unwrap_err();
             assert!(error.to_string().contains("restart"));
             assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
         }
         let text = original.replace("off_delay_s = 3", "off_delay_s = 4");
         assert_eq!(
-            reload(&text, &current, &path)
+            reload(&text, config_hash(&original), &current, &path)
                 .await
                 .unwrap()
                 .timing
                 .off_delay_s,
             4
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_edited_since_it_was_read_is_refused_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.toml");
+        let current = config();
+        tokio::fs::write(&path, include_str!("../../choregos.example.toml"))
+            .await
+            .unwrap();
+        let read = read_config(&path).await.unwrap();
+        assert!(read.contains("off_delay_s = 3"));
+        let edit = format!("{read}# operator note\n");
+        // Someone edits the mounted file after the editor read it.
+        let external = read.replacen("off_delay_s = 3", "off_delay_s = 17", 1);
+        tokio::fs::write(&path, &external).await.unwrap();
+        let error = reload(&edit, config_hash(&read), &current, &path)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::Changed), "{error}");
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), external);
+        // Read again, the same edit lands on top of the external one.
+        let edit = format!("{external}# operator note\n");
+        let saved = reload(&edit, config_hash(&external), &current, &path)
+            .await
+            .unwrap();
+        assert_eq!(saved.timing.off_delay_s, 17);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), edit);
     }
 
     #[tokio::test]

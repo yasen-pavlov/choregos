@@ -1,0 +1,5 @@
+<div id="raw-foot" class="cfg-foot"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <span class="grow note">{% if !raw.dirty %}No changes yet.{% else if raw.problems.is_empty() %}Parses and validates; review the diff before saving.{% else %}Fix the errors to review changes.{% endif %}</span>
+  <a class="btn ghost" href="/config?tab=raw">Discard</a>
+  <button type="button" class="btn primary" hx-post="/config/preview" hx-target="#section" hx-swap="outerHTML"{% if !raw.problems.is_empty() %} disabled{% endif %}>Review changes →</button>
+</div>

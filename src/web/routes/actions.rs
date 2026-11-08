@@ -1,4 +1,5 @@
-//! POST `/actions/*`: forward operator commands to the runtime; respond with a flash fragment.
+//! POST `/actions/*`: forward operator commands to the runtime; respond with a toast swapped
+//! out of band into `#toasts`, plus the refreshed top-bar `#status` and `#bands`.
 
 use askama::Template;
 use axum::{
@@ -11,14 +12,20 @@ use serde::Deserialize;
 
 use crate::{
     state::{Command, CommandError, Mode},
-    web::{WebError, WebState, render},
+    web::{
+        WebError, WebState, render,
+        view::{self, Status},
+    },
 };
 
 #[derive(Template)]
-#[template(path = "partials/flash.html")]
-struct Flash {
-    ok: bool,
-    text: String,
+#[template(path = "partials/toast.html")]
+struct Toast {
+    /// `ok`, `bad` or `would`.
+    tone: &'static str,
+    title: String,
+    detail: Option<String>,
+    status: Status,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,29 +39,70 @@ pub(crate) struct SendRawForm {
     data: String,
 }
 
-fn flash(status: StatusCode, ok: bool, text: String) -> Result<Response, WebError> {
-    Ok((status, render(&Flash { ok, text })?).into_response())
+fn toast(
+    web: &WebState,
+    code: StatusCode,
+    tone: &'static str,
+    title: String,
+    detail: Option<String>,
+) -> Result<Response, WebError> {
+    let status = Status::new(&web.app.snapshot(), true);
+    Ok((
+        code,
+        render(&Toast {
+            tone,
+            title,
+            detail,
+            status,
+        })?,
+    )
+        .into_response())
 }
 
-fn rejected(text: impl Into<String>) -> Result<Response, WebError> {
-    flash(StatusCode::UNPROCESSABLE_ENTITY, false, text.into())
+fn rejected(web: &WebState, text: impl Into<String>) -> Result<Response, WebError> {
+    toast(
+        web,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "bad",
+        text.into(),
+        None,
+    )
+}
+
+/// Commands whose effects shadow mode suppresses: the runtime records them as `would`.
+fn suppressed_in_shadow(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::AllOff | Command::Takeover(_) | Command::Standby(_) | Command::SendRaw { .. }
+    )
 }
 
 async fn run(web: &WebState, command: Command, done: String) -> Result<Response, WebError> {
     let description = format!("{command:?}");
+    let would = suppressed_in_shadow(&command);
     match web.app.command(command).await {
         Ok(()) => {
             tracing::info!(command = %description, "operator command accepted");
-            flash(StatusCode::OK, true, done)
+            if would && web.app.snapshot().mode == Mode::Shadow {
+                toast(
+                    web,
+                    StatusCode::OK,
+                    "would",
+                    done,
+                    Some("Shadow mode: recorded as would; nothing was sent.".to_owned()),
+                )
+            } else {
+                toast(web, StatusCode::OK, "ok", done, None)
+            }
         }
         Err(error) => {
             tracing::warn!(command = %description, %error, "operator command failed");
-            let status = match error {
+            let code = match error {
                 CommandError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
                 CommandError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
                 CommandError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            flash(status, false, error.to_string())
+            toast(web, code, "bad", error.to_string(), None)
         }
     }
 }
@@ -67,7 +115,7 @@ fn known_role(web: &WebState, role: &str) -> bool {
         .any(|view| view.role == role)
 }
 
-/// Reloads the page after a successful command whose effect is shown outside the flash.
+/// Reloads the page after a successful command whose effect is shown outside the toast.
 fn refresh_on_success(mut response: Response) -> Response {
     if response.status().is_success() {
         response
@@ -81,7 +129,7 @@ pub(crate) async fn mode(
     State(web): State<WebState>,
     Form(form): Form<ModeForm>,
 ) -> Result<Response, WebError> {
-    // The mode badge lives in the page chrome.
+    // The mode shapes every page (bar rule, band, button labels), so reload it.
     run(
         &web,
         Command::SetMode(form.mode),
@@ -108,7 +156,7 @@ pub(crate) async fn identify(
             )
             .await
         }
-        _ => rejected("Logical address must be 0–14."),
+        _ => rejected(&web, "Logical address must be 0–14."),
     }
 }
 
@@ -117,11 +165,11 @@ pub(crate) async fn forget(
     Path(la): Path<String>,
 ) -> Result<Response, WebError> {
     match la.parse::<u8>() {
-        // The forgotten row and any role bound through it live in the page, not the flash.
+        // The forgotten row and any role bound through it live in the page, not the toast.
         Ok(la) if la <= 14 => run(&web, Command::Forget(la), format!("Forgot LA {la}."))
             .await
             .map(refresh_on_success),
-        _ => rejected("Logical address must be 0–14."),
+        _ => rejected(&web, "Logical address must be 0–14."),
     }
 }
 
@@ -152,12 +200,12 @@ pub(crate) async fn send_raw(
     Form(form): Form<SendRawForm>,
 ) -> Result<Response, WebError> {
     let Some(to) = form.to.trim().parse::<u8>().ok().filter(|to| *to <= 15) else {
-        return rejected("Destination must be a logical address 0–15.");
+        return rejected(&web, "Destination must be a logical address 0–15.");
     };
     let max_bytes = web.app.bridge_max_raw_bytes();
     let data = match parse_hex(&form.data, max_bytes) {
         Ok(data) => data,
-        Err(message) => return rejected(message),
+        Err(message) => return rejected(&web, message),
     };
     let done = format!("Sent {} to LA {to}.", hex::encode_upper(&data));
     run(&web, Command::SendRaw { to, data }, done).await

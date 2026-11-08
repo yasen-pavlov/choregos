@@ -1,0 +1,52 @@
+{%- let t = timeline -%}
+<div id="timeline" class="tl" data-from="{{ view::iso(t.span.from) }}" data-to="{{ view::iso(t.span.to) }}" data-zoom="{{ t.zoom.word() }}" data-at="{% if let Some(at) = t.at %}{{ view::iso(at) }}{% endif %}" data-bridge="{{ t.bridge }}">
+  <div class="tl-bar">
+    <span class="k">Zoom</span>
+    <nav class="tl-zoom" aria-label="Zoom">{% for link in t.zooms %}<a data-nav data-zoom="{{ link.zoom }}" href="{{ link.page }}" hx-get="{{ link.partial }}" hx-target="#timeline" hx-swap="outerHTML" hx-push-url="{{ link.page }}"{% if link.current %} aria-current="true"{% endif %}>{{ link.label }}</a>{% endfor %}</nav>
+    <a class="btn sm ghost" data-nav data-pan="prev" href="{{ t.prev.page }}" hx-get="{{ t.prev.partial }}" hx-target="#timeline" hx-swap="outerHTML" hx-push-url="{{ t.prev.page }}">{{ t.prev.label }}</a>
+    {%- if let Some(next) = t.next %}
+    <a class="btn sm ghost" data-nav data-pan="next" href="{{ next.page }}" hx-get="{{ next.partial }}" hx-target="#timeline" hx-swap="outerHTML" hx-push-url="{{ next.page }}">{{ next.label }}</a>
+    {%- else %}
+    <span class="btn sm ghost off" aria-disabled="true" title="The window already ends now">{{ t.zoom.step_label() }} →</span>
+    {%- endif %}
+    <label class="tog" title="needs the recorder script"><input type="checkbox" id="tl-tail" disabled> live tail</label>
+    <span class="grow"></span>
+    <span class="dim small"><kbd>-</kbd> <kbd>+</kbd> zoom · <kbd>←</kbd> <kbd>→</kbd> pan · <kbd>[</kbd> <kbd>]</kbd> prev/next decision · <kbd>Esc</kbd> close</span>
+  </div>
+  <div class="tl-grid">
+    <section class="panel flush tl-main" aria-label="Timeline">
+      <div class="ph"><span class="mono" id="tl-span">{{ t.span.line() }}</span><span class="grow"></span><span class="dim small">frames from {{ t.source }} · <span id="tl-n-frames">{{ t.frames }}</span> frames · <span id="tl-n-decisions">{{ t.decisions }}</span> decisions</span></div>
+      {%- if t.truncated %}
+      <p class="note pb"><strong>Window truncated:</strong> the read stopped at its cap (5000 entries, or 64 MiB / 2 M lines of trace scanned) with more input left, so later frames are missing. Zoom in.</p>
+      {%- endif %}
+      <div class="lanes">
+        <div class="lane axis"><span class="lbl"></span><svg class="track" height="22" aria-hidden="true">{% for a in t.lanes.axis %}<text class="ax" x="{{ view::timeline::pct(a.x) }}%" y="15" data-t="{{ view::iso(a.at) }}">{{ a.label }}</text>{% endfor %}</svg></div>
+        <div class="lane room"><span class="lbl k">Room</span><svg class="track" height="36" role="img" aria-label="Room intent">
+          {%- for b in t.lanes.room %}<svg class="band {{ b.class }}" x="{{ view::timeline::pct(b.x) }}%" y="8" width="{{ view::timeline::pct(b.width) }}%" height="20" data-t0="{{ view::iso(b.start) }}" data-t1="{{ view::iso(b.end) }}"{% if b.open %} data-open=""{% endif %}><title>{{ b.label }} · {{ view::clock(b.start) }} → {{ view::clock(b.end) }}</title><rect width="100%" height="100%" rx="2"></rect><text x="6" y="14">{{ b.label }}</text></svg>{% endfor -%}
+        </svg></div>
+        <div class="lane decisions"><span class="lbl k">Decisions</span><svg class="track" height="36" id="tl-marks" role="img" aria-label="Decisions · {{ t.lanes.decisions.len() }} in this window">
+          {%- for m in t.lanes.decisions %}
+          {%- if m.linked %}<a class="mk {{ m.class }}{% if m.selected %} selected{% endif %}" href="/recorder/{{ m.id }}" data-id="{{ m.id }}">{% else %}<g class="mk {{ m.class }}" data-id="{{ m.id }}">{% endif -%}
+          <title>{{ m.id }} {{ m.headline }} · {{ m.title }}</title><svg x="{{ view::timeline::pct(m.x) }}%" y="18" overflow="visible" data-t="{{ view::iso(m.at) }}" aria-hidden="true"><rect class="dia" x="-6" y="-6" width="12" height="12" transform="rotate(45)"></rect>{% if m.show_id %}<text x="11" y="4">{{ m.id }}</text>{% endif %}</svg>
+          {%- if m.linked %}</a>{% else %}</g>{% endif %}
+          {%- endfor %}
+        </svg></div>
+        {%- for lane in t.lanes.addresses %}
+        <div class="lane addr{% if lane.focus %} focus{% endif %}" data-la="{{ lane.la }}"><span class="lbl mono">{{ lane.la }} <span class="dim">{{ lane.name }}</span></span><svg class="track" height="32" role="img" aria-label="{{ lane.summary }}">
+          {%- if let Some(empty) = lane.empty %}<text class="empty" x="8" y="20">{{ empty }}</text>{% endif %}
+          {%- for tick in lane.ticks %}<rect class="tk {{ tick.kind }}" x="{{ view::timeline::pct(tick.x) }}%" y="{{ tick.y() }}" width="{{ tick.width() }}" height="{{ tick.height() }}" data-seq="{{ tick.seq }}" data-t="{{ view::iso(tick.at) }}"><title>{{ tick.title }}</title></rect>{% if let Some(note) = tick.note %}<svg x="{{ view::timeline::pct(tick.x) }}%" y="0" overflow="visible" data-t="{{ view::iso(tick.at) }}" aria-hidden="true"><text class="tk-note" x="6" y="21">{{ note }}</text></svg>{% endif %}{% endfor -%}
+        </svg>{% if !lane.ticks.is_empty() %}<ul class="sr-only">{% for tick in lane.ticks %}<li>{{ tick.line }}</li>{% endfor %}</ul>{% endif %}</div>
+        {%- endfor %}
+        {%- for lane in t.lanes.observations %}
+        <div class="lane obs" data-obs="{{ lane.key }}"><span class="lbl k">{{ lane.label }}</span><svg class="track" height="32" role="img" aria-label="{{ lane.summary }}">
+          {%- if let Some(empty) = lane.empty %}<text class="empty" x="8" y="20">{{ empty }}</text>{% endif %}
+          {%- for b in lane.runs %}<svg class="run {{ b.class }}" x="{{ view::timeline::pct(b.x) }}%" y="10" width="{{ view::timeline::pct(b.width) }}%" height="12" data-t0="{{ view::iso(b.start) }}" data-t1="{{ view::iso(b.end) }}"{% if b.open %} data-open=""{% endif %}><title>{{ b.label }} · {{ view::clock(b.start) }} → {{ view::clock(b.end) }}</title><rect width="100%" height="100%" rx="2"></rect><text x="4" y="10">{{ b.label }}</text></svg>{% endfor -%}
+        </svg>{% if !lane.runs.is_empty() %}<ul class="sr-only">{% for b in lane.runs %}<li>{{ b.label }} · {{ view::clock(b.start) }} → {{ view::clock(b.end) }}</li>{% endfor %}</ul>{% endif %}</div>
+        {%- endfor %}
+      </div>
+      <p class="legend small"><span class="sw sw-trigger"></span> trigger <span class="sw sw-ours"></span> ours <span class="sw sw-other"></span> other <span class="sw sw-nack"></span> nack <span class="sw sw-dia"></span> decision, coloured by verdict <span class="obs-word">cyan lanes = device observations</span> <span class="dim">· hover a tick for its frame</span></p>
+    </section>
+    {%- let selected = t.selected %}
+    {% include "partials/timeline_selected.html" %}
+  </div>
+</div>

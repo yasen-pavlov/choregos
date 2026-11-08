@@ -12,7 +12,7 @@ handles the rest.
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=yasen-pavlov_choregos&metric=coverage)](https://sonarcloud.io/summary/new_code?id=yasen-pavlov_choregos)
 [![License: MIT](https://img.shields.io/github/license/yasen-pavlov/choregos)](LICENSE)
 
-![Choregos dashboard](docs/dashboard.png)
+![Choregos cockpit](docs/cockpit.png)
 
 ## Why
 
@@ -42,9 +42,9 @@ testable model instead of a pile of automations.
   sensors, active source, conflicts, bridge availability, a mode select and an
   all-off button; receiver, Sonos and media players use HA's integrations.
   TV power-off can use native webOS SSAP to avoid HA reconnect delays after wake.
-- **Shows its work.** A web UI with dashboard, live bus stream, devices,
-  decision log, config editor and manual actions, behind OIDC or a break-glass
-  login.
+- **Shows its work.** A web UI with a room cockpit, a flight recorder (decisions,
+  bus windows, timeline, live frames), a device registry with statistics, and a
+  reviewed config editor, behind OIDC or a break-glass login.
 - **Shadow mode.** Run the complete engine without touching anything and read
   what it *would* have done before switching it on.
 
@@ -133,7 +133,7 @@ For containers, also pass the configured key environment variable (for example
 With native webOS and its key configured, active mode continuously observes
 `getPowerState`: idle every `[verify].tv_idle_poll_s` (default 15 seconds), with
 faster action windows for the full `[verify].tv_window_s`, then back to idle.
-The dashboard shows `direct: on`, `off` or `unreachable` alongside unchanged HA
+The cockpit shows the direct `on`, `off` or `unreachable` sample alongside the HA
 state. Direct webOS supplies TV verdict/drift evidence while available; HA supplies
 it without webOS or after pairing loss. TV `unreachable` becomes evidence only
 after two consecutive failures, agreeing with Off and refuting On. A single
@@ -332,18 +332,23 @@ decisions, but the executor allows only read-only traffic on the bus:
 identification, startup/resync interrogation and presence polls. TV wake/off, HA
 service calls, raw CEC, fake-TV replies and volume forwarding are logged as
 `would:` with their payload instead of being sent. Mode and config persistence
-and HA discovery keep working, so the dashboard and HA entities are fully live
+and HA discovery keep working, so the cockpit and HA entities are fully live
 while you check the decisions against what actually happened.
 
 ## Web UI
 
 | Page | Shows |
 | --- | --- |
-| `/` | Mode switch, bridge/MQTT/HA status, TV/receiver/Sonos, each role's power with takeover/standby buttons, active source, all-off; one reporting-only amber pill per open drift next to room intent: `subject.field: observed, intended X, for <duration>` |
-| `/bus` | Live frame stream (SSE) with decoded opcodes and operands |
-| `/devices` | Bus table (addresses, identity keys, power, last seen, matched role) with manual identify; roles; raw frame send |
-| `/decisions` | The decision ring with reasons, actions, verdict chips and expandable expectations; `drift`/`drift_resolved` rows instead show `subject.field intended → observed via <source>`, plus elapsed duration on resolution, without a verdict chip |
-| `/config` | Validate-and-save editor for the TOML file |
+| `/` Cockpit | Room strip (intent, active source, receiver input, off timer, consistency badge: `consistent` / `drift: …` / `unknown: …` / `not checked (shadow)` / `warming`), the decision being verified, alerts, one card per role with power by source (CEC · Home Assistant · probe), last decision and verdict, take-over/standby/identify; outputs (TV webOS·HA, receiver Denon·HA, speakers); last five decisions; all-off. Polls a partial every 3 s. |
+| `/recorder` | Flight recorder: the decision ring newest first with filters (role, reason group or literal, verdict, would, time range; migrated rows hidden), restart separators, cursor paging. `/recorder/{id}` shows the trigger decoded, the reason with its glossary sentence, actions as issued, expectations, family and neighbours, and the bus window read from the day's trace file (frames tagged trigger / ours / reply / other, observation lines with the expectation they settled) or from memory. `/recorder/timeline` draws a window as lanes (room band, decision markers, one lane per address, device observations) with a side panel; `/recorder/live` is the SSE frame stream; `/recorder/glossary` explains every reason. |
+| `/devices` | Registry of roles, outputs, the bridge and unbound bus entries with identity state, power by source and last decision. Each device page shows its truth sources side by side with an agreement chip, identity keys against the match rule and identity events, statistics from the ring (wakes, wake-to-picture, receiver ready, source switch, standby confirmation; p50/p95 with n), quirk sentences from its profile and the decisions it took part in. |
+| `/config` | Section forms with help, defaults and bounds, a role editor, the raw TOML editor, and one review step (what changes in words, what restarts, a line diff) before saving. Edits are applied to the file's own document, so comments and order survive; only the fields you changed are written; a file that changed underneath you is refused with a fresh review. Restart-gated sections are read-only; secrets appear only as environment-variable names. |
+
+The top bar on every page carries the mode switch, the consistency badge and
+the bridge/MQTT/HA pills; the bridge pill opens a drawer with telemetry, bus
+status and a raw-frame send. Every page is server-rendered and complete
+without JavaScript; htmx polls partials, and one vendored script adds keyboard
+shortcuts, hover cards and live tail to the recorder.
 
 Every decision records its id, trigger, parent, role, transition, reason and exact
 actions (or shadow `would:` actions). Observable effects get expectations with
@@ -369,9 +374,9 @@ settlement time. Ordinary fields still meet on their first fresh matching read.
 Drift resolves only on agreeing evidence newer than its opening disagreement.
 Intent-change closure reports the newest usable value, including retained direct
 evidence across a single failed query. Expired contested deadlines also retain
-usable direct evidence; ordinary reporting and the dashboard stay raw.
+usable direct evidence; ordinary reporting and the cockpit stay raw.
 
-![Decision log](docs/decisions.png)
+![Flight recorder](docs/recorder.png)
 
 Authentication is OIDC (`web.oidc`) with a local break-glass account
 (`web.local_login` + `CHOREGOS_LOCAL_PASSWORD`). Sessions are signed with
@@ -380,7 +385,7 @@ Authentication is OIDC (`web.oidc`) with a local break-glass account
 
 ## Development
 
-Rust stable, edition 2024, no JavaScript build step. CI runs formatting, clippy,
+Rust stable, edition 2024, no JavaScript build step (htmx and one vendored recorder script). CI runs formatting, clippy,
 tests with LLVM coverage to SonarCloud, and a Docker build; releases are cut
 from signed `v*` tags with [git-cliff](cliff.toml) notes (the crate version stays
 `0.0.0`; the tag is the release identity).

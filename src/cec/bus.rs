@@ -301,6 +301,17 @@ impl BusModel {
             })
             .min()
     }
+
+    /// When the identification query for `la` is next due: its backoff deadline, held back
+    /// by the one-query-per-second gate. `None` when `la` needs no query. Read-only; the
+    /// same arithmetic as [`Self::next_identify_deadline`] for one entry.
+    pub fn next_identify_at(&self, la: u8) -> Option<Instant> {
+        let entry = self.entries.get(&la)?;
+        (la < 15 && la != self.bridge && (!entry.identified || entry.manual_pending)).then(|| {
+            let due = Self::entry_deadline(self.retry, entry);
+            self.identify_not_before.map_or(due, |gate| due.max(gate))
+        })
+    }
     fn physical_duplicate_from(&self, frame: &Frame) -> Option<u8> {
         if frame.from < 15 && Self::reports_physical(frame) {
             self.entries.iter().find_map(|(&la, entry)| {

@@ -11,39 +11,55 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Sends awaiting a `stat/…/RESULT`, oldest first, each with its FIFO position.
 #[derive(Default)]
-pub(super) struct OutstandingSends(VecDeque<(u8, Vec<u8>, Instant)>);
+pub(super) struct OutstandingSends {
+    queue: VecDeque<(u64, u8, Vec<u8>, Instant)>,
+    /// The position the next recorded send gets; never reset, so positions are never reused.
+    next: u64,
+}
 impl OutstandingSends {
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.queue.clear();
     }
-    pub fn record(&mut self, to: u8, data: Vec<u8>, now: Instant) {
-        if self.0.len() == 64 {
-            self.0.pop_front();
+    /// Queues a send; returns its FIFO position.
+    pub fn record(&mut self, to: u8, data: Vec<u8>, now: Instant) -> u64 {
+        if self.queue.len() == 64 {
+            self.queue.pop_front();
         }
-        self.0.push_back((to, data, now));
+        let position = self.next;
+        self.next += 1;
+        self.queue.push_back((position, to, data, now));
+        position
     }
-    pub fn result(&mut self, payload: &Value, now: Instant) -> Option<Event> {
+    /// Consumes the oldest live send for an `HdmiSend` reply: its position, and the
+    /// `SendResult` when the reply is the patched `{"Ack":bool}` (stock replies consume the
+    /// entry without classifying the target).
+    pub fn result(&mut self, payload: &Value, now: Instant) -> Option<(u64, Option<Event>)> {
         let result = payload.get("HdmiSend")?;
-        while self
-            .0
-            .front()
-            .is_some_and(|(_, _, at)| now.saturating_duration_since(*at) > Duration::from_secs(5))
-        {
-            self.0.pop_front();
+        while self.queue.front().is_some_and(|(_, _, _, at)| {
+            now.saturating_duration_since(*at) > Duration::from_secs(5)
+        }) {
+            self.queue.pop_front();
         }
-        let (to, data, _) = self.0.pop_front()?;
-        let status = if result.get("Ack")?.as_bool()? {
+        let (position, to, data, _) = self.queue.pop_front()?;
+        let Some(ack) = result.get("Ack").and_then(Value::as_bool) else {
+            return Some((position, None));
+        };
+        let status = if ack {
             SendStatus::Ack
         } else {
             SendStatus::Nack
         };
-        Some(Event::SendResult {
-            to,
-            data,
-            status,
-            attempts: None,
-        })
+        Some((
+            position,
+            Some(Event::SendResult {
+                to,
+                data,
+                status,
+                attempts: None,
+            }),
+        ))
     }
 }
 
@@ -128,17 +144,24 @@ mod tests {
     fn stock_replies_consume_entries_without_classifying_the_target() {
         let now = Instant::now();
         let mut pending = OutstandingSends::default();
-        for value in [
+        for (expected, value) in [
             serde_json::json!("Done"),
             serde_json::json!("Sending failed"),
             serde_json::json!("Invalid JSON"),
             serde_json::json!({"Ack":true}),
             serde_json::json!({"Ack":false}),
-        ] {
-            pending.record(4, vec![0x36], now);
-            let event = pending.result(&serde_json::json!({"HdmiSend":value}), now);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let position = pending.record(4, vec![0x36], now);
+            assert_eq!(position, expected as u64);
+            let (consumed, event) = pending
+                .result(&serde_json::json!({"HdmiSend":value}), now)
+                .unwrap();
+            assert_eq!(consumed, position);
             assert_eq!(event.is_some(), value.is_object());
-            assert!(pending.0.is_empty());
+            assert!(pending.queue.is_empty());
         }
     }
     #[test]
@@ -150,7 +173,7 @@ mod tests {
         }
         let ack = serde_json::json!({"HdmiSend":{"Ack":true}});
         assert!(
-            matches!(pending.result(&ack, now),Some(Event::SendResult { data, .. }) if data == [1])
+            matches!(pending.result(&ack, now), Some((1, Some(Event::SendResult { data, .. }))) if data == [1])
         );
         assert!(
             pending
@@ -160,5 +183,7 @@ mod tests {
         pending.record(4, vec![0x36], now);
         pending.clear();
         assert!(pending.result(&ack, now).is_none());
+        // Positions continue across a clear.
+        assert_eq!(pending.record(4, vec![0x36], now), 66);
     }
 }

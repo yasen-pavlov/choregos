@@ -2,6 +2,282 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-08 — Phase 2 slice 5: Recorder timeline and the recorder script
+
+- One vendored, hand-written script, `src/web/static/recorder-2.js` (no dependencies, no
+  build step, served like htmx with a version suffix and an immutable cache header; bump
+  the suffix on any change). It loads only on Recorder pages (`{% block scripts %}` in
+  `base.html`) and adds: list keys (`/` filter, `j`/`k` row focus, `Enter` open, `t`
+  timeline), timeline keys (`-`/`+` zoom, `←`/`→` pan by clicking the toolbar links,
+  `[`/`]` select the previous/next decision into the side panel, `Esc` close), hover/tap
+  cards that show an element's own SVG `<title>` text, and live tail. It sets SSE text
+  with `textContent` only, reads SSE rows through `DOMParser`, uses no `eval`, and is one
+  IIFE; server HTML enters the page only as htmx-swapped partials.
+- No-JS baseline: every position is a server-side percentage written as an SVG attribute
+  (`x="18.10%"`), so the timeline is complete without the script and without inline
+  styles; zoom, pan, close and the decision links are ordinary links (htmx swaps the
+  `#timeline` block when it is there); the live-tail checkbox renders disabled.
+- Window: `at` is the centre; without `at` the window centres on `select`, else it ends
+  now (the live edge) rather than centring on now, so half the default view is not the
+  future and live tail appends at the right edge. `at=now` keeps the live edge even with a
+  selection (the zoom links of such a window carry it, and so does live tail's re-fetch).
+  Pan steps a tenth of the zoom; "→" is disabled at the live edge. Trace day files first,
+  memory otherwise (the slice-2 reader, now shared and with no focal decision); every
+  ring decision in the window tags its trigger and settles its observations.
+- Lanes: the room band replays intent from the ring as the engine sets it (a role on
+  turns the room on with it; the active role off leaves it on with no role; the off timer
+  turns it off; `service_started` forgets it). `record_would` rows are skipped: they say
+  what a `would` start policy would have done, never the intent (`late_announcement`
+  would-rows always, since a real one stops a role that is not active; `console_start*`
+  would-rows in their Off → Off shape only, since shadow mode marks real transitions
+  `would` too and those always change power). The receiver input is named only from a
+  recorded `media_player.select_source` action on a row (its `source`), never from the
+  current config, so with `select_source = false` no input is shown; the first input of
+  the role already on is named inside its band rather than starting one. Frames sit in
+  their sender's lane, presence polls in their target's. Observation lanes take TV,
+  receiver and probe samples; with no sample in the window a lane shows the device's
+  current sample from when it was taken (memory holds no history). Home Assistant
+  observations get no lane.
+- Accessibility: the room, address and observation tracks are `role="img"` with a
+  summary as their name (`LA 11 Console · 4 frames · trigger at :40.8`, `tv · webos:
+  unreachable → on at :56.4`); each address and observation lane also renders a
+  visually hidden list of its frames (`time from→to opcode meaning`) or runs as the text
+  alternative. Markers stay links with their headline as `aria-label`. The header counts
+  are the drawn ticks and markers.
+- Ticks for our own frames are drawn in the text colour, not amber (board 06: amber
+  marks shadow only).
+- `/p/timeline/window.json?from&to` returns the window's entries (frames with tags,
+  observations, decisions) and lanes (`WindowJson`), bounded to an hour and 5000 entries
+  like the bus window. The script does not use it.
+- Live tail keeps no model of its own: frames from the SSE stream are appended as ticks
+  and everything slides each second; every decision row and every reset (connect,
+  reconnect, lag, settled verdict) re-fetches `/p/timeline?at=now&zoom&select`
+  (debounced 500 ms, one request at a time; a response is dropped when the tail stopped or
+  another swap replaced the window meanwhile), and so does a 30 s timer for observation
+  runs. Ticks that streamed in while a re-fetch was in flight are put back unless the
+  partial already has them. Room bands, markers, verdicts, observations, the lane text and
+  counts therefore always come from the server.
+
+## 2026-11-08 — Phase 2 slice 4: Config
+
+- Document-preserving edits: the form never serialises `Config` back to text. Each edit
+  is applied to the on-disk TOML document with `toml_edit` (pinned `=0.22.27`, already in
+  the lock through `toml 0.8`; only the direct-dependency edge is new). A replaced value
+  keeps its comment and spacing; nested records (`match`, `probe`, `receiver.observe`) are
+  written through `TableLike`, so `match = { … }` and a `[device.match]` table are both
+  edited in place, and a key inserted or removed reformats only an inline record; a value
+  equal to what the file already means (an absent key at its default included) is not
+  written; list edits keep the file's order and append new entries. A removed `[[device]]`
+  (or slot) hands the comment block above its header to whatever now follows (the next
+  header, else the end of the file): it may document more than that role. Rows written as
+  an inline array (`device = []`, `device = [{ … }]`) stay as written until a row changes,
+  then become `[[device]]` tables carrying the key's comments; removing the last row leaves
+  `device = []`, since `Config` requires the key. A missing `[trace]`/`[verify]` table is
+  created after its predecessor in `Config` order, only when a value differs.
+- String fields render as one-row `<textarea>`s styled as inputs: an `<input>` drops line
+  breaks from its value, so posting a section would rewrite an untouched multiline string.
+  Text compares by trimmed lines, so a browser's CRLF is no change; a newline after the
+  start tag keeps a value's leading newline through the HTML parser (the raw editor too).
+- The field table (`view::config::FIELDS`, keyed by TOML path) holds labels, units, help,
+  defaults and the integer bounds `Config::validate` enforces; unit tests check that each
+  key is in `choregos.example.toml` (live or in its comments), that every rendered field
+  has a row and every row renders, and that every bound is no looser than `validate`.
+  Editable: `bridge` (kind, topic or node, logical address), `trace`, `tv.entity`,
+  `receiver` (entity, select_source, observe), `presets` (timezone, slots add/remove),
+  `sonos` (entity, mute switch, volume_from), `timing`, `verify`, `fake_tv` (replies,
+  osd_name; power_status and cec_version are shown as fixed values), `[[device]]`. Read-only:
+  `mode` (top-bar switch), `mqtt`, `home_assistant`, `web`, `tv.wake`, `tv.off`, with each
+  secret as its environment variable name and set / not set (read at request time).
+- Validate runs the save path's checks on the edited text: deserialisation
+  (`deny_unknown_fields` included), `Config::validate` and `runtime::validate_reload`
+  (now `pub`), so a
+  restart-gated edit is rejected before review. Input errors (not a number, outside the
+  table's bounds, unknown choice) are reported per field without touching the document.
+  Each `[[device]]` is also validated alone so a problem lands on its row; a validation
+  message is pinned to the field it names, else shown for the section. The raw editor
+  reports parser errors at their span and validation errors at the key's line.
+- Pending edits live only in the form (no server session). A plain change returns only
+  out-of-band state (changed / error marks, row headers, footer, nav), so inputs keep what
+  is being typed; structural buttons (add/remove role, probe or slot, fill, reset, back)
+  re-render the section. Leaving a section with pending changes asks first, on phones too:
+  the phone section picker is the same links in a `<details>` rather than a `<select>`,
+  because a select already shows the new section when its confirm is cancelled and no
+  script may reset it. Controls carry `aria-invalid` with their error; the form posts the
+  names it currently marks (`_invalid`) and a state response re-renders only the controls
+  whose mark flips (htmx restores focus by id). Checkbox groups are `<fieldset>`s named by
+  a visually hidden `<legend>`; the review diff is an `<ol>` with textual `+`/`-`.
+- Only the fields the user changed are applied, always, not only after a 409. The section
+  form carries `_orig`: one hidden JSON object of form name → the value that field showed
+  when the form first rendered it (string, list or null), plus the identity of each file
+  row of the section's row array at page load, in file order (`rows:device`: role ids;
+  `rows:presets.slot`: each slot's `[from, to, script]`). Validate, preview and save write
+  a field only when its posted value differs from its original, compared as the "was"
+  note compares (numbers by value, lists as sets, text trimmed with every line break —
+  CRLF or a lone CR — as LF, as an HTML textarea normalises it, a blank optional value as
+  absent): an edit back to the original is no edit, and a key changed in the file outside
+  the form is never written back, even in the same section; an untouched text keeps the
+  file's own bytes. A re-render (a structural button, Back to edit) shows an untouched
+  field at the file's current value and moves its original there; an edit keeps its own.
+  New rows carry no originals and are written whole. Structural changes stay explicit: a
+  role, slot or probe leaves the file only through its remove button; rows appended
+  outside the form (past the page-load rows) are kept. Form rows address file rows by
+  position, so the form fails closed when that position no longer holds the row it opened
+  on: if the file's first page-load-count rows are not exactly the recorded identities (a
+  row removed, reordered, a role renamed or a slot changed outside the form), validate,
+  preview and save (its 409 fresh review) refuse the form unapplied — nothing is proposed
+  or written — and answer 409 with the section re-rendered from the file, the user's edits
+  to it dropped and a note to make them again; a plain change gets `HX-Retarget: #section`
+  and `HX-Reswap: outerHTML` so the whole section swaps. Re-rendering from the file rather
+  than keeping the edits is deliberate: kept edits would sit on rows that now mean other
+  roles. A form posted without `_orig` applies every posted field and positions unchecked.
+- Review → save is one step for form and raw: one sentence per changed key (table
+  sentences, else `key: old → new`; a whole added or removed role is one sentence), the
+  static restart and resync columns, and a unified LCS line diff with `@@ [table] @@`
+  hunks. The editor reads the file through the runtime (`Request::ReadConfig`), never a
+  cache, and the review carries that text's 64-bit hash (`runtime::config_hash`). Save
+  refuses with 409 and a fresh review when the file read now hashes differently: the
+  review applies the user's changes to the current file, so its diff lists only those
+  changes and the external edit survives the save.
+  `Request::SaveConfig(text, expected_hash, reply)` repeats the check in the runtime's
+  serialized save handler: it re-reads the file immediately before the atomic write and
+  answers `ConfigError::Changed` (also 409) when it moved, so a hand edit of the mounted
+  file or a mode switch since the review is refused, not overwritten. It is not a lock: an
+  external writer landing between that read and the rename is not covered (documented in
+  operations). `POST /config` is gone.
+- Deviations from the boards: one section is edited and reviewed at a time (05a shows two
+  sections and a combined count; edits live in the form, which holds one section).
+  "On the bus now" compares the filled keys with `view::devices::rule_matches` over the
+  snapshot's `BusEntryView`s (`identity::matches` needs engine `BusEntry`s); when nothing
+  matches it lists unbound entries to fill from. The raw textarea has no line-number
+  gutter; errors name their line. The review's diff is open on phones too (no JS to fold
+  it by viewport).
+
+## 2026-11-08 — Phase 2 slice 3: Devices
+
+- `/devices` is the registry: roles (config order), outputs (TV, receiver, speakers),
+  the bridge and unbound bus entries (no role bound; the bridge, the receiver's
+  audio-system entry — the first unbound `device_type = 5` — and entries a restored role
+  waits on are listed elsewhere). `/p/devices` returns the `#registry` block, polled every
+  5 s. `/devices/{role}` (404 for an unknown role), `/devices/out/{tv,receiver,speakers,
+  bridge}` and `/devices/la/{n}` are the detail pages; an LA page for a bound role, the
+  bridge, the audio system or a restored role's entry redirects (303) to that page, an
+  unknown LA is 404. Device profiles come from the configuration text, parsed per request.
+  The receiver page's CEC entry panel carries Identify and a confirmed Forget for the
+  audio-system LA (same action routes and warming rule as an LA page), so the redirect
+  loses no operator control.
+- Statistics ("How it behaves", output timings) are computed from the ring on request.
+  Excluded everywhere: `would` rows and migrated history; latencies of 0 ms (already
+  satisfied when decided). Percentiles are nearest-rank, `sorted[ceil(p·n/100) − 1]`; p95
+  is hidden under n = 5; n is always shown. Wakes = rows of the role with `to = on` and a
+  settled verdict (not `none`, not `pending`), achieved / total. Wake → picture =
+  `tv.power = on` met on those wakes, restricted to `tv_direct` samples when any exist
+  (the via is shown). Receiver ready = `receiver.power = on` met on those wakes. Source
+  switch = `receiver.source` met on `takeover_settled` rows whose parent is one of those
+  wakes. Standby confirmed = settled `role:<r>` power expectations on any row: met or
+  `cec_only` of total, missed and unknown counted separately, with every allowed via.
+  Polled roles add "left the bus" = `presence_timeout` rows. Output timings use the same
+  rules over all rows: TV off (`tv.power = off`, `tv_direct` preferred), receiver on, off
+  (p50/p95) and source, speakers `playback = stopped`.
+- Agreement between truth sources compares normalised power: CEC on/standby; Home
+  Assistant `on|playing|paused|idle|buffering` → on, `off|standby` → off; probe
+  awake/standby. A CEC transition, unknown or unavailable Home Assistant, an unreachable
+  probe or Denon are not evidence; for the TV, as on the cockpit, webOS unreachable and
+  Home Assistant unavailable/unknown read as off. Fewer than two readings = "one source".
+- Identity events: the role's `identity_lost` rows, plus `conflict`, `conflict_resolved`,
+  `command_identify` and `command_forget` rows (no role) whose trigger frame sender or
+  command target is one of the role's addresses: current, last (below), restored, any in
+  a current `Snapshot.conflicts` entry naming the role, or one a loss row names. Synthetic
+  `verified` (bound entry's `confirmed_at`) and `restored` (service start) lines. An entry
+  confirmed before the service start is shown as restored and re-confirmed by vendor and
+  OSD (only a live 84 refreshes `confirmed_at`).
+- Additive snapshot fields: `BusEntryView.confirmed_at` (from `BusEntry.confirmed_at`) and
+  `BusEntryView.next_identify_at` (from the new read-only `BusModel::next_identify_at`, the
+  per-entry arithmetic of `next_identify_deadline`; `None` while the bridge is offline,
+  when no query is sent). `RoleView.last_logical_address`, view only, filled by the
+  snapshot builder: the binding, else the restored entry's LA, else the previous
+  snapshot's value (a conflict or a forget on an Off role unbinds without any row naming
+  the role), else after a restart the trigger LA of the role's newest `identity_lost` row.
+  The engine keeps no such memory.
+- Role page sections are in the DOM once: Identity, Identity events, Quirks and Decisions
+  are open `<details>` that read as plain panels on desktop and fold on phones. Phones
+  therefore open them expanded (board 04d shows them folded; no script can fold them by
+  width under the CSP); the "Edit in Config" and "All in Recorder" links sit at the foot
+  of their panels, outside the summary, at both widths. The bridge page polls its own
+  `#bridge-page-info` wrapper (`/devices/out/bridge`), the drawer its `#bridge-info`;
+  both include the same status content with id prefixes, so no id is shared.
+- Deviations from the boards: logical addresses use the CEC names (LA 9 is "recording
+  device 3", LA 11 "playback device 3"); an unbound entry an identity conflict involves
+  reads `conflict`; the LA page notes say why no role matches (unidentified, conflict or
+  unmatched).
+
+## 2026-11-08 — Phase 2 slice 2: the Recorder
+
+- `/recorder` (decision list), `/recorder/{id}` (one decision), `/recorder/live` (live
+  frames, SSE at `/recorder/live/events`) and `/recorder/glossary` replace `/decisions` and
+  `/bus`, which are removed. The list filters by role (`room` = no role), reason group,
+  exact reason, verdict, would, time range and migrated history, all as GET parameters;
+  pages hold 100 rows behind a `before=<id>` cursor and the first page polls
+  `/p/recorder` every 5 s so verdicts settle in place. The poll replaces one
+  `#recorder-results` block (rows, count and pager, all from one snapshot), so the Older
+  cursor always follows the displayed last row when decisions arrive or a verdict filter
+  drops a settled row. Canonical URLs keep custom-range bounds lossless (RFC3339 with the
+  input's fraction). Day separators are UTC days.
+- Bus window (`/p/window/{id}?from=&to=`, seconds around the decision, bounded
+  −300…0…600): read from the trace day files when `trace.keep_days > 0` and a file exists
+  for the window's UTC date(s), else from memory (`recent_frames` + the ring, no
+  observations); the footer names the source, and says when the trace has no frames for
+  the window (memory is not used to fill a valid trace window). The viewed decision is
+  always one row, keyed `(timestamp, id)`, even when the trace lacks its creation line.
+  Trace records go through the same `runtime::bridge::Correlation` as replay; a send
+  outcome attaches to the send the adapter matched (see the decoder metadata below), never
+  to a row found by similar bytes, and an aether host `tx` with no recorded send (manual
+  or expired id) is still an `ours` row.
+- Window read caps (`runtime::trace::ReadBudget::WINDOW`): at most 5000 in-window entries
+  are returned; one line is buffered up to 1 MiB (longer lines are consumed and dropped,
+  never held whole); the scan stops after 64 MiB or 2 M lines in total, pre-window, torn
+  and unknown lines included. The reader flags `truncated` only when it stops with input
+  left (another in-window entry, or unread bytes when the scan budget is spent), and the
+  window footer says "Window truncated" from that flag.
+- Frames are tagged `trigger` (equal to the trigger frame, closest within ±2 s), `ours`
+  (sent or local), `reply` (to the bridge within 1 s after one of ours) or `other`; an
+  observation within ±1.5 s of `timestamp + latency_ms` with the met value is noted as
+  settling that expectation. Home Assistant observations are read as the engine reads
+  them: power `on|playing|paused|idle|buffering` → `on`, `off|standby` → `off`, playback
+  `idle|paused|off|stopped|standby` → `stopped`, source from the `source` attribute, and
+  sampled at `last_changed` (power, playback) or `last_updated` (source). A trace decision
+  row links to its detail page only when the ring holds the same id at the same time (ids
+  repeat across state lineages); a verdict line settles the newest earlier row with its id.
+- New runtime API: `runtime::trace::read_window(directory, from, to, ReadBudget) ->
+  WindowRead { entries, truncated }` (and `trace::day_file`), and
+  `AppState::set_trace_directory` / `trace_directory`, set once in `runtime::run` from the
+  state file's directory.
+- Additive, display-only decoder metadata on `runtime::bridge::Decoded`: `result_for:
+  Option<SendKey>` (`Fifo(position)` for Tasmota, positions never reused; `Id(id)` for
+  aether) names the recorded send an outcome consumed, including a stock Tasmota reply or
+  an aether rejection that yields no `SendResult`; `host_tx: Option<HostTx>` describes an
+  aether host transmission that yields no `SendResult`. `Correlation::record_send` returns
+  the Tasmota FIFO position. `events` are unchanged, and the live runtime and replay ignore
+  both fields.
+- The glossary page lists all 38 reason literals by group with the group's rule; the
+  detail page links to its anchor. Action strings are decoded in the view from their
+  JSON (`Action` has no `Deserialize`); unparsable strings are shown verbatim.
+- On the detail page the desktop window loads on `intersect once` and the phone copy, in a
+  closed `<details>`, on `toggle once`: one of the two is hidden by the layout, and a
+  hidden `load` trigger would read the trace for nothing.
+- The top-bar mode switch is a `<fieldset>` with a visually hidden legend instead of
+  `div role="group"` (Sonar Web:S6819).
+
+## 2026-11-07 — Phase 2 slice 1: cockpit and chrome
+
+- Phase 2 slice 1: cockpit + chrome; consistency badge rule (warming → not checked
+  (shadow) → unknown: no intent yet → drift → unknown: TV unreachable → consistent);
+  toasts instead of flash; bridge drawer (raw send moved there); dashboard route replaced.
+- Additive, display-only snapshot fields: `RoleView.media_player` (the configured HA
+  media player), `RoleView.restored` (unbound, but an unverified entry restored from the
+  state file matches the role's keys, using the same predicate `identity::resolve` binds
+  with), `Snapshot.bridge_node` and `Snapshot.bridge_boot` (from the last aether status the
+  adapter accepted; cleared on bridge offline), and `Snapshot.off_deadline` (reserved;
+  engine accessor pending, so always `None` and the cockpit shows no countdown).
 ## 2026-11-07 (evening) — Probe trust and same-field closure
 
 - E3: entering rest produced only 9–10 seconds of Standby before a roughly
@@ -75,7 +351,6 @@ Deviations from DESIGN.md agreed in review. Newest first.
 - Reduce private probe-run tracking to `(ConsoleState, Instant)` and remove the
   unused wall timestamp parameter. Raw direct samples retain query-send wall time
   for reporting. No snapshot or persistence changes.
-
 
 ## 2026-11-07 — Console start evidence and startup source guard
 

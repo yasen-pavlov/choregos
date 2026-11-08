@@ -1,0 +1,1 @@
+{% for part in sentence.0 %}{% match part %}{% when Part::Text(text) %}{{ text }}{% when Part::Code(code) %}<code>{{ code }}</code>{% endmatch %}{% endfor %}

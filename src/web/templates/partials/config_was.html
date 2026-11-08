@@ -1,0 +1,1 @@
+<span id="{{ f.id }}-s" class="fstate"{% if oob %} hx-swap-oob="true"{% endif %}>{% if let Some(was) = f.was %}<span class="chip info">changed · was {{ was }}</span> <button type="button" class="link" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"reset:{{ f.name }}"}'>reset</button>{% endif %}</span>

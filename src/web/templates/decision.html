@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}#{{ decision.id }} · recorder · choregos{% endblock %}
+{% block scripts %}<script src="/static/{{ crate::web::RECORDER_JS }}" defer></script>{% endblock %}
+{% block content %}
+{% let tab = "decisions" %}
+<div class="page-h">
+  <a class="small" href="/recorder">← Recorder</a>
+  <span class="desk-only">{% include "partials/recorder_nav.html" %}</span>
+  <span class="grow"></span>
+  {% include "partials/prev_next.html" %}
+</div>
+<header class="dec-head">
+  <div class="grow">
+    <span class="k">Decision #{{ decision.id }} · {{ group.label() }}</span>
+    <h1>{{ headline }}</h1>
+    <span class="mono dim small">{{ when }}</span>
+  </div>
+  <div class="dec-verdict">
+    {% if decision.would %}<span class="chip lg would">would</span>{% else %}<span class="chip lg {{ view::verdict_tone(decision.verdict) }}">{{ decision.verdict }}</span>{% endif %}
+    {% if let Some(met) = met %}<span class="small dim">{{ met }}</span>{% endif %}
+  </div>
+</header>
+<div class="dec-grid">
+  <div class="dec-main">
+    <section class="panel flush" id="trigger" aria-label="Trigger">
+      <div class="ph"><h2 class="grow">Trigger</h2><span class="chip info">{{ trigger.kind }}</span></div>
+      <div class="pb">
+        {% if let Some(frame) = trigger.frame %}
+        <div class="trig">
+          <span class="trig-frame mono"><span class="addr">{{ frame.from }} → {{ frame.to }}</span>{% if let Some(op) = frame.opcode %} <span class="op">{{ op }}</span>{% endif %} {{ frame.operands }}</span>
+          <dl class="dl">
+            <dt>From</dt><dd>{{ frame.from }} · {{ frame.from_name }}</dd>
+            <dt>To</dt><dd>{{ frame.to }} · {{ frame.to_name }}</dd>
+            <dt>Opcode</dt><dd>{% if let Some(op) = frame.opcode %}<span class="mono">{{ op }}</span> {% endif %}{{ frame.opcode_name }}</dd>
+            {% if let Some(params) = frame.params %}<dt>Params</dt><dd>{{ params }}</dd>{% endif %}
+          </dl>
+        </div>
+        {% else %}
+        <p><span class="mono">{{ trigger.kind }}</span> <span class="mono">{{ trigger.text }}</span></p>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="panel flush" id="why" aria-label="Why">
+      <div class="ph"><h2 class="grow">Why</h2><span class="mono">{{ decision.reason }}</span></div>
+      <div class="pb stack">
+        {% if let Some(sentence) = sentence %}<p><strong>{{ sentence }}</strong></p>{% else %}<p class="dim">This reason is not in the glossary.</p>{% endif %}
+        <p class="dim">Rule applied: {{ rule }}</p>
+        {% if let Some(drift) = view::drift_row(decision) %}<p class="small"><span class="mono">{{ drift.subject }}.{{ drift.field }}</span> intended {{ drift.intended }}, observed {{ drift.observed }} via {{ drift.via }} since {{ view::when_ms(drift.since) }}{% if let Some(lasted) = view::drift_lasted(decision) %} · lasted {{ lasted }}{% endif %}</p>{% endif %}
+        <a class="small" href="/recorder/glossary#r-{{ decision.reason }}">Glossary for every reason →</a>
+      </div>
+    </section>
+
+    <section class="panel flush" id="actions" aria-label="Actions">
+      <div class="ph"><h2 class="grow">Actions</h2><span class="note desk-only">what Choregos sent — results of each frame are in the bus window</span></div>
+      {% if actions.is_empty() %}
+      <p class="pb dim">No actions.</p>
+      {% else %}
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th scope="col">#</th><th scope="col">Action</th><th scope="col">Target</th><th scope="col">Detail</th><th scope="col" class="r">Status</th></tr></thead>
+          <tbody>
+            {% for action in actions %}
+            <tr class="{% if action.housekeeping %}house{% endif %}{% if action.would %} would{% endif %}">
+              <td class="mono dim">{{ loop.index }}</td>
+              <td class="mono">{{ action.kind }}</td>
+              <td>{{ action.target }}</td>
+              <td class="mono small">{{ action.detail }}</td>
+              <td class="r"><span class="chip {% if action.would %}would{% else %}dim{% endif %}">{{ action.status() }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="panel flush" id="expectations" aria-label="Expectations">
+      <div class="ph"><h2 class="grow">Expectations</h2><span class="note desk-only">what the room should look like, and what it did</span></div>
+      {% if expectations.is_empty() %}
+      <p class="pb dim">{% if decision.would %}None: nothing is verified for a would row.{% else %}None: nothing in this decision is checked against the room.{% endif %}</p>
+      {% else %}
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th scope="col">Subject</th><th scope="col">Expect</th><th scope="col">Via</th><th scope="col" class="r">Deadline</th><th scope="col" class="r">Attempts</th><th scope="col">Outcome</th><th scope="col" class="r">Latency</th></tr></thead>
+          <tbody>
+            {% for e in expectations %}
+            <tr>
+              <td class="mono">{{ e.name }}</td>
+              <td class="mono">{{ e.expect }}</td>
+              <td class="mono">{% for (via, used) in e.via %}{% if *used %}<strong>{{ via }}</strong>{% else %}<span class="dim">{{ via }}</span>{% endif %}{% if !loop.last %} {% endif %}{% endfor %}</td>
+              <td class="mono num r">{{ e.deadline }}</td>
+              <td class="mono num r">{{ e.attempts }}</td>
+              <td><span class="chip {{ e.tone }}">{{ e.outcome }}</span></td>
+              <td class="mono num r">{% if let Some(latency) = e.latency %}{{ latency }}{% else %}<span class="dim">—</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% for e in expectations %}{% if let Some(explain) = e.explain %}<p class="pb explain small"><span class="mono">{{ e.name }}</span>: {{ explain }}</p>{% endif %}{% endfor %}
+      {% endif %}
+    </section>
+
+    <section class="panel flush desk-only" id="bus-window" aria-label="Bus window">
+      <div class="ph"><h2 class="grow">Bus window</h2></div>
+      <div class="window-slot" hx-get="{{ window_url }}" hx-trigger="intersect once" hx-swap="innerHTML">
+        {% include "partials/window_loading.html" %}
+      </div>
+    </section>
+    <details class="panel flush phone-only window-fold">
+      <summary class="ph"><h2 class="grow">Bus window</h2></summary>
+      <div class="window-slot" hx-get="{{ window_url }}" hx-trigger="toggle once from:closest details" hx-swap="innerHTML">
+        {% include "partials/window_loading.html" %}
+      </div>
+    </details>
+  </div>
+
+  <aside class="dec-side">
+    <section class="panel flush" id="family" aria-label="Family">
+      <div class="ph"><h2 class="grow">Family</h2></div>
+      <div class="pb stack">
+        <div><span class="k">Parent</span>
+          {% if let Some(parent) = parent %}<div><a class="mono" href="/recorder/{{ parent.id }}">#{{ parent.id }}</a> <span class="mono">{{ parent.reason }}</span> {% if parent.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(parent.verdict) }}">{{ parent.verdict }}</span>{% endif %}</div>
+          {% else if let Some(id) = decision.parent %}<div class="dim">#{{ id }} (no longer in memory)</div>
+          {% else %}<div class="dim">— ({{ trigger.kind }} trigger)</div>{% endif %}
+        </div>
+        <div><span class="k">Children</span>
+          {% for child in children %}<div>↳ <a class="mono" href="/recorder/{{ child.id }}">#{{ child.id }}</a> <span class="mono">{{ child.reason }}</span> {% if child.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(child.verdict) }}">{{ child.verdict }}</span>{% endif %}</div>{% else %}<div class="dim">none</div>{% endfor %}
+        </div>
+      </div>
+    </section>
+    <section class="panel flush" id="neighbours" aria-label="Neighbours">
+      <div class="ph"><h2 class="grow">Neighbours</h2></div>
+      <div class="pb stack small">
+        <a class="desk-only" href="/recorder/timeline?select={{ decision.id }}">Open in timeline →</a>
+        {% if let Some(role) = decision.role %}{% let name = role_name.as_deref().unwrap_or(role) %}
+        <a href="/recorder?role={{ role|urlencode }}">Other decisions for {{ name }} →</a>
+        {% endif %}
+        <a href="/recorder?reason={{ decision.reason|urlencode }}">Other {{ decision.reason }} rows →</a>
+        {% if let Some(role) = decision.role %}{% let name = role_name.as_deref().unwrap_or(role) %}
+        <a href="/devices/{{ role|urlencode_strict }}">{{ name }} in Devices →</a>
+        {% endif %}
+      </div>
+    </section>
+  </aside>
+</div>
+<div class="phone-only"><div class="pager">{% include "partials/prev_next.html" %}</div></div>
+{% endblock %}

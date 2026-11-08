@@ -1,0 +1,16 @@
+<header class="dev-head">
+  <div class="grow">
+    <span class="k">Bridge</span>
+    <h1>Bridge</h1>
+    <span class="mono dim small">speaks on the bus as LA {{ page.snapshot.bridge_logical_address }}</span>
+  </div>
+  <div class="dev-actions"><button type="button" class="btn sm" hx-get="/p/bridge" hx-target="#drawer" hx-swap="innerHTML">Open the drawer</button></div>
+</header>
+<section class="panel" aria-label="Bridge status">
+  {% let snapshot = page.snapshot %}
+  {# Its own wrapper and ids: the drawer, when open, polls its #bridge-info separately. #}
+  <div id="bridge-page-info" class="pb-flow" hx-get="/devices/out/bridge" hx-trigger="every 3s" hx-select="#bridge-page-info" hx-swap="outerHTML">
+    {% let info_id = "bridge-page" %}{% include "partials/bridge_info.html" %}
+  </div>
+</section>
+<p class="note">Raw frames are sent from the bridge drawer, which opens from the bridge pill in the top bar on any page.</p>

@@ -1,0 +1,18 @@
+<div class="scroll-x">
+  <table class="tbl involved">
+    <thead><tr><th scope="col">#</th><th scope="col">Time</th><th scope="col">Reason</th><th scope="col">Its part</th><th scope="col">Verdict</th></tr></thead>
+    <tbody>
+      {% for row in page.involved %}
+      <tr{% if row.decision.would %} class="would"{% endif %}>
+        <td class="mono"><a href="/recorder/{{ row.decision.id }}">{{ row.decision.id }}</a></td>
+        <td class="mono num" title="{{ view::iso(row.decision.timestamp) }}">{{ view::when_ms(row.decision.timestamp) }}</td>
+        <td class="mono" title="{{ view::reason_title(row.decision.reason) }}">{{ row.decision.reason }}</td>
+        <td class="small">{{ row.part }}{% if let Some((word, tone)) = row.outcome %} <span class="chip {{ tone }}">{{ word }}</span>{% endif %}</td>
+        <td>{% if row.decision.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(row.decision.verdict) }}">{{ row.decision.verdict }}</span>{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">No decisions involve this role yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

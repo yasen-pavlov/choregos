@@ -1,4 +1,4 @@
-use super::{Decoded, Incoming};
+use super::{Decoded, HostTx, Incoming, SendKey};
 use crate::{
     cec::Frame,
     engine::{Event, SendStatus},
@@ -198,34 +198,49 @@ impl Correlation {
         if payload.get("origin").and_then(Value::as_str) != Some("host") {
             return;
         }
+        let attempts = payload
+            .get("attempts")
+            .and_then(Value::as_u64)
+            .and_then(|v| u8::try_from(v).ok());
+        // Display metadata for an outcome that yields no `SendResult`; the engine never sees it.
+        let unanswered = |decoded: &mut Decoded| {
+            decoded.host_tx = frame(payload).map(|frame| {
+                Box::new(HostTx {
+                    frame,
+                    status: status.unwrap_or("unknown").to_owned(),
+                    attempts,
+                })
+            });
+        };
         let Some(id) = payload.get("id").and_then(Value::as_str) else {
             if status == Some("rejected") {
                 tracing::warn!(reason = ?payload.get("reason"), "aether rejected send");
             }
+            unanswered(decoded);
             return;
         };
         self.pending
             .retain(|_, (_, _, at)| now.saturating_duration_since(*at) < Duration::from_secs(5));
-        let Some((to, data, _)) = self.pending.remove(id) else {
+        let Some((id, (to, data, _))) = self.pending.remove_entry(id) else {
             tracing::debug!(id, "unknown or expired aether send outcome");
+            unanswered(decoded);
             return;
         };
+        if status == Some("rejected") {
+            tracing::warn!(id = id.as_str(), reason = ?payload.get("reason"), "aether rejected send");
+        }
+        decoded.result_for = Some(SendKey::Id(id));
         let status = match status {
             Some("ack") => SendStatus::Ack,
             Some("nack") => SendStatus::Nack,
             Some("arb_lost") => SendStatus::ArbLost,
             Some("line_error") => SendStatus::LineError,
             Some("busy") => SendStatus::Busy,
-            Some("rejected") => {
-                tracing::warn!(id, reason = ?payload.get("reason"), "aether rejected send");
+            _ => {
+                unanswered(decoded);
                 return;
             }
-            _ => return,
         };
-        let attempts = payload
-            .get("attempts")
-            .and_then(Value::as_u64)
-            .and_then(|v| u8::try_from(v).ok());
         decoded.events.push(Event::SendResult {
             to,
             data,
@@ -430,6 +445,47 @@ mod tests {
         assert!(c.bus(&rejected, now).events.is_empty());
         assert!(c.pending.is_empty());
         assert!(c.bus(&outcome(7, "manual", "ack"), now).events.is_empty());
+    }
+    #[test]
+    fn outcomes_name_the_send_they_answer_and_unmatched_host_tx_stays_visible() {
+        let mut c = Correlation::default();
+        online(&mut c, 1);
+        let now = Instant::now();
+        // Two identical sends answered out of order: each outcome names its own id.
+        c.record("s-1".into(), 4, vec![0x36], now);
+        c.record("s-2".into(), 4, vec![0x36], now);
+        let second = c.bus(&outcome(1, "s-2", "nack"), now);
+        assert_eq!(second.result_for, Some(SendKey::Id("s-2".into())));
+        assert!(matches!(
+            &second.events[..],
+            [Event::SendResult {
+                status: SendStatus::Nack,
+                ..
+            }]
+        ));
+        assert!(second.host_tx.is_none(), "a SendResult needs no raw row");
+        let first = c.bus(&outcome(2, "s-1", "ack"), now);
+        assert_eq!(first.result_for, Some(SendKey::Id("s-1".into())));
+        // A rejection consumes its send without an engine event, and keeps its word.
+        c.record("s-3".into(), 4, vec![0x36], now);
+        let rejected = c.bus(&outcome(3, "s-3", "rejected"), now);
+        assert!(rejected.events.is_empty());
+        assert_eq!(rejected.result_for, Some(SendKey::Id("s-3".into())));
+        assert_eq!(rejected.host_tx.unwrap().status, "rejected");
+        // An unknown id reaches no engine event but its wire frame is described.
+        let manual = c.bus(&outcome(4, "manual-1", "ack"), now);
+        assert!(manual.events.is_empty() && manual.result_for.is_none());
+        let tx = manual.host_tx.unwrap();
+        assert_eq!(
+            (
+                tx.frame.from,
+                tx.frame.to,
+                tx.frame.opcode,
+                tx.status.as_str(),
+                tx.attempts
+            ),
+            (0, 4, Some(0x36), "ack", Some(2))
+        );
     }
     #[test]
     fn pending_ids_expire_at_five_seconds_are_bounded_and_clear_on_boot_or_offline() {

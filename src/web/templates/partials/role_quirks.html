@@ -1,0 +1,7 @@
+{% if page.quirks.is_empty() %}
+<p class="pb dim">This role is not in the configuration on disk.</p>
+{% else %}
+<ul class="pb quirks">
+  {% for sentence in page.quirks %}<li>{% include "partials/sentence.html" %}</li>{% endfor %}
+</ul>
+{% endif %}

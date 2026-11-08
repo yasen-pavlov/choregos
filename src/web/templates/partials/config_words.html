@@ -1,0 +1,8 @@
+<div id="r{{ role.index }}-w" class="words"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <span class="k">In words</span>
+  {%- if let Some(words) = role.words %}
+  <ul class="quirks">{% for sentence in words %}<li>{% include "partials/sentence.html" %}</li>{% endfor %}</ul>
+  {%- else %}
+  <p class="note">Fix the errors to preview.</p>
+  {%- endif %}
+</div>

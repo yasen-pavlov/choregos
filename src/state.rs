@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -39,6 +40,8 @@ struct Inner {
     config_text: std::sync::RwLock<String>,
     runtime: std::sync::RwLock<Option<tokio::sync::mpsc::Sender<crate::runtime::Input>>>,
     auth: AuthConfig,
+    /// Where the runtime writes its daily bus traces; `None` until the runtime says so.
+    trace_directory: std::sync::RwLock<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -56,6 +59,8 @@ impl AppState {
             bridge_online: false,
             bridge_bus: None,
             bridge_telemetry: None,
+            bridge_node: None,
+            bridge_boot: None,
             last_frame_at: None,
             bridge_logical_address: config.bridge.logical_address(),
             bridge_max_raw_bytes: config.bridge.max_raw_bytes(),
@@ -68,14 +73,17 @@ impl AppState {
                     source: device.source.clone(),
                     power: RolePower::Off,
                     logical_address: None,
+                    last_logical_address: None,
                     physical_address: None,
                     vendor: None,
                     osd: None,
                     last_event: None,
                     last_seen: None,
                     conflicted: false,
+                    restored: false,
                     direct: None,
                     probe_configured: device.probe.is_some(),
+                    media_player: device.media_player.clone(),
                 })
                 .collect(),
             bus: Vec::new(),
@@ -96,6 +104,7 @@ impl AppState {
             receiver_direct: None,
             drift: Vec::new(),
             conflicts: Vec::new(),
+            off_deadline: None,
             recent_frames: VecDeque::new(),
             decisions: VecDeque::new(),
             connections,
@@ -121,6 +130,7 @@ impl AppState {
                 config_text: std::sync::RwLock::new(config_text),
                 runtime: std::sync::RwLock::new(None),
                 auth,
+                trace_directory: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -171,7 +181,29 @@ impl AppState {
             .clone()
     }
 
-    pub async fn save_config(&self, text: &str) -> Result<(), ConfigError> {
+    /// The configuration file as it is on disk now, read by the runtime.
+    pub async fn read_config(&self) -> Result<String, ConfigError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.config_request(crate::runtime::Request::ReadConfig(reply))
+            .await?;
+        result.await.map_err(|_| ConfigError::Unavailable)?
+    }
+
+    /// Saves and applies `text` when the file still hashes to `expected`
+    /// (`crate::runtime::config_hash` of the text the editor read); otherwise
+    /// `ConfigError::Changed` and nothing is written.
+    pub async fn save_config(&self, text: &str, expected: u64) -> Result<(), ConfigError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.config_request(crate::runtime::Request::SaveConfig(
+            text.into(),
+            expected,
+            reply,
+        ))
+        .await?;
+        result.await.map_err(|_| ConfigError::Unavailable)?
+    }
+
+    async fn config_request(&self, request: crate::runtime::Request) -> Result<(), ConfigError> {
         let sender = self
             .inner
             .runtime
@@ -179,14 +211,10 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(ConfigError::Unavailable)?;
-        let (reply, result) = tokio::sync::oneshot::channel();
         sender
-            .send(crate::runtime::Input::Request(
-                crate::runtime::Request::SaveConfig(text.into(), reply),
-            ))
+            .send(crate::runtime::Input::Request(request))
             .await
-            .map_err(|_| ConfigError::Unavailable)?;
-        result.await.map_err(|_| ConfigError::Unavailable)?
+            .map_err(|_| ConfigError::Unavailable)
     }
 
     pub(crate) fn attach(&self, sender: tokio::sync::mpsc::Sender<crate::runtime::Input>) {
@@ -228,6 +256,24 @@ impl AppState {
     pub fn auth(&self) -> &AuthConfig {
         &self.inner.auth
     }
+
+    /// Records where the runtime writes its `cec-bus.<date>.jsonl` day files.
+    pub fn set_trace_directory(&self, directory: PathBuf) {
+        *self
+            .inner
+            .trace_directory
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(directory);
+    }
+
+    /// The trace day-file directory, once the runtime has set it.
+    pub fn trace_directory(&self) -> Option<PathBuf> {
+        self.inner
+            .trace_directory
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -236,6 +282,10 @@ pub struct Snapshot {
     pub warming: bool,
     pub bridge_online: bool,
     pub bridge_bus: Option<String>,
+    /// Aether node that reported the current status; `None` for Tasmota and while offline.
+    pub bridge_node: Option<String>,
+    /// Aether boot counter of the current status; `None` for Tasmota and while offline.
+    pub bridge_boot: Option<u32>,
     pub bridge_telemetry: Option<BridgeTelemetry>,
     pub last_frame_at: Option<DateTime<Utc>>,
     pub bridge_logical_address: u8,
@@ -249,6 +299,9 @@ pub struct Snapshot {
     pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>,
     pub drift: Vec<crate::action::DriftDetail>,
     pub conflicts: Vec<Conflict>,
+    /// When the room-off timer fires. Filled once the engine exposes its room-off deadline;
+    /// `None` until then (`intent.off_at` is when the room last went off, not a deadline).
+    pub off_deadline: Option<DateTime<Utc>>,
     pub recent_frames: VecDeque<FrameView>,
     pub decisions: VecDeque<DecisionView>,
     pub connections: Health,
@@ -435,14 +488,23 @@ pub struct RoleView {
     pub source: String,
     pub power: RolePower,
     pub logical_address: Option<u8>,
+    /// The address the role is or was last known at: its binding, else its restored entry's,
+    /// else the last binding this service saw (or, after a restart, the address of its last
+    /// `identity_lost` row). Display only; identity history follows the role through it.
+    pub last_logical_address: Option<u8>,
     pub physical_address: Option<String>,
     pub vendor: Option<String>,
     pub osd: Option<String>,
     pub last_event: Option<String>,
     pub last_seen: Option<DateTime<Utc>>,
     pub conflicted: bool,
+    /// Unbound, but an unverified bus entry restored from the state file matches the role's
+    /// identity keys; it binds once the device is re-confirmed on the bus. Display only.
+    pub restored: bool,
     pub direct: Option<(ConsoleState, DateTime<Utc>)>,
     pub probe_configured: bool,
+    /// The device's configured Home Assistant media player, if any.
+    pub media_player: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,6 +519,12 @@ pub struct BusEntryView {
     pub identified: bool,
     pub verified: bool,
     pub matched_role: Option<String>,
+    /// When the last Report Physical Address confirmed this entry (kept from the state file
+    /// for a restored entry until it is confirmed again).
+    pub confirmed_at: Option<DateTime<Utc>>,
+    /// When the next identification query for this entry is due; `None` when it needs none
+    /// or the bridge is offline (no queries are sent then). Display only.
+    pub next_identify_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -529,6 +597,20 @@ pub struct DecisionView {
     pub verdict: crate::action::Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<crate::action::DriftDetail>,
+}
+
+impl DecisionView {
+    /// The logical address the row's trigger names: the frame's sender, or an identify/forget
+    /// command's target.
+    pub fn trigger_logical_address(&self) -> Option<u8> {
+        match &self.trigger {
+            crate::action::Trigger::Frame { from, .. } => Some(*from),
+            crate::action::Trigger::Command {
+                command: Command::Identify(la) | Command::Forget(la),
+            } => Some(*la),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

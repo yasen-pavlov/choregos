@@ -150,7 +150,7 @@ src/runtime/executor.rs Action → side effect (respects mode)             [core
 src/state.rs           AppState shared with the web layer (RwLock snapshot + broadcast channel of UI events) [core]
 src/web/mod.rs         axum router, OIDC + local login, session cookie   [ui]
 src/web/auth.rs                                                           [ui]
-src/web/routes/*.rs    dashboard, bus, devices, decisions, config, actions, healthz, SSE [ui]
+src/web/routes/*.rs    cockpit, chrome (status/bridge partials), recorder, live (SSE), devices, config, actions, healthz [ui]
 src/web/templates/     askama templates, htmx, one static CSS, no JS build [ui]
 tests/replay.rs        fixture-driven engine tests                        [core]
 fixtures/*.jsonl       captures                                           [lead]
@@ -849,16 +849,88 @@ its value or establishes when the device actually changed state.
 
 ## 6. Web UI (axum + askama + htmx + SSE; no JS build step)
 
-Pages (all behind auth): 
-- `/` Dashboard: mode switch (confirm when going active), bridge status, role cards (name, power, LA/PA, vendor/OSD, last event, "takeover" and "standby" buttons), TV/receiver/Sonos/Kodi HA states, active source, conflicts banner, "all off".
-  Next to room intent, one amber pill per open drift shows
-  `subject.field: observed, intended X, for <duration>`; reporting only.
-- `/bus` Live bus: SSE stream of frames (decoded: from/to names, opcode name, operands) interleaved with decisions; filters by LA/opcode; last 2000 kept in memory (ring buffer in `AppState`).
-- `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "identify" and confirmed "forget" controls per non-bridge LA.
-- `/decisions` Decision log with stable `d-<id>` anchors, parent links, reasons and resulting actions (and `would:` entries in shadow mode).
-  `drift`/`drift_resolved` rows show `subject.field intended → observed via <source>`
-  without a verdict chip; a resolved row also shows how long the drift lasted.
-- `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
+Pages (all behind auth); the chrome on every page is a top bar (brand, nav
+Cockpit · Recorder · Devices · Config, mode switch with confirm in both
+directions, consistency badge, bridge/mqtt/ha pills, user) polled through
+`/p/status` every 3 s; the bridge pill opens a drawer (`/p/bridge`: node, boot
+count, RSSI, links, uptime, bus status, last frame, raw send). Action responses
+are out-of-band toasts. Shadow mode shows an amber band and labels every
+action "Would …".
+- `/` Cockpit: room strip (intent, active source, receiver input, off timer
+  from `Snapshot.off_deadline` only — never inferred, consistency badge:
+  warming → not checked (shadow) → unknown: no intent → drift → unknown: TV
+  unreachable → consistent), verifying line for a pending decision, alert slot
+  (bridge offline, bus fault, conflicts, warming), one card per role (power by
+  source CEC / HA / probe, identity chip, last decision with verdict edge,
+  takeover/standby/identify), outputs (TV webOS·HA, receiver Denon·HA source and
+  sound mode, speakers), last five decisions with restart separators; `/p/cockpit`
+  partial every 3 s; "all off" with confirm.
+- `/recorder` Decision list, newest first, filters as query parameters (role,
+  reason group, verdict, would, reason literal, time range, migrated rows hidden
+  by default), cursor pagination (`before=<id>`, 100 rows), page 1 polled every
+  5 s. `/recorder/{id}` detail: trigger, reason with glossary sentence, actions
+  as issued ("sent", never "acknowledged"), expectations, family (parent and
+  children), neighbours, and the bus window `/p/window/{id}?from&to` read from
+  the day's trace file (`cec-bus.<UTC date>.jsonl`, bounded, `spawn_blocking`)
+  with observation lines, or from the in-memory frame ring when no file covers
+  the window; frames tagged trigger / ours / reply / other / obs.
+  `/recorder/live` is the SSE stream of frames (decoded: from/to names, opcode
+  name, operands) interleaved with decisions; filters by LA/opcode; last 2000
+  kept in memory (ring buffer in `AppState`); `follow=off` renders without the
+  stream. `/recorder/glossary` lists every reason literal by group with its
+  sentence. `/recorder/timeline?at&zoom&select` draws one window (1 m to 1 h,
+  trace day files else memory) as lanes: the room's intent replayed from the ring,
+  decision markers coloured by verdict, one lane per logical address (frames by
+  sender, presence polls by target; bound roles shown when silent) and the
+  TV / receiver / probe observation runs with their settle notes; positions are
+  server-side percentages, so it is complete without JavaScript, and each address
+  and observation lane carries an accessible name and a visually hidden text list
+  of its frames or runs; `select` opens the side panel (`/p/timeline/select/{id}`);
+  `/p/timeline` is the block the zoom and pan links swap (`at=now` keeps the live
+  edge with a selection); `/p/timeline/window.json?from&to` (≤ 1 h, ≤ 5000
+  entries) is the same window as JSON. Phones get a "desk only" note. The one
+  vendored script (`recorder-<n>.js`, Recorder pages only) adds keys, hover cards
+  and live tail (frame ticks appended from the SSE stream; the block re-fetched on
+  every decision, reset and 30 s).
+- `/devices` Registry, polled every 5 s (`/p/devices`): roles, outputs (TV,
+  receiver with its audio-system CEC entry, speakers), the bridge and unbound bus
+  entries, each with kind, LA · PA, vendor · OSD, identity (bound / restored /
+  unbound / conflict; unmatched / unidentified with the next identify query),
+  power, sources, last decision and last seen. `/devices/{role}`: power by source
+  (CEC, Home Assistant, probe; the used one marked, agreement shown), identity keys
+  against the match rule with identity events, statistics from the ring (wakes,
+  wake → picture, receiver ready, source switch, standby confirmed, left the bus;
+  nearest-rank p50/p95, n always shown), quirks from the device profile, the
+  decisions involving it, and identify / take over / standby / confirmed forget; a
+  restored role waiting for its device shows its stored keys and "Identify now".
+  `/devices/out/{tv,receiver,speakers}`: direct vs Home Assistant, timings, drift
+  history, how Choregos drives it; `/devices/out/bridge`: the bridge status.
+  `/devices/la/{n}`: an unbound entry's keys, identify backoff, recent frames,
+  identify and confirmed forget.
+- `/config` The file stays the source of truth: every edit is applied to its own
+  document (`toml_edit`; comments, order and formatting kept), never by serialising
+  `Config`. Form tab: a section nav (every top-level `Config` field, file order picks
+  the first editable one; badges `restart`, `partly`, role count, `n changed`,
+  `n error`) and one section at a time (`/p/config/{section}`): label, key, input
+  with the validated bounds, unit, help, `Default N · lo–hi`, `changed · was X`
+  with reset, error line; `[[device]]` is a role editor (add/remove, match keys with
+  the bus entries they match and "Fill from this entry", on/off event pickers,
+  takeover, presence, `verify_standby`, media player, probe add/remove, "In words"
+  from the device-page quirk sentences); `mode` is changed by the top-bar switch;
+  `mqtt`, `home_assistant`, `web`, `tv.wake` and `tv.off` are read-only with their
+  secrets as environment variable names and set / not set. Raw TOML tab (desktop):
+  the file text, parse and validation errors with their line. `POST
+  /config/validate` applies the pending form (or raw text) to the current file and
+  runs `Config` parsing, `validate` and `validate_reload`; pending edits live in the
+  form only. Both tabs end in `POST /config/preview` (what changes, one sentence per
+  key; what restarts; what the resync does; unified line diff) and `POST
+  /config/save`. The editor reads the file through the runtime
+  (`AppState::read_config`); the save carries the hash of the text it was reviewed
+  against, and the runtime re-reads the file immediately before the atomic write and
+  refuses with `ConfigError::Changed` when the hash moved (409, fresh review of the
+  user's changes applied to the current file; a form applies only the fields the user
+  changed, so an outside edit is never written back). Not a
+  lock: an external writer racing that last read→rename is not covered.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
 Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; local username/password break-glass form at `/login/local`; signed session cookie (`tower-sessions` or axum-extra signed cookies); CSRF for POSTs via same-site cookie + hidden token. Visual design: dark, dense, monospace for bus data; mocked before implementation (see `docs/ui.md` once written).
 
@@ -880,8 +952,9 @@ impl AppState {
     pub fn snapshot(&self) -> Snapshot;                 // cheap clone of everything the UI renders
     pub fn subscribe(&self) -> broadcast::Receiver<UiEvent>; // Frame | Decision only
     pub async fn command(&self, cmd: Command) -> Result<(), CommandError>;
-    pub fn config_text(&self) -> String;                // current file text; environment secrets never serialized
-    pub async fn save_config(&self, text: &str) -> Result<(), ConfigError>; // validate + atomic write + reload
+    pub fn config_text(&self) -> String;                // running config's text; environment secrets never serialized
+    pub async fn read_config(&self) -> Result<String, ConfigError>; // the file on disk now, read by the runtime
+    pub async fn save_config(&self, text: &str, expected: u64) -> Result<(), ConfigError>; // runtime::config_hash of the text read; validate + re-read + compare (else Changed) + atomic write + reload
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }

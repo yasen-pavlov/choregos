@@ -29,6 +29,8 @@ use crate::state::AppState;
 
 pub(crate) const HTMX_JS: &str = "htmx-2.0.11.min.js";
 pub(crate) const HTMX_SSE_JS: &str = "htmx-ext-sse-2.2.4.min.js";
+/// The one hand-written script, loaded on Recorder pages only; bump the suffix on change.
+pub(crate) const RECORDER_JS: &str = "recorder-2.js";
 pub(crate) const STYLESHEET: &str = "choregos.css";
 
 const SESSION_COOKIE: &str = "choregos_session";
@@ -69,15 +71,34 @@ pub fn router(state: AppState) -> Router {
     };
 
     let protected = Router::new()
-        .route("/", get(routes::dashboard::page))
-        .route("/bus", get(routes::bus::page))
-        .route("/bus/events", get(routes::bus::events))
-        .route("/devices", get(routes::devices::page))
-        .route("/decisions", get(routes::decisions::page))
+        .route("/", get(routes::cockpit::page))
+        .route("/p/cockpit", get(routes::cockpit::partial))
+        .route("/p/status", get(routes::chrome::status))
+        .route("/p/bridge", get(routes::chrome::bridge))
+        .route("/recorder", get(routes::recorder::page))
+        .route("/p/recorder", get(routes::recorder::rows))
+        .route("/recorder/glossary", get(routes::recorder::glossary))
+        .route("/recorder/live", get(routes::live::page))
+        .route("/recorder/live/events", get(routes::live::events))
+        .route("/recorder/timeline", get(routes::timeline::page))
+        .route("/p/timeline", get(routes::timeline::block))
         .route(
-            "/config",
-            get(routes::config::page).post(routes::config::submit),
+            "/p/timeline/window.json",
+            get(routes::timeline::window_json),
         )
+        .route("/p/timeline/select/{id}", get(routes::timeline::selected))
+        .route("/recorder/{id}", get(routes::recorder::detail))
+        .route("/p/window/{id}", get(routes::recorder::window))
+        .route("/devices", get(routes::devices::page))
+        .route("/p/devices", get(routes::devices::partial))
+        .route("/devices/out/{name}", get(routes::devices::output))
+        .route("/devices/la/{la}", get(routes::devices::entry))
+        .route("/devices/{role}", get(routes::devices::role))
+        .route("/config", get(routes::config::page))
+        .route("/p/config/{section}", get(routes::config::partial))
+        .route("/config/validate", post(routes::config::validate))
+        .route("/config/preview", post(routes::config::preview))
+        .route("/config/save", post(routes::config::save))
         .route("/actions/mode", post(routes::actions::mode))
         .route("/actions/all-off", post(routes::actions::all_off))
         .route("/actions/identify/{la}", post(routes::actions::identify))
@@ -151,12 +172,18 @@ pub(crate) enum WebError {
     BadRequest(String),
     #[error("not found")]
     NotFound,
+    /// The configuration file could not be read through the runtime.
+    #[error("configuration file unavailable: {0}")]
+    ConfigFile(#[from] crate::config::ConfigError),
 }
 
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::Render(_) | Self::Session(_) => {
+            Self::ConfigFile(crate::config::ConfigError::Unavailable) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::Render(_) | Self::Session(_) | Self::ConfigFile(_) => {
                 tracing::error!(error = %self, "web request failed");
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }

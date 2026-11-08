@@ -471,6 +471,7 @@ dependencies = [
  "tokio-test",
  "tokio-tungstenite",
  "toml 1.1.8+spec-1.1.0",
+ "toml_edit",
  "tower",
  "tower-http 0.7.1",
  "tower-sessions",

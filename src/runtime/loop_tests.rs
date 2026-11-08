@@ -25,7 +25,7 @@ const DUMMY_SECRET: &str = "runtime-test-only-dummy-secret-value";
 
 // Broker::start creates unowned server threads and has no shutdown API. Hosting
 // the same Router/Server in an owned runtime lets tests really sever every socket.
-struct Broker {
+pub(super) struct Broker {
     address: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -80,7 +80,7 @@ impl Broker {
             thread: Some(thread),
         }
     }
-    async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -108,7 +108,7 @@ struct MqttView {
     subscriptions: u64,
     publications: Vec<Publish>,
 }
-struct MqttPeer {
+pub(super) struct MqttPeer {
     client: AsyncClient,
     port: u16,
     view: watch::Receiver<MqttView>,
@@ -165,7 +165,7 @@ impl MqttPeer {
         .await
         .expect("MQTT observation timed out")
     }
-    async fn publish(&self, topic: &str, retained: bool, payload: impl Into<Vec<u8>>) {
+    pub(super) async fn publish(&self, topic: &str, retained: bool, payload: impl Into<Vec<u8>>) {
         self.client
             .publish(topic, QoS::AtLeastOnce, retained, payload)
             .await
@@ -334,14 +334,14 @@ async fn ha_session(socket: TcpStream, observed: watch::Sender<HaView>, initial:
     }
 }
 
-struct Harness {
-    state: AppState,
+pub(super) struct Harness {
+    pub(super) state: AppState,
     config: Config,
     path: PathBuf,
     inputs: mpsc::Sender<super::Input>,
-    peer: MqttPeer,
+    pub(super) peer: MqttPeer,
     ha: HaFake,
-    broker: Broker,
+    pub(super) broker: Broker,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<crate::engine::Engine>>>,
     _directory: tempfile::TempDir,
@@ -351,7 +351,7 @@ impl Harness {
     async fn start() -> Self {
         Self::start_with_bridge(false).await
     }
-    async fn start_with_bridge(native: bool) -> Self {
+    pub(super) async fn start_with_bridge(native: bool) -> Self {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reservation.local_addr().unwrap();
         drop(reservation);
@@ -536,6 +536,17 @@ impl Harness {
             .unwrap()
             .unwrap();
     }
+    /// Saves `text` over the file as the runtime reads it now, as the web editor does.
+    async fn save_config(&self, text: &str) -> Result<(), crate::config::ConfigError> {
+        tokio::time::timeout(WAIT, async {
+            let read = self.state.read_config().await?;
+            self.state
+                .save_config(text, super::config_hash(&read))
+                .await
+        })
+        .await
+        .unwrap()
+    }
     async fn stop_runtime(&mut self) {
         self.take_engine().await;
     }
@@ -554,7 +565,7 @@ impl Harness {
         }
         None
     }
-    async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) {
         self.stop_runtime().await;
         self.ha.shutdown().await;
         self.broker.shutdown().await;
@@ -576,7 +587,10 @@ fn role_on(snapshot: &Snapshot) -> bool {
         .iter()
         .any(|role| role.role == "streamer" && role.power == RolePower::On)
 }
-async fn wait_snapshot(state: &AppState, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
+pub(super) async fn wait_snapshot(
+    state: &AppState,
+    predicate: impl Fn(&Snapshot) -> bool,
+) -> Snapshot {
     tokio::time::timeout(WAIT, async {
         loop {
             let snapshot = state.snapshot();
@@ -700,10 +714,26 @@ async fn app_commands_persist_mode_execute_takeover_and_reload_configuration_thr
         "# preserve this operator comment after save\n{}",
         toml::to_string_pretty(&changed).unwrap()
     );
-    tokio::time::timeout(WAIT, harness.state.save_config(&submitted))
+    // An editor read the file before a mode switch landed: its save is refused, unwritten.
+    let read = harness.state.read_config().await.unwrap();
+    assert_eq!(read, harness.state.config_text());
+    harness.command(Command::SetMode(Mode::Shadow)).await;
+    let moved = tokio::fs::read_to_string(&harness.path).await.unwrap();
+    let error = harness
+        .state
+        .save_config(&submitted, super::config_hash(&read))
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::config::ConfigError::Changed),
+        "{error}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&harness.path).await.unwrap(),
+        moved
+    );
+    harness.command(Command::SetMode(Mode::Active)).await;
+    harness.save_config(&submitted).await.unwrap();
     wait_snapshot(&harness.state, |snapshot| {
         snapshot.connections.mqtt_connected
             && snapshot.connections.ha_connected
@@ -767,7 +797,6 @@ async fn app_commands_persist_mode_execute_takeover_and_reload_configuration_thr
     let saved = tokio::fs::read_to_string(&harness.path).await.unwrap();
     changed.web.bind.set_port(9000);
     let error = harness
-        .state
         .save_config(&changed.redacted_text().unwrap())
         .await
         .unwrap_err();
@@ -1411,7 +1440,7 @@ async fn saved_bridge_kind_switch_subscribes_to_native_status_and_bus_and_resync
     };
     changed.fake_tv.replies = false;
     let text = toml::to_string_pretty(&changed).unwrap();
-    harness.state.save_config(&text).await.unwrap();
+    harness.save_config(&text).await.unwrap();
     let snapshot = wait_snapshot(&harness.state, |s| {
         s.bridge_online && s.bridge_bus.as_deref() == Some("ok") && s.bridge_max_raw_bytes == 15
     })
@@ -1906,7 +1935,6 @@ async fn direct_observer_set_mode_and_reload_restart_idle_sampling() {
     });
     config.verify.receiver_idle_poll_s = 5;
     harness
-        .state
         .save_config(&toml::to_string(&config).unwrap())
         .await
         .unwrap();
@@ -1939,7 +1967,6 @@ async fn direct_observer_set_mode_and_reload_restart_idle_sampling() {
     config.mode = Mode::Active;
     config.trace.keep_days = 29; // unrelated reload must still restart observation.
     harness
-        .state
         .save_config(&toml::to_string(&config).unwrap())
         .await
         .unwrap();

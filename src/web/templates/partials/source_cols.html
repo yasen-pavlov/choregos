@@ -1,0 +1,9 @@
+<div class="src-cols">
+  {% for col in page.sources %}
+  <div class="{{ col.class() }}">
+    <span class="k">{% if col.used %}<span class="dot info" aria-hidden="true"></span>{% endif %}{{ col.title }}{% if col.used %} · used{% endif %}{% if col.disagrees %} · disagrees{% endif %}</span>
+    <span class="value">{{ col.value }}</span>
+    {% for line in col.lines %}<span class="{% if loop.first %}mono {% endif %}dim small">{{ line }}</span>{% endfor %}
+  </div>
+  {% endfor %}
+</div>

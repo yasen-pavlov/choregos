@@ -1,0 +1,19 @@
+{%- if f.kind == "int" -%}
+<input id="{{ f.id }}" class="num" type="number" name="{{ f.name }}" value="{{ f.value }}" inputmode="numeric"{% if let Some(min) = f.min %} min="{{ min }}"{% endif %}{% if let Some(max) = f.max %} max="{{ max }}"{% endif %}{% if f.error.is_some() %} aria-invalid="true"{% endif %} aria-describedby="{{ f.id }}-e {{ f.id }}-h"{% if oob %} hx-swap-oob="true"{% endif %}>
+{%- else if f.kind == "text" -%}
+{#- A one-row textarea, not an input: an input's value drops line breaks, which would rewrite
+    an untouched multiline string. The newline after the tag is eaten by the HTML parser, so a
+    value that starts with one keeps it. -#}
+<textarea id="{{ f.id }}" class="one" name="{{ f.name }}" rows="1" spellcheck="false" autocomplete="off"{% if f.error.is_some() %} aria-invalid="true"{% endif %} aria-describedby="{{ f.id }}-e {{ f.id }}-h"{% if oob %} hx-swap-oob="true"{% endif %}>
+{{ f.value }}</textarea>
+{%- else if f.kind == "bool" -%}
+<input id="{{ f.id }}" type="checkbox" name="{{ f.name }}" value="true"{% if f.checked %} checked{% endif %}{% if f.error.is_some() %} aria-invalid="true"{% endif %} aria-describedby="{{ f.id }}-e {{ f.id }}-h"{% if oob %} hx-swap-oob="true"{% endif %}>
+{%- else if f.kind == "choice" -%}
+<select id="{{ f.id }}" name="{{ f.name }}"{% if f.error.is_some() %} aria-invalid="true"{% endif %} aria-describedby="{{ f.id }}-e {{ f.id }}-h"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {%- for (option, on) in f.options %}<option value="{{ option }}"{% if on %} selected{% endif %}>{{ option }}</option>{% endfor -%}
+</select>
+{%- else -%}
+<fieldset class="chips" id="{{ f.id }}" aria-describedby="{{ f.id }}-e {{ f.id }}-h"{% if oob %} hx-swap-oob="true"{% endif %}><legend class="sr-only">{{ f.label }}</legend><input type="hidden" name="{{ f.name }}" value="">
+  {%- for (option, on) in f.options %}<label><input type="checkbox" id="{{ f.id }}-{{ loop.index0 }}" name="{{ f.name }}" value="{{ option }}"{% if on %} checked{% endif %}{% if f.error.is_some() %} aria-invalid="true"{% endif %}><span>{{ option }}</span></label>{% endfor -%}
+</fieldset>
+{%- endif -%}

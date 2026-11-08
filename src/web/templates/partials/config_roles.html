@@ -1,0 +1,52 @@
+<div class="pb roles-h">
+  <span class="grow note">One <code>[[device]]</code> per player Choregos switches between. Any filled match key must match the bus entry.</span>
+  <button type="button" class="btn sm" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"add_role"}'>+ Add role</button>
+</div>
+{%- for role in s.roles %}
+<details class="role" id="r{{ role.index }}"{% if role.open %} open{% endif %}>
+  <summary>{% include "partials/config_role_head.html" %}</summary>
+  <input type="hidden" name="device.{{ role.index }}.origin" value="{{ role.origin }}">
+  {% include "partials/config_role_problems.html" %}
+  <div class="rgrp">
+    <div class="rl"><h3>Identity</h3><p class="note">role id, display name, receiver input, CEC kind</p></div>
+    <div class="rf">{% for f in role.identity %}{% include "partials/config_field.html" %}{% endfor %}</div>
+  </div>
+  <div class="rgrp">
+    <div class="rl"><h3>Match</h3><p class="note">any filled key must match the bus entry</p></div>
+    <div class="rf">
+      {%- for f in role.matching %}{% include "partials/config_field.html" %}{% endfor %}
+      {% include "partials/config_bus.html" %}
+    </div>
+  </div>
+  <div class="rgrp">
+    <div class="rl"><h3>Counts as on and off</h3><p class="note">CEC events from this device</p></div>
+    <div class="rf wide">{% let f = role.on %}{% include "partials/config_field.html" %}{% let f = role.off %}{% include "partials/config_field.html" %}</div>
+  </div>
+  <div class="rgrp">
+    <div class="rl"><h3>Takeover</h3><p class="note">when another player takes over</p></div>
+    <div class="rf wide">{% let f = role.takeover %}{% include "partials/config_field.html" %}{% include "partials/config_takeover_note.html" %}</div>
+  </div>
+  <div class="rgrp">
+    <div class="rl"><h3>Presence</h3><p class="note">events: it says when it turns off. poll: it just disappears, so Choregos polls it and treats silence as off.</p></div>
+    <div class="rf">{% let f = role.presence %}{% include "partials/config_field.html" %}{% let f = role.verify_standby %}{% include "partials/config_field.html" %}{% let f = role.media_player %}{% include "partials/config_field.html" %}</div>
+  </div>
+  <div class="rgrp">
+    <div class="rl"><h3>Probe</h3><p class="note"><code>probe = {&nbsp;kind = "ps5", …&nbsp;}</code></p>
+      {%- if role.probe.is_empty() %}
+      <button type="button" class="link" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"add_probe:{{ role.index }}"}'>Add probe</button>
+      {%- else %}
+      <button type="button" class="link" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"remove_probe:{{ role.index }}"}'>Remove probe</button>
+      {%- endif %}
+    </div>
+    <div class="rf">
+      {%- if role.probe.is_empty() %}<p class="note">No probe: CEC alone decides this player's power.</p>{% endif %}
+      {%- for f in role.probe %}{% include "partials/config_field.html" %}{% endfor %}
+      {%- if !role.probe.is_empty() %}{% include "partials/config_wake_note.html" %}{% endif %}
+    </div>
+  </div>
+  {% include "partials/config_words.html" %}
+  <div class="role-foot">
+    <button type="button" class="btn sm danger" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"remove_role:{{ role.index }}"}' hx-confirm="Remove {% if role.id.is_empty() %}this new role{% else %}the role {{ role.id }}{% endif %}? It leaves the file when you save.">Remove role…</button>
+  </div>
+</details>
+{%- endfor %}

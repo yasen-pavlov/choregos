@@ -1,0 +1,35 @@
+{# Polled every 5 s: identity, power and last-seen change often. #}
+<div id="registry" class="stack-16" hx-get="/p/devices" hx-trigger="every 5s" hx-select="#registry" hx-swap="outerHTML">
+<section class="panel flush" aria-label="Devices">
+  <div class="scroll-x">
+    <table class="tbl reg">
+      <thead><tr><th scope="col">Name</th><th scope="col">Kind</th><th scope="col">LA · PA</th><th scope="col">Vendor · OSD</th><th scope="col">Identity</th><th scope="col">Power</th><th scope="col">Sources</th><th scope="col">Last decision</th><th scope="col" class="r">Last seen</th></tr></thead>
+      <tbody id="reg-roles">
+        <tr class="day"><td colspan="9">Roles · {{ registry.roles.len() }}</td></tr>
+        {%- for row in registry.roles %}{% include "partials/registry_row.html" %}{% else %}
+        <tr><td colspan="9" class="empty">No roles configured. <a href="/config">Add a role in Config</a></td></tr>
+        {%- endfor %}
+      </tbody>
+      <tbody id="reg-outputs">
+        <tr class="day"><td colspan="9">Outputs · {{ registry.outputs.len() }}</td></tr>
+        {%- for row in registry.outputs %}{% include "partials/registry_row.html" %}{% endfor %}
+      </tbody>
+      <tbody id="reg-bridge">
+        <tr class="day"><td colspan="9">Bridge</td></tr>
+        {%- let row = registry.bridge %}{% include "partials/registry_row.html" %}
+      </tbody>
+      <tbody id="reg-unbound">
+        <tr class="day"><td colspan="9">Unbound bus entries · {{ registry.unbound.len() }}</td></tr>
+        {%- for row in registry.unbound %}{% include "partials/registry_row.html" %}{% else %}
+        <tr><td colspan="9" class="empty">Every device on the bus belongs to a role.</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% if !registry.notes.is_empty() %}
+<div class="reg-notes">
+  {% for note in registry.notes %}<div class="panel reg-note"><span class="chip {{ note.tone }}">{{ note.label }}</span><p class="small">{{ note.text }}</p></div>{% endfor %}
+</div>
+{% endif %}
+</div>

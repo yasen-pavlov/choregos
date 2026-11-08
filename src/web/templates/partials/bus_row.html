@@ -1,6 +1,6 @@
 {% match row %}
 {% when BusRow::Frame(frame) %}
-<tr class="frame {{ view::direction(frame.direction) }}">
+<tr class="frame {{ view::direction(frame.direction) }}" data-t="{{ view::iso(frame.timestamp) }}" data-from="{{ frame.from }}" data-to="{{ frame.to }}" data-bytes="{{ frame.data }}"{% if let Some(ack) = frame.ack %} data-ack="{{ ack }}"{% endif %}>
   <td class="mono dim" title="{{ view::iso(frame.timestamp) }}">{{ view::clock(frame.timestamp) }}</td>
   <td class="dir"{% if frame.direction == crate::state::FrameDirection::Local %} title="The bridge answered on its own (local reply)"{% endif %}>{{ view::direction(frame.direction) }}</td>
   <td><span class="mono la">{{ frame.from }}</span> {{ frame.from_name }}</td>
@@ -10,11 +10,11 @@
   <td class="mono">{{ view::hex_bytes(frame.params) }}</td>
 </tr>
 {% when BusRow::Decision(decision) %}
-<tr class="decision{% if decision.would %} would{% endif %}">
+<tr class="decision{% if decision.would %} would{% endif %}" data-t="{{ view::iso(decision.timestamp) }}" data-id="{{ decision.id }}" data-verdict="{% if decision.would %}would{% else %}{{ view::verdict_tone(decision.verdict) }}{% endif %}">
   <td class="mono dim" title="{{ view::iso(decision.timestamp) }}">{{ view::clock(decision.timestamp) }}</td>
   <td class="dir">⇒</td>
   <td colspan="5">
-    <a class="mono dim" href="/decisions#d-{{ decision.id }}">#{{ decision.id }}</a>
+    <a class="mono dim" href="/recorder/{{ decision.id }}">#{{ decision.id }}</a>
     <strong>{{ view::opt(decision.role) }}</strong> {{ view::transition(decision.from, decision.to) }}
     <span class="reason">{{ decision.reason }}</span>
     {% if decision.verdict != crate::action::Verdict::None %}<span class="pill verdict-{{ decision.verdict }}">{{ decision.verdict }}</span>{% endif %}

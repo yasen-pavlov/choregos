@@ -1,0 +1,18 @@
+<div class="fld" id="{{ f.id }}-row">
+  <div class="fl">
+    {%- if f.kind == "multi" %}<span class="lbl" aria-hidden="true">{{ f.label }}</span>{% else %}<label for="{{ f.id }}">{{ f.label }}</label>{% endif %}
+    <code>{{ f.key }}</code>
+  </div>
+  <div class="fi">
+    <div class="row">
+      {%- if f.kind == "bool" %}<input type="hidden" name="{{ f.name }}" value="false">{% endif %}
+      {% include "partials/config_control.html" %}
+      {%- if !f.unit.is_empty() %}<span class="unit dim">{{ f.unit }}</span>{% endif %}
+      {% include "partials/config_was.html" %}
+    </div>
+    {% include "partials/config_err.html" %}
+    {%- if !f.help.is_empty() || !f.limits.is_empty() %}
+    <p class="help" id="{{ f.id }}-h">{{ f.help }}{% if !f.limits.is_empty() %} {{ f.limits }}{% endif %}</p>
+    {%- endif %}
+  </div>
+</div>

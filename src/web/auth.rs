@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
 use tower_sessions::{Session, cookie::Key};
 
-use super::{WebError, WebState, render, view::Layout};
+use super::{
+    WebError, WebState, render,
+    view::{self, Layout},
+};
 use crate::{config::Secret, state::AuthConfig};
 
 pub(crate) const USER_KEY: &str = "user";

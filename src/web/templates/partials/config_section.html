@@ -1,0 +1,53 @@
+{% let oob = false -%}
+<form id="section" class="panel flush cfg-sec" novalidate hx-post="/config/validate" hx-trigger="change delay:500ms, submit" hx-swap="none">
+  <input type="hidden" name="section" value="{{ s.key }}">
+  <input type="hidden" name="_orig" value="{{ s.orig }}">
+  {% include "partials/config_invalid.html" %}
+  <div class="ph"><h2 class="mono">{{ s.title }}</h2><span class="grow"></span><span class="note">{{ s.note }}</span></div>
+  {% include "partials/config_problems.html" %}
+  {%- if s.key == "mode" %}
+  <div class="pb cfg-mode">
+    <p><code>mode = "{{ s.mode }}"</code></p>
+    <p class="note">Change it with the shadow | active switch in the top bar; the switch writes it back to this file and keeps its comments.</p>
+  </div>
+  {%- else if s.key == "device" %}
+  {% include "partials/config_roles.html" %}
+  {%- else %}
+  {%- if !s.fields.is_empty() %}
+  <div class="flds">
+    {%- for f in s.fields %}
+    {% include "partials/config_field.html" %}
+    {%- endfor %}
+  </div>
+  {%- endif %}
+  {%- if s.key == "presets" %}
+  {% include "partials/config_slots.html" %}
+  {%- endif %}
+  {%- endif %}
+  {%- if !s.groups.is_empty() %}
+  <div class="pb ro-wrap">
+    {%- if s.gate.restart_note() %}
+    <p class="ro-note"><span class="chip dim">read-only</span> These settings are read at start-up. Change them in the mounted <code>choregos.toml</code> while the container is stopped, then start it. Restart-gated settings — <code>[mqtt]</code>, <code>[home_assistant]</code>, <code>[web]</code>, <code>tv.wake</code> and <code>tv.off</code> — cannot be changed here, not even in Raw TOML.</p>
+    {%- endif %}
+    {%- for g in s.groups %}
+    <section class="ro">
+      <h3 class="k">{{ g.title }}</h3>
+      <dl class="ro-rows">
+        {%- for (key, value) in g.rows %}
+        <dt class="mono">{{ key }}</dt><dd class="mono">{{ value }}</dd>
+        {%- endfor %}
+        {%- for secret in g.secrets %}
+        <dt class="mono">{{ secret.label }}</dt><dd class="mono">env {{ secret.env }} <span class="chip {{ secret.tone() }}">{{ secret.word() }}</span></dd>
+        {%- endfor %}
+      </dl>
+    </section>
+    {%- endfor %}
+    {%- if s.gate.restart_note() %}
+    <p class="note">Secrets are never shown or editable here: only the variable name and whether it is set.</p>
+    {%- endif %}
+  </div>
+  {%- endif %}
+  {%- if s.gate.editable() %}
+  {% include "partials/config_foot.html" %}
+  {%- endif %}
+</form>

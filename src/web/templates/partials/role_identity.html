@@ -1,0 +1,9 @@
+<div class="pb stack">
+  <dl class="dl idrows">
+    {% for row in page.keys %}
+    <dt>{{ row.key }}</dt><dd><span class="mono">{{ row.value }}</span>{% if let Some(check) = row.check %} {% if check.tone().is_empty() %}<span class="small dim">{{ check.word() }}</span>{% else %}<span class="chip {{ check.tone() }}">{{ check.word() }}</span>{% endif %}{% endif %}</dd>
+    {% endfor %}
+    <dt>Confirmed</dt><dd class="mono small">{{ page.confirmed }}</dd>
+  </dl>
+  {% if let Some(rule) = page.rule %}<div><span class="k">Match rule</span><pre class="rule">{{ rule }}</pre></div>{% endif %}
+</div>

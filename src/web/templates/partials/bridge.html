@@ -1,0 +1,23 @@
+<aside class="drawer" aria-label="Bridge">
+  <div class="ph"><h2 class="grow">Bridge</h2><button type="button" class="btn sm ghost" hx-get="/p/bridge?close=true" hx-target="#drawer" hx-swap="innerHTML" aria-label="Close the bridge drawer">✕</button></div>
+  <div class="pb">
+    {# Only this block re-polls while the drawer is open, so the raw-send form keeps its input. #}
+    <div id="bridge-info" class="pb-flow" hx-get="/p/bridge" hx-trigger="every 3s" hx-select="#bridge-info" hx-swap="outerHTML">
+      {% let info_id = "bridge" %}{% include "partials/bridge_info.html" %}
+    </div>
+    <hr>
+    <div class="k">Raw send</div>
+    <form id="raw-send" hx-post="/actions/send-raw" hx-swap="none" hx-confirm="Send this raw CEC frame?">
+      <div class="fields">
+        <label for="raw-to">To LA</label>
+        <input id="raw-to" name="to" inputmode="numeric" list="raw-to-options" placeholder="4" required>
+        <label for="raw-data">Data (hex)</label>
+        <input id="raw-data" name="data" class="mono" placeholder="8F" required>
+      </div>
+      <datalist id="raw-to-options">{% for entry in snapshot.bus %}<option value="{{ entry.logical_address }}">{% if let Some(role) = entry.matched_role %}{{ role }}{% else %}{{ view::opt(entry.osd) }}{% endif %}</option>{% endfor %}</datalist>
+      <p class="help">Opcode and operands in hex, 1–{{ snapshot.bridge_max_raw_bytes }} bytes. The frame comes from LA {{ snapshot.bridge_logical_address }}, the bridge's own address.</p>
+      <div class="row"><button type="submit" class="btn{% if shadow %} would{% endif %}">{% if shadow %}Would send…{% else %}Send…{% endif %}</button></div>
+      {% if shadow %}<p class="help">In shadow this records a <span class="chip would">would</span> row; the executor does not put the frame on the bus.</p>{% endif %}
+    </form>
+  </div>
+</aside>
