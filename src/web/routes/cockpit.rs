@@ -191,14 +191,6 @@ impl Cockpit {
     }
 }
 
-fn role_name(snapshot: &Snapshot, role: &str) -> String {
-    snapshot
-        .roles
-        .iter()
-        .find(|view| view.role == role)
-        .map_or_else(|| role.to_owned(), |view| view.name.clone())
-}
-
 /// Wake rows (the role came on) and room-off rows (timer or all off).
 fn sets_intent(decision: &DecisionView, power: RoomPower) -> bool {
     match power {
@@ -220,7 +212,7 @@ fn room(snapshot: &Snapshot, now: DateTime<Utc>) -> Room {
         .find(|decision| !view::is_migrated(decision) && sets_intent(decision, intent.power))
         .map(|decision| (decision.id, decision.timestamp));
     let active = snapshot.active_role.as_ref().map(|role| ActiveSource {
-        name: role_name(snapshot, role),
+        name: view::role_name(snapshot, role),
         role: role.clone(),
         logical_address: snapshot
             .roles
@@ -779,7 +771,7 @@ fn recent(snapshot: &Snapshot) -> Vec<RecentRow> {
             role_name: decision
                 .role
                 .as_deref()
-                .map(|role| role_name(snapshot, role)),
+                .map(|role| view::role_name(snapshot, role)),
             actions: ActionSummary::from_actions(&decision.actions).text(),
             latency: if decision.verdict == Verdict::Pending {
                 None

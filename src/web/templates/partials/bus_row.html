@@ -14,7 +14,7 @@
   <td class="mono dim" title="{{ view::iso(decision.timestamp) }}">{{ view::clock(decision.timestamp) }}</td>
   <td class="dir">⇒</td>
   <td colspan="5">
-    <a class="mono dim" href="/decisions#d-{{ decision.id }}">#{{ decision.id }}</a>
+    <a class="mono dim" href="/recorder/{{ decision.id }}">#{{ decision.id }}</a>
     <strong>{{ view::opt(decision.role) }}</strong> {{ view::transition(decision.from, decision.to) }}
     <span class="reason">{{ decision.reason }}</span>
     {% if decision.verdict != crate::action::Verdict::None %}<span class="pill verdict-{{ decision.verdict }}">{{ decision.verdict }}</span>{% endif %}

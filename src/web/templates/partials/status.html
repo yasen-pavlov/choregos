@@ -1,10 +1,10 @@
 <div id="status" class="status"{% if status.oob %} hx-swap-oob="true"{% endif %}>
-  <div class="modesw" role="group" aria-label="Mode">
+  <fieldset class="modesw"><legend class="sr-only">Mode</legend>
     <button type="button" id="mode-shadow" hx-post="/actions/mode" hx-vals='{"mode":"shadow"}' hx-swap="none"
       hx-confirm="Stop controlling the room? Choregos will only observe; every decision is recorded as would."{% if status.is_shadow() %} disabled aria-pressed="true"{% else %} aria-pressed="false"{% endif %}>shadow</button>
     <button type="button" id="mode-active" hx-post="/actions/mode" hx-vals='{"mode":"active"}' hx-swap="none"
       hx-confirm="Switch to active? Choregos will start sending what it decides: waking the TV, switching the receiver, putting consoles in standby."{% if !status.is_shadow() %} disabled aria-pressed="true"{% else %} aria-pressed="false"{% endif %}>active</button>
-  </div>
+  </fieldset>
   <span id="consistency" class="chip lg {{ status.consistency.tone() }}" title="{{ status.consistency.title() }}">{{ status.consistency.label() }}</span>
   <div class="conns" aria-label="Connections">
     <button type="button" class="conn {% if status.health.bridge_online %}up{% else %}down{% endif %}" hx-get="/p/bridge" hx-target="#drawer" hx-swap="innerHTML" title="CEC bridge {% if status.health.bridge_online %}online{% if let Some(signal) = status.bridge_signal %} · {{ signal }}{% endif %}{% else %}offline{% endif %}"><span class="dot{% if !status.health.bridge_online %} bad{% endif %}"></span><span class="label">bridge</span></button>

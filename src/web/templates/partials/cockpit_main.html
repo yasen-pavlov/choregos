@@ -6,7 +6,7 @@
       <div class="cell">
         <span class="k">Room intent{% if cockpit.shadow %} (would){% endif %}</span>
         <span class="big">{{ cockpit.room.power }}</span>
-        {% if let Some((id, at)) = cockpit.room.since %}<span class="dim small" title="{{ view::iso(at) }}">since {{ view::when_ms(at) }} · <a href="/decisions#d-{{ id }}">#{{ id }}</a></span>{% endif %}
+        {% if let Some((id, at)) = cockpit.room.since %}<span class="dim small" title="{{ view::iso(at) }}">since {{ view::when_ms(at) }} · <a href="/recorder/{{ id }}">#{{ id }}</a></span>{% endif %}
       </div>
       <div class="cell">
         <span class="k">Active source</span>
@@ -44,7 +44,7 @@
       <span class="grow">{% for item in v.items %}{% if !loop.first %} · {% endif %}<span class="mono">{{ item.name }}</span> <b>{{ item.expect }}</b>{% if let Some((tone, label)) = item.chip %} <span class="chip {{ tone }}">{{ label }}</span>{% if !item.detail.is_empty() %} <span class="mono dim">{{ item.detail }}</span>{% endif %}{% else %} — {{ item.detail }}{% endif %}{% endfor %}</span>
       <span class="mono num dim">{{ v.progress() }}</span>
       {% if v.max_ms > 0 %}<progress max="{{ v.max_ms }}" value="{{ v.value() }}" aria-label="time towards the last deadline"></progress>{% endif %}
-      <a class="small" href="/decisions#d-{{ v.id }}">#{{ v.id }} →</a>
+      <a class="small" href="/recorder/{{ v.id }}">#{{ v.id }} →</a>
     </div>
     {% endfor %}
   </section>
@@ -77,7 +77,7 @@
         <span class="k">Last decision</span>
         {% endif %}
         {% if let Some(last) = card.last %}
-        <span><a class="mono" href="/decisions#d-{{ last.id }}">#{{ last.id }}</a> <span class="dim" title="{{ view::iso(last.timestamp) }}">{{ view::when(last.timestamp) }}</span> <span class="mono" title="{{ view::reason_title(last.reason) }}">{{ last.reason }}</span> {% if last.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(last.verdict) }}">{{ last.verdict }}</span>{% endif %}</span>
+        <span><a class="mono" href="/recorder/{{ last.id }}">#{{ last.id }}</a> <span class="dim" title="{{ view::iso(last.timestamp) }}">{{ view::when(last.timestamp) }}</span> <span class="mono" title="{{ view::reason_title(last.reason) }}">{{ last.reason }}</span> {% if last.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(last.verdict) }}">{{ last.verdict }}</span>{% endif %}</span>
         {% if let Some(line) = card.line %}<span class="dim small">{{ line }}</span>{% endif %}
         {% else %}
         <span class="dim small">No decision yet.</span>
@@ -109,7 +109,7 @@
   </section>
 
   <section class="panel flush" aria-label="Last decisions">
-    <div class="ph"><h2 class="grow">Last 5 decisions</h2><a class="small" href="/decisions">Open Recorder →</a></div>
+    <div class="ph"><h2 class="grow">Last 5 decisions</h2><a class="small" href="/recorder">Open Recorder →</a></div>
     <div class="scroll-x">
       <table class="tbl">
         <thead><tr><th scope="col">#</th><th scope="col">Time</th><th scope="col">Role</th><th scope="col">Change</th><th scope="col">Reason</th><th scope="col">Actions</th><th scope="col">Verdict</th><th scope="col" class="r">Latency</th></tr></thead>
@@ -119,7 +119,7 @@
           <tr class="sep"><td colspan="8">#{{ row.decision.id }} · {{ view::when_ms(row.decision.timestamp) }} · service started — rows below were made by the previous run</td></tr>
           {% else %}
           <tr id="recent-{{ row.decision.id }}"{% if row.decision.would %} class="would"{% endif %}>
-            <td class="mono"><a href="/decisions#d-{{ row.decision.id }}">{{ row.decision.id }}</a>{% if let Some(parent) = row.decision.parent %} <span class="dim">↳ {{ parent }}</span>{% endif %}</td>
+            <td class="mono"><a href="/recorder/{{ row.decision.id }}">{{ row.decision.id }}</a>{% if let Some(parent) = row.decision.parent %} <a class="dim" href="/recorder/{{ parent }}">↳ {{ parent }}</a>{% endif %}</td>
             <td class="mono num" title="{{ view::iso(row.decision.timestamp) }}">{{ view::when_ms(row.decision.timestamp) }}</td>
             <td>{% if let Some(name) = row.role_name %}{{ name }}{% else %}<span class="dim">room</span>{% endif %}</td>
             <td class="mono">{% if row.decision.from.is_none() && row.decision.to.is_none() %}<span class="dim">—</span>{% else %}{{ view::transition(row.decision.from, row.decision.to) }}{% endif %}</td>

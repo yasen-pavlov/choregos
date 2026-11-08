@@ -3,6 +3,9 @@
 //! Colour and tone helpers return class names only; templates never branch on raw strings
 //! to pick a colour.
 
+pub(crate) mod recorder;
+pub(crate) mod window;
+
 use chrono::{DateTime, Utc};
 
 use super::auth::{Ctx, SessionUser};
@@ -509,6 +512,15 @@ pub(crate) fn wake_latency(decision: &DecisionView) -> Option<u64> {
         })
 }
 
+/// A role's display name; the id itself for a role no longer configured.
+pub(crate) fn role_name(snapshot: &Snapshot, role: &str) -> String {
+    snapshot
+        .roles
+        .iter()
+        .find(|view| view.role == role)
+        .map_or_else(|| role.to_owned(), |view| view.name.clone())
+}
+
 /// The newest ring row about `role`.
 pub(crate) fn last_decision_for<'a>(
     snapshot: &'a Snapshot,
@@ -707,6 +719,17 @@ impl Segment {
 
 pub(crate) fn clock(timestamp: &DateTime<Utc>) -> String {
     timestamp.format("%H:%M:%S%.3f").to_string()
+}
+
+/// [`clock`] split for the bus window, whose phone layout drops the hours and minutes:
+/// `17:08:` …
+pub(crate) fn clock_hm(timestamp: &DateTime<Utc>) -> String {
+    timestamp.format("%H:%M:").to_string()
+}
+
+/// … and `40.865`.
+pub(crate) fn clock_s(timestamp: &DateTime<Utc>) -> String {
+    timestamp.format("%S%.3f").to_string()
 }
 
 pub(crate) fn hms(timestamp: &DateTime<Utc>) -> String {
@@ -926,36 +949,6 @@ pub(crate) fn ha_attribute(entity: &HaEntityView, key: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn outcome_kind(outcome: &Outcome) -> &'static str {
-    match outcome {
-        Outcome::Pending => "pending",
-        Outcome::Met { .. } => "met",
-        Outcome::Missed { .. } => "missed",
-        Outcome::Unknown { .. } => "unknown",
-        Outcome::CecOnly { .. } => "cec only",
-    }
-}
-
-pub(crate) fn outcome_observed(outcome: &Outcome) -> String {
-    match outcome {
-        Outcome::Pending => "…".into(),
-        Outcome::Met { observed, .. }
-        | Outcome::Missed { observed }
-        | Outcome::CecOnly { observed } => observed.clone(),
-        Outcome::Unknown { observed } => observed.clone().unwrap_or_else(|| "nothing seen".into()),
-    }
-}
-
-/// Source and latency for a met expectation; `None` otherwise.
-pub(crate) fn outcome_detail(outcome: &Outcome) -> Option<String> {
-    match outcome {
-        Outcome::Met {
-            via, latency_ms, ..
-        } => Some(format!("via {via} in {:.1} s", *latency_ms as f64 / 1000.0)),
-        _ => None,
-    }
-}
-
 /// The drift detail of a `drift` / `drift_resolved` row; `None` for any other reason, so a
 /// stray detail never replaces an ordinary row's reason.
 pub(crate) fn drift_row(decision: &DecisionView) -> Option<&DriftDetail> {
@@ -963,15 +956,6 @@ pub(crate) fn drift_row(decision: &DecisionView) -> Option<&DriftDetail> {
         .drift
         .as_ref()
         .filter(|_| matches!(decision.reason.as_str(), "drift" | "drift_resolved"))
-}
-
-/// Pill tone for a drift row's reason: `resolved` for `drift_resolved`, else `open`.
-pub(crate) fn drift_tone(reason: &str) -> &'static str {
-    if reason == "drift_resolved" {
-        "resolved"
-    } else {
-        "open"
-    }
 }
 
 /// How long a resolved drift lasted (row time minus onset); `None` for an onset row.
@@ -1107,7 +1091,7 @@ mod tests {
     }
 
     /// The snapshot of a freshly started service: warming, shadow, nothing known.
-    fn snapshot() -> Snapshot {
+    pub(super) fn snapshot() -> Snapshot {
         let text = r#"
 mode = "shadow"
 [mqtt]
@@ -1372,7 +1356,7 @@ username = "admin"
         }
     }
 
-    fn row(id: u64, role: Option<&str>, expectations: Vec<Expectation>) -> DecisionView {
+    pub(super) fn row(id: u64, role: Option<&str>, expectations: Vec<Expectation>) -> DecisionView {
         DecisionView {
             id,
             trigger: Trigger::Service {

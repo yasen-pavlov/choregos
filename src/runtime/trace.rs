@@ -289,6 +289,156 @@ fn parse_mqtt(topic: &str, payload: Value) -> Option<TraceEntry> {
     })
 }
 
+/// The day file the writer appends `date`'s records to.
+pub fn day_file(directory: &Path, date: NaiveDate) -> PathBuf {
+    directory.join(format!("cec-bus.{date}.jsonl"))
+}
+
+/// The bounds of one window read: the entries it returns, the longest line it buffers, and
+/// the bytes and lines it scans in total (pre-window, torn and unknown lines included).
+#[derive(Clone, Copy, Debug)]
+pub struct ReadBudget {
+    pub entries: usize,
+    pub line_bytes: usize,
+    pub scan_bytes: u64,
+    pub scan_lines: u64,
+}
+
+impl ReadBudget {
+    /// The bus window's budget: 5000 entries, 1 MiB lines, 64 MiB or 2 M lines scanned.
+    pub const WINDOW: Self = Self {
+        entries: 5000,
+        line_bytes: 1 << 20,
+        scan_bytes: 64 << 20,
+        scan_lines: 2_000_000,
+    };
+}
+
+/// What a window read returned, and whether it stopped at its budget with input left
+/// (more in-window entries than `entries`, or the scan budget spent before the window end).
+#[derive(Debug, Default)]
+pub struct WindowRead {
+    pub entries: Vec<(DateTime<Utc>, TraceEntry)>,
+    pub truncated: bool,
+}
+
+/// Reads one line of at most `max` bytes (newline included) into `line`, consuming at most
+/// `allowance` bytes. Returns the bytes consumed and whether the line is whole; a longer
+/// line is consumed to its end (within the allowance) without being kept. `None` at EOF.
+fn bounded_line(
+    reader: &mut impl std::io::BufRead,
+    line: &mut Vec<u8>,
+    max: usize,
+    allowance: u64,
+) -> std::io::Result<Option<(u64, bool)>> {
+    line.clear();
+    let mut consumed = 0u64;
+    let mut whole = true;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((consumed > 0).then_some((consumed, whole)));
+        }
+        let room = usize::try_from(allowance - consumed).unwrap_or(usize::MAX);
+        if room == 0 {
+            return Ok(Some((consumed, false)));
+        }
+        let chunk = &available[..available.len().min(room)];
+        let (chunk, done) = match chunk.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (&chunk[..=end], true),
+            None => (chunk, false),
+        };
+        if whole && line.len() + chunk.len() <= max {
+            line.extend_from_slice(chunk);
+        } else {
+            whole = false;
+            line.clear();
+        }
+        let length = chunk.len();
+        reader.consume(length);
+        consumed += length as u64;
+        if done {
+            return Ok(Some((consumed, whole)));
+        }
+    }
+}
+
+/// Records with `from ≤ ts ≤ to` from the UTC day files the window spans, in file order and
+/// at most `budget.entries` of them. Each file is scanned line by line: lines before `from`
+/// are skipped on their timestamp alone, the scan of a file stops at the first line after
+/// `to`, torn, unknown and overlong lines are ignored (an overlong one is never buffered
+/// whole). A missing day file contributes nothing. Reading stops, flagged `truncated`, at
+/// one entry over the limit or when the scan budget is spent with input left.
+pub fn read_window(
+    directory: &Path,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    budget: ReadBudget,
+) -> std::io::Result<WindowRead> {
+    use std::io::BufRead;
+    #[derive(Deserialize)]
+    struct Stamp {
+        ts: DateTime<Utc>,
+    }
+    let mut read = WindowRead::default();
+    let (mut bytes, mut lines) = (0u64, 0u64);
+    let mut line = Vec::new();
+    let mut date = from.date_naive();
+    'days: while date <= to.date_naive() {
+        let file = match std::fs::File::open(day_file(directory, date)) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(file) = file {
+            let mut reader = std::io::BufReader::new(file);
+            loop {
+                let allowance = budget.scan_bytes.saturating_sub(bytes);
+                if lines >= budget.scan_lines || allowance == 0 {
+                    read.truncated = !reader.fill_buf()?.is_empty();
+                    if read.truncated {
+                        break 'days;
+                    }
+                    break;
+                }
+                let Some((consumed, whole)) =
+                    bounded_line(&mut reader, &mut line, budget.line_bytes, allowance)?
+                else {
+                    break;
+                };
+                bytes += consumed;
+                lines += 1;
+                if !whole {
+                    continue;
+                }
+                let Ok(text) = std::str::from_utf8(&line) else {
+                    continue;
+                };
+                let Ok(Stamp { ts }) = serde_json::from_str(text) else {
+                    continue;
+                };
+                if ts > to {
+                    break;
+                }
+                if ts >= from
+                    && let Some(entry) = parse(text)
+                {
+                    if read.entries.len() == budget.entries {
+                        read.truncated = true;
+                        break 'days;
+                    }
+                    read.entries.push(entry);
+                }
+            }
+        }
+        let Some(next) = date.succ_opt() else {
+            break;
+        };
+        date = next;
+    }
+    Ok(read)
+}
+
 #[derive(Clone)]
 struct Controls {
     keep_days: u32,
@@ -887,5 +1037,240 @@ mod native_tests {
             .unwrap()
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse().unwrap()
+    }
+
+    fn command(la: u8) -> TraceEntry {
+        TraceEntry::Command(Command::Identify(la))
+    }
+
+    /// Writes `records` (timestamp, LA tag) as the day file of `date`, with a header and a
+    /// torn line in the middle like a crashed writer leaves.
+    fn day(directory: &Path, date: &str, records: &[(&str, u8)]) {
+        let mut text = line(
+            at(&format!("{date}T00:00:00Z")),
+            &TraceEntry::Identities(vec![]),
+        );
+        for (index, (ts, la)) in records.iter().enumerate() {
+            if index == 1 {
+                text.push_str("{\"ts\":\"torn\n");
+            }
+            text.push_str(&line(at(ts), &command(*la)));
+        }
+        std::fs::write(
+            day_file(directory, date.parse::<NaiveDate>().unwrap()),
+            text,
+        )
+        .unwrap();
+    }
+
+    fn tags(entries: &[(DateTime<Utc>, TraceEntry)]) -> Vec<u8> {
+        entries
+            .iter()
+            .map(|(_, entry)| match entry {
+                TraceEntry::Command(Command::Identify(la)) => *la,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn window_spans_midnight_across_two_day_files_inclusively() {
+        let directory = tempfile::tempdir().unwrap();
+        day(
+            directory.path(),
+            "2026-11-06",
+            &[
+                ("2026-11-06T23:59:00Z", 1),
+                ("2026-11-06T23:59:50Z", 2),
+                ("2026-11-06T23:59:59.999Z", 3),
+            ],
+        );
+        day(
+            directory.path(),
+            "2026-11-07",
+            &[
+                ("2026-11-07T00:00:05Z", 4),
+                ("2026-11-07T00:00:10Z", 5),
+                ("2026-11-07T00:00:11Z", 6),
+            ],
+        );
+        let entries = read_all(
+            directory.path(),
+            at("2026-11-06T23:59:50Z"),
+            at("2026-11-07T00:00:10Z"),
+            100,
+        );
+        // The second file's identity header (00:00:00) is inside the window too.
+        assert!(matches!(entries[2].1, TraceEntry::Identities(_)));
+        let records: Vec<_> = entries
+            .into_iter()
+            .filter(|(_, entry)| !matches!(entry, TraceEntry::Identities(_)))
+            .collect();
+        assert_eq!(tags(&records), [2, 3, 4, 5]);
+        assert_eq!(records[0].0, at("2026-11-06T23:59:50Z"));
+    }
+
+    #[test]
+    fn missing_day_files_read_as_an_empty_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let window = |from, to| read_all(directory.path(), at(from), at(to), 100);
+        assert!(window("2026-11-06T12:00:00Z", "2026-11-06T12:10:00Z").is_empty());
+        // One of two days present: the window reads what exists.
+        day(
+            directory.path(),
+            "2026-11-07",
+            &[("2026-11-07T00:00:01Z", 7)],
+        );
+        let entries = window("2026-11-06T23:59:00Z", "2026-11-07T00:01:00Z");
+        assert_eq!(entries.len(), 2, "header + one record");
+        let absent = directory.path().join("absent");
+        let from = at("2026-11-07T00:00:00Z");
+        assert!(read_all(&absent, from, from, 10).is_empty());
+    }
+
+    #[test]
+    fn limit_caps_the_entries_returned() {
+        let directory = tempfile::tempdir().unwrap();
+        day(
+            directory.path(),
+            "2026-11-06",
+            &[
+                ("2026-11-06T10:00:01Z", 1),
+                ("2026-11-06T10:00:02Z", 2),
+                ("2026-11-06T10:00:03Z", 3),
+            ],
+        );
+        day(
+            directory.path(),
+            "2026-11-07",
+            &[("2026-11-07T10:00:00Z", 4)],
+        );
+        let from = at("2026-11-06T10:00:00Z");
+        let to = at("2026-11-07T11:00:00Z");
+        let read = |limit| read_window(directory.path(), from, to, budget(limit)).unwrap();
+        assert_eq!(tags(&read(2).entries), [1, 2]);
+        assert!(read(2).truncated, "more in-window entries remain");
+        assert!(read(0).entries.is_empty());
+        let all = read(100);
+        assert_eq!(
+            all.entries.len(),
+            5,
+            "four records and the second day's header"
+        );
+        assert!(!all.truncated);
+        // Exactly at the limit with nothing left in the window is complete.
+        assert!(!read(5).truncated);
+    }
+
+    fn budget(entries: usize) -> ReadBudget {
+        ReadBudget {
+            entries,
+            ..ReadBudget::WINDOW
+        }
+    }
+
+    fn read_all(
+        directory: &Path,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: usize,
+    ) -> Vec<(DateTime<Utc>, TraceEntry)> {
+        let read = read_window(directory, from, to, budget(limit)).unwrap();
+        assert!(!read.truncated);
+        read.entries
+    }
+
+    #[test]
+    fn overlong_lines_are_skipped_without_buffering_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut text = line(at("2026-11-07T10:00:01Z"), &command(1));
+        // A torn writer's payload far over the line cap, valid JSON prefix and all.
+        text.push_str("{\"ts\":\"2026-11-07T10:00:02Z\",\"topic\":\"x\",\"payload\":\"");
+        text.push_str(&"A".repeat(4096));
+        text.push_str("\"}\n");
+        text.push_str(&line(at("2026-11-07T10:00:03Z"), &command(3)));
+        std::fs::write(
+            day_file(directory.path(), "2026-11-07".parse().unwrap()),
+            text,
+        )
+        .unwrap();
+        let read = read_window(
+            directory.path(),
+            at("2026-11-07T10:00:00Z"),
+            at("2026-11-07T11:00:00Z"),
+            ReadBudget {
+                line_bytes: 1024,
+                ..budget(100)
+            },
+        )
+        .unwrap();
+        assert_eq!(tags(&read.entries), [1, 3]);
+        assert!(!read.truncated);
+
+        let mut line = Vec::new();
+        let mut reader = std::io::Cursor::new(format!("{}\nok\n", "B".repeat(100)));
+        assert_eq!(
+            bounded_line(&mut reader, &mut line, 10, u64::MAX).unwrap(),
+            Some((101, false))
+        );
+        assert!(line.is_empty(), "the overlong line is not kept");
+        assert_eq!(
+            bounded_line(&mut reader, &mut line, 10, u64::MAX).unwrap(),
+            Some((3, true))
+        );
+        assert_eq!(line, b"ok\n");
+        assert_eq!(
+            bounded_line(&mut reader, &mut line, 10, u64::MAX).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_spent_scan_budget_is_flagged_not_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        // Lots of pre-window lines, which never count against the entry limit.
+        let early: Vec<(String, u8)> = (0..50)
+            .map(|second| (format!("2026-11-07T09:00:{second:02}Z"), 0))
+            .collect();
+        let mut records: Vec<(&str, u8)> =
+            early.iter().map(|(ts, la)| (ts.as_str(), *la)).collect();
+        records.push(("2026-11-07T10:00:01Z", 9));
+        day(directory.path(), "2026-11-07", &records);
+        let (from, to) = (at("2026-11-07T10:00:00Z"), at("2026-11-07T11:00:00Z"));
+        let read = |budget| read_window(directory.path(), from, to, budget).unwrap();
+
+        let complete = read(budget(100));
+        assert_eq!(
+            (tags(&complete.entries), complete.truncated),
+            (vec![9], false)
+        );
+        let by_lines = read(ReadBudget {
+            scan_lines: 10,
+            ..budget(100)
+        });
+        assert!(by_lines.entries.is_empty() && by_lines.truncated);
+        let by_bytes = read(ReadBudget {
+            scan_bytes: 500,
+            ..budget(100)
+        });
+        assert!(by_bytes.entries.is_empty() && by_bytes.truncated);
+        // A budget spent exactly at the end of the input is not a truncation.
+        let size = std::fs::metadata(day_file(directory.path(), "2026-11-07".parse().unwrap()))
+            .unwrap()
+            .len();
+        let exact = read(ReadBudget {
+            scan_bytes: size,
+            ..budget(100)
+        });
+        assert_eq!((tags(&exact.entries), exact.truncated), (vec![9], false));
     }
 }

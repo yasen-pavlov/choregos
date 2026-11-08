@@ -2,6 +2,63 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-08 — Phase 2 slice 2: the Recorder
+
+- `/recorder` (decision list), `/recorder/{id}` (one decision), `/recorder/live` (live
+  frames, SSE at `/recorder/live/events`) and `/recorder/glossary` replace `/decisions` and
+  `/bus`, which are removed. The list filters by role (`room` = no role), reason group,
+  exact reason, verdict, would, time range and migrated history, all as GET parameters;
+  pages hold 100 rows behind a `before=<id>` cursor and the first page polls
+  `/p/recorder` every 5 s so verdicts settle in place. The poll replaces one
+  `#recorder-results` block (rows, count and pager, all from one snapshot), so the Older
+  cursor always follows the displayed last row when decisions arrive or a verdict filter
+  drops a settled row. Canonical URLs keep custom-range bounds lossless (RFC3339 with the
+  input's fraction). Day separators are UTC days.
+- Bus window (`/p/window/{id}?from=&to=`, seconds around the decision, bounded
+  −300…0…600): read from the trace day files when `trace.keep_days > 0` and a file exists
+  for the window's UTC date(s), else from memory (`recent_frames` + the ring, no
+  observations); the footer names the source, and says when the trace has no frames for
+  the window (memory is not used to fill a valid trace window). The viewed decision is
+  always one row, keyed `(timestamp, id)`, even when the trace lacks its creation line.
+  Trace records go through the same `runtime::bridge::Correlation` as replay; a send
+  outcome attaches to the send the adapter matched (see the decoder metadata below), never
+  to a row found by similar bytes, and an aether host `tx` with no recorded send (manual
+  or expired id) is still an `ours` row.
+- Window read caps (`runtime::trace::ReadBudget::WINDOW`): at most 5000 in-window entries
+  are returned; one line is buffered up to 1 MiB (longer lines are consumed and dropped,
+  never held whole); the scan stops after 64 MiB or 2 M lines in total, pre-window, torn
+  and unknown lines included. The reader flags `truncated` only when it stops with input
+  left (another in-window entry, or unread bytes when the scan budget is spent), and the
+  window footer says "Window truncated" from that flag.
+- Frames are tagged `trigger` (equal to the trigger frame, closest within ±2 s), `ours`
+  (sent or local), `reply` (to the bridge within 1 s after one of ours) or `other`; an
+  observation within ±1.5 s of `timestamp + latency_ms` with the met value is noted as
+  settling that expectation. Home Assistant observations are read as the engine reads
+  them: power `on|playing|paused|idle|buffering` → `on`, `off|standby` → `off`, playback
+  `idle|paused|off|stopped|standby` → `stopped`, source from the `source` attribute, and
+  sampled at `last_changed` (power, playback) or `last_updated` (source). A trace decision
+  row links to its detail page only when the ring holds the same id at the same time (ids
+  repeat across state lineages); a verdict line settles the newest earlier row with its id.
+- New runtime API: `runtime::trace::read_window(directory, from, to, ReadBudget) ->
+  WindowRead { entries, truncated }` (and `trace::day_file`), and
+  `AppState::set_trace_directory` / `trace_directory`, set once in `runtime::run` from the
+  state file's directory.
+- Additive, display-only decoder metadata on `runtime::bridge::Decoded`: `result_for:
+  Option<SendKey>` (`Fifo(position)` for Tasmota, positions never reused; `Id(id)` for
+  aether) names the recorded send an outcome consumed, including a stock Tasmota reply or
+  an aether rejection that yields no `SendResult`; `host_tx: Option<HostTx>` describes an
+  aether host transmission that yields no `SendResult`. `Correlation::record_send` returns
+  the Tasmota FIFO position. `events` are unchanged, and the live runtime and replay ignore
+  both fields.
+- The glossary page lists all 38 reason literals by group with the group's rule; the
+  detail page links to its anchor. Action strings are decoded in the view from their
+  JSON (`Action` has no `Deserialize`); unparsable strings are shown verbatim.
+- On the detail page the desktop window loads on `intersect once` and the phone copy, in a
+  closed `<details>`, on `toggle once`: one of the two is hidden by the layout, and a
+  hidden `load` trigger would read the trace for nothing.
+- The top-bar mode switch is a `<fieldset>` with a visually hidden legend instead of
+  `div role="group"` (Sonar Web:S6819).
+
 ## 2026-11-07 — Phase 2 slice 1: cockpit and chrome
 
 - Phase 2 slice 1: cockpit + chrome; consistency badge rule (warming → not checked

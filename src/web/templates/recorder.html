@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}recorder · choregos{% endblock %}
+{% block content %}
+{% let tab = "decisions" %}
+<div class="page-h">
+  <h1>Recorder</h1>
+  {% include "partials/recorder_nav.html" %}
+</div>
+<form class="panel rec-filters" method="get" action="/recorder">
+  <div class="frow">
+    <label><span class="k">Role</span>
+      <select name="role">
+        <option value="">All roles</option>
+        <option value="room"{% if list.filter.role_is("room") %} selected{% endif %}>room (no role)</option>
+        {% for (id, name) in list.roles %}<option value="{{ id }}"{% if list.filter.role_is(id) %} selected{% endif %}>{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <fieldset class="seg"><legend class="k">Time</legend>
+      {% for range in list.ranges %}<label><input type="radio" name="range" value="{{ range.word() }}"{% if list.range_is(range) %} checked{% endif %}><span>{{ range.label() }}</span></label>{% endfor %}
+    </fieldset>
+    <label class="custom"><span class="k">From</span><input type="datetime-local" name="from" value="{{ list.filter.custom_from() }}"{% if list.filter.custom_seconds() %} step="any"{% endif %}></label>
+    <label class="custom"><span class="k">To</span><input type="datetime-local" name="to" value="{{ list.filter.custom_to() }}"{% if list.filter.custom_seconds() %} step="any"{% endif %}></label>
+    <fieldset class="seg"><legend class="k">Would</legend>
+      {% for would in list.woulds %}<label><input type="radio" name="would" value="{{ would.word() }}"{% if list.would_is(would) %} checked{% endif %}><span>{{ would.label() }}</span></label>{% endfor %}
+    </fieldset>
+    <label class="check"><input type="checkbox" name="migrated" value="show"{% if list.filter.migrated %} checked{% endif %}> Show migrated</label>
+  </div>
+  <div class="frow">
+    <fieldset class="chips"><legend class="k">Reason</legend>
+      {% for group in list.groups %}<label><input type="checkbox" name="group" value="{{ group.label() }}"{% if list.filter.has_group(group) %} checked{% endif %}><span>{{ group.label() }}</span></label>{% endfor %}
+    </fieldset>
+    <fieldset class="chips"><legend class="k">Verdict</legend>
+      {% for verdict in list.verdicts %}<label><input type="checkbox" name="verdict" value="{{ verdict }}"{% if list.filter.has_verdict(verdict) %} checked{% endif %}><span>{{ verdict }}</span></label>{% endfor %}
+    </fieldset>
+    {% if let Some(reason) = list.filter.reason %}<label class="check"><input type="checkbox" name="reason" value="{{ reason }}" checked> reason <span class="mono">{{ reason }}</span></label>{% endif %}
+    <span class="grow"></span>
+    <button type="submit" class="btn sm primary">Apply</button>
+    {% if list.filter.is_filtered() %}<a class="small" href="/recorder">Clear filters</a>{% endif %}
+  </div>
+  <p class="note">Older windows are read from the day files on disk. Filters are query parameters, so a filtered view is a link you can keep.</p>
+</form>
+{% include "partials/recorder_results.html" %}
+{% endblock %}

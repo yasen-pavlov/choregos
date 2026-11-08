@@ -73,10 +73,14 @@ pub fn router(state: AppState) -> Router {
         .route("/p/cockpit", get(routes::cockpit::partial))
         .route("/p/status", get(routes::chrome::status))
         .route("/p/bridge", get(routes::chrome::bridge))
-        .route("/bus", get(routes::bus::page))
-        .route("/bus/events", get(routes::bus::events))
+        .route("/recorder", get(routes::recorder::page))
+        .route("/p/recorder", get(routes::recorder::rows))
+        .route("/recorder/glossary", get(routes::recorder::glossary))
+        .route("/recorder/live", get(routes::live::page))
+        .route("/recorder/live/events", get(routes::live::events))
+        .route("/recorder/{id}", get(routes::recorder::detail))
+        .route("/p/window/{id}", get(routes::recorder::window))
         .route("/devices", get(routes::devices::page))
-        .route("/decisions", get(routes::decisions::page))
         .route(
             "/config",
             get(routes::config::page).post(routes::config::submit),

@@ -884,6 +884,7 @@ impl Runtime {
 
 pub async fn run(config: Config, config_text: String, path: PathBuf) -> anyhow::Result<()> {
     let state = AppState::new(config.clone(), config_text);
+    state.set_trace_directory(state_directory(&path).to_path_buf());
     let listener = tokio::net::TcpListener::bind(config.web.bind).await?;
     let (shutdown, mut stopped) = watch::channel(false);
     let mut server = tokio::spawn({

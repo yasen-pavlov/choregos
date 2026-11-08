@@ -1,0 +1,16 @@
+<div id="recorder-results"{% if let Some(url) = list.poll_url %} hx-get="{{ url }}" hx-trigger="every 5s" hx-select="#recorder-results" hx-swap="outerHTML"{% endif %}>
+<section class="panel flush" aria-label="Decisions">
+  <div class="scroll-x">
+    <table class="tbl rec-list">
+      <thead><tr><th scope="col">#</th><th scope="col">Time</th><th scope="col">Role</th><th scope="col">Change</th><th scope="col">Reason</th><th scope="col">Trigger</th><th scope="col">Actions</th><th scope="col">Verdict</th><th scope="col" class="r">Latency</th></tr></thead>
+      {% include "partials/recorder_rows.html" %}
+    </table>
+  </div>
+  <div class="pager">
+    <span class="note">Showing {{ list.total }} of {{ list.ring }} decisions in memory (last ~2 weeks) · newest first · {{ crate::web::view::recorder::PAGE_ROWS }} per page{% if let Some(before) = list.filter.before %} · before #{{ before }}{% endif %}</span>
+    <span class="grow"></span>
+    {% if let Some(url) = list.newest_url %}<a class="btn sm ghost" href="{{ url }}">← Newest</a>{% endif %}
+    {% if let Some(url) = list.older_url %}<a class="btn sm ghost" href="{{ url }}">Older →</a>{% endif %}
+  </div>
+</section>
+</div>

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -39,6 +40,8 @@ struct Inner {
     config_text: std::sync::RwLock<String>,
     runtime: std::sync::RwLock<Option<tokio::sync::mpsc::Sender<crate::runtime::Input>>>,
     auth: AuthConfig,
+    /// Where the runtime writes its daily bus traces; `None` until the runtime says so.
+    trace_directory: std::sync::RwLock<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -126,6 +129,7 @@ impl AppState {
                 config_text: std::sync::RwLock::new(config_text),
                 runtime: std::sync::RwLock::new(None),
                 auth,
+                trace_directory: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -232,6 +236,24 @@ impl AppState {
 
     pub fn auth(&self) -> &AuthConfig {
         &self.inner.auth
+    }
+
+    /// Records where the runtime writes its `cec-bus.<date>.jsonl` day files.
+    pub fn set_trace_directory(&self, directory: PathBuf) {
+        *self
+            .inner
+            .trace_directory
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(directory);
+    }
+
+    /// The trace day-file directory, once the runtime has set it.
+    pub fn trace_directory(&self) -> Option<PathBuf> {
+        self.inner
+            .trace_directory
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

@@ -22,12 +22,17 @@ Use a matching local `choregos` CLI for offline replay and extraction.
   headers, CEC traffic/results, bridge availability, accepted commands and HA
   engine inputs. `[trace] keep_days` controls retention (default 30, range
   0–365; 0 disables capture). Startup and daily rollover prune old files.
-  Trace write failures warn without stopping control.
+  Trace write failures warn without stopping control. The web UI's Recorder
+  (`/recorder/<id>`) reads a decision's bus window from these files when
+  capture is on and the day's file exists, otherwise from the ~6 h of frames
+  held in memory; `/recorder/live` shows the in-memory frames as they arrive.
 
 Decision ids are unique within a state-file lineage, not globally: after a crash
 or failed asynchronous writes, restart resumes from the last persisted counter.
 Deleting or restoring state can also reuse ids already present in traces or logs;
-correlate trace decision rows by `(ts, id)`, not by id alone.
+correlate trace decision rows by `(ts, id)`, not by id alone. The Recorder's bus
+window does the same: a trace decision row links to its detail page only when
+the ring holds that id at that time.
 
 **The container runs as UID/GID 65532.** Both the directory and its files must
 be accessible to that user. A root-owned mode-0600 config causes `Permission

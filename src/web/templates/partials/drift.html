@@ -1,3 +1,0 @@
-{# Reason cell of a `drift` / `drift_resolved` row: the disagreement, its evidence, and how long it held. #}
-<span class="pill drift-{{ view::drift_tone(decision.reason) }}">{{ decision.reason }}</span>
-<span class="drift-detail" title="Reporting only: no action was taken. Onset {{ view::iso(drift.since) }}"><span class="mono">{{ drift.subject }}.{{ drift.field }}</span> {{ drift.intended }} → {{ drift.observed }} <span class="dim">via {{ drift.via }}{% if let Some(lasted) = view::drift_lasted(decision) %} · lasted {{ lasted }}{% endif %}</span></span>

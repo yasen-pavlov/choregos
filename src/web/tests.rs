@@ -244,10 +244,14 @@ async fn unauthenticated_requests_are_sent_to_login() {
     let h = harness(UNREACHABLE_ISSUER);
     for path in [
         "/",
-        "/bus",
-        "/bus/events",
+        "/recorder",
+        "/p/recorder",
+        "/recorder/1",
+        "/p/window/1",
+        "/recorder/glossary",
+        "/recorder/live",
+        "/recorder/live/events",
         "/devices",
-        "/decisions",
         "/config",
         "/p/cockpit",
         "/p/status",
@@ -559,9 +563,10 @@ async fn pages_render_and_reference_served_assets() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
     for path in [
-        "/bus?la=4&opcode=82",
+        "/recorder/live?la=4&opcode=82",
         "/devices",
-        "/decisions",
+        "/recorder",
+        "/recorder/glossary",
         "/config",
         "/p/cockpit",
         "/p/status",
@@ -570,10 +575,17 @@ async fn pages_render_and_reference_served_assets() {
         let response = h.get(path, Some(&cookie)).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
-    assert_eq!(
-        h.get("/bus?la=99", Some(&cookie)).await.status(),
-        StatusCode::BAD_REQUEST
-    );
+    for bad in [
+        "/recorder/live?la=99",
+        "/recorder?group=nap",
+        "/recorder?before=x",
+    ] {
+        assert_eq!(
+            h.get(bad, Some(&cookie)).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
     let html = body(h.get("/", Some(&cookie)).await).await;
     let assets: Vec<&str> = html
         .match_indices("/static/")
@@ -744,7 +756,7 @@ async fn bus_rows_mark_local_replies_and_nacked_frames() {
         .recent_frames
         .extend([local, nacked, acked, frame(4, 15, 0x82, "Active Source")]);
     h.state.publish(snapshot.clone(), []);
-    let page = body(h.get("/bus", Some(&cookie)).await).await;
+    let page = body(h.get("/recorder/live", Some(&cookie)).await).await;
 
     let local_row = row_containing(&page, "Report Physical Address");
     assert!(
@@ -770,7 +782,7 @@ async fn bus_rows_mark_local_replies_and_nacked_frames() {
     }
 
     // Live rows come from the same partial: a local reply the destination NACKed.
-    let response = h.get("/bus/events", Some(&cookie)).await;
+    let response = h.get("/recorder/live/events", Some(&cookie)).await;
     let mut stream = response.into_body().into_data_stream();
     h.state.publish(
         snapshot,
@@ -862,28 +874,6 @@ fn verdict_decision() -> DecisionView {
     }
 }
 
-#[tokio::test]
-async fn decisions_page_renders_verdict_chip_and_expectations() {
-    let h = harness(UNREACHABLE_ISSUER);
-    let (cookie, _) = h.login().await;
-    let mut snapshot = h.state.snapshot();
-    snapshot
-        .decisions
-        .extend([shadow_decision(), verdict_decision()]);
-    h.state.publish(snapshot, []);
-    let page = body(h.get("/decisions", Some(&cookie)).await).await;
-    assert_eq!(
-        page.matches("class=\"pill verdict-").count(),
-        1,
-        "the `none` verdict renders no chip"
-    );
-    assert!(page.contains("pill verdict-partial\">partial<"));
-    assert!(page.contains("tv.power"));
-    assert!(page.contains("via tv_direct in 3.4 s"));
-    assert!(page.contains("standby → on"));
-    assert!(page.contains("2 retries"));
-}
-
 /// Class tokens of the element whose text starts at the first occurrence of `text`.
 fn classes_around<'a>(html: &'a str, text: &str) -> Vec<&'a str> {
     let at = html
@@ -909,17 +899,6 @@ fn assert_shadow_actions(html: &str) {
     let before_identify = &html[..html.find(identify).expect("identify action is rendered")];
     assert!(!before_identify.ends_with("would: "));
     assert!(!classes_around(html, identify).contains(&"would"));
-}
-
-#[tokio::test]
-async fn decisions_page_shows_the_runtime_would_prefix_once() {
-    let h = harness(UNREACHABLE_ISSUER);
-    let (cookie, _) = h.login().await;
-    let mut snapshot = h.state.snapshot();
-    snapshot.decisions.extend([shadow_decision()]);
-    h.state.publish(snapshot, []);
-    let page = body(h.get("/decisions", Some(&cookie)).await).await;
-    assert_shadow_actions(&page);
 }
 
 /// A drift as the engine records it: Home Assistant reports the receiver `observed` while
@@ -959,60 +938,645 @@ fn drift_decision(
     }
 }
 
-#[tokio::test]
-async fn decisions_page_renders_drift_detail_and_resolved_duration_without_a_verdict() {
-    let h = harness(UNREACHABLE_ISSUER);
-    let (cookie, _) = h.login().await;
-    let since = chrono::Utc::now() - chrono::TimeDelta::minutes(5);
-    let mut snapshot = h.state.snapshot();
-    snapshot.decisions.extend([
-        verdict_decision(),
+/// The body of a page that must render.
+async fn ok_page(h: &Harness, cookie: &str, path: &str) -> String {
+    let response = h.get(path, Some(cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    body(response).await
+}
+
+/// Ids of the list rows in page order.
+fn row_ids(html: &str) -> Vec<u64> {
+    html.match_indices("<tr id=\"row-")
+        .map(|(at, marker)| {
+            between(&html[at + marker.len()..], "", "\"")
+                .parse()
+                .expect("numeric row id")
+        })
+        .collect()
+}
+
+/// A ring covering the list's filters: migrated history, a drift onset and resolution,
+/// a shadow `would` row and a settled row that follows it up.
+fn recorder_ring() -> Vec<DecisionView> {
+    let since = chrono::Utc::now() - chrono::TimeDelta::minutes(30);
+    let migrated = DecisionView {
+        id: 20,
+        trigger: crate::action::Trigger::Service {
+            name: crate::action::ServiceKind::Migrated,
+        },
+        timestamp: since - chrono::TimeDelta::hours(3),
+        ..verdict_decision()
+    };
+    let would = DecisionView {
+        id: 22,
+        timestamp: since + chrono::TimeDelta::minutes(1),
+        ..shadow_decision()
+    };
+    let settled = DecisionView {
+        id: 23,
+        parent: Some(22),
+        timestamp: since + chrono::TimeDelta::minutes(2),
+        ..verdict_decision()
+    };
+    vec![
+        migrated,
         drift_decision(
-            11,
+            21,
             "drift",
             chrono::TimeDelta::seconds(30),
             drift_detail("off", since),
         ),
+        would,
+        settled,
         drift_decision(
-            12,
+            24,
             "drift_resolved",
-            chrono::TimeDelta::milliseconds(95_500),
+            chrono::TimeDelta::milliseconds(195_500),
             drift_detail("on", since),
         ),
-        // A detail on a row whose reason is not drift does not take over the row.
-        DecisionView {
-            id: 13,
-            drift: Some(drift_detail("off", since)),
-            ..verdict_decision()
-        },
-    ]);
+    ]
+}
+
+#[tokio::test]
+async fn recorder_lists_newest_first_hides_migrated_and_applies_each_filter() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend(recorder_ring());
     h.state.publish(snapshot, []);
-    let page = body(h.get("/decisions", Some(&cookie)).await).await;
+    let page = |path: &'static str| ok_page(&h, &cookie, path);
 
-    let onset = row_containing(&page, "id=\"d-11\"");
-    assert!(classes_around(onset, "drift</span>").contains(&"drift-open"));
-    assert!(onset.contains("<span class=\"mono\">receiver.power</span> on → off"));
-    assert!(onset.contains("via ha</span>"), "{onset}");
-    assert!(!onset.contains("lasted"), "an open onset has no duration");
-    assert!(!onset.contains("pill verdict-"), "{onset}");
-
-    let resolved = row_containing(&page, "id=\"d-12\"");
-    assert!(classes_around(resolved, "drift_resolved</span>").contains(&"drift-resolved"));
-    assert!(resolved.contains("receiver.power</span> on → on"));
+    let html = page("/recorder").await;
+    assert_eq!(
+        row_ids(&html),
+        [24, 23, 22, 21],
+        "newest first, migrated hidden"
+    );
+    // First page polls its results (rows, count and pager) so verdicts settle in place.
+    assert!(html.contains(r##"<div id="recorder-results" hx-get="/p/recorder" hx-trigger="every 5s" hx-select="#recorder-results" hx-swap="outerHTML">"##));
+    let would = row_containing(&html, "id=\"row-22\"");
     assert!(
-        resolved.contains("via ha · lasted 1m 35s</span>"),
+        would.starts_with("<tr id=\"row-22\" class=\"would\""),
+        "{would}"
+    );
+    assert!(
+        would.contains("<span class=\"chip would\">would</span>"),
+        "{would}"
+    );
+    let settled = row_containing(&html, "id=\"row-23\"");
+    assert!(
+        settled.contains("<span class=\"chip warn\">partial</span>"),
+        "{settled}"
+    );
+    assert!(
+        settled.contains("href=\"/recorder/22\""),
+        "parent link: {settled}"
+    );
+    assert!(settled.contains("↳ 22"), "{settled}");
+    assert!(
+        settled.contains("command takeover streamer"),
+        "trigger: {settled}"
+    );
+    assert!(settled.contains(">3.4 s<"), "latency: {settled}");
+    let resolved = row_containing(&html, "id=\"row-24\"");
+    assert!(resolved.contains("lasted 3m 15s"), "{resolved}");
+    assert!(
+        resolved.contains("<span class=\"grp\">drift</span>"),
         "{resolved}"
     );
-    assert!(!resolved.contains("pill verdict-"), "{resolved}");
+    assert!(html.contains("Showing 4 of 5 decisions in memory"));
 
-    // Ordinary rows keep their plain reason and verdict chip.
-    let ordinary = row_containing(&page, "id=\"d-9\"");
-    assert!(ordinary.contains("<td>PowerOn</td>"), "{ordinary}");
-    assert!(ordinary.contains("pill verdict-partial"));
-    let mismatched = row_containing(&page, "id=\"d-13\"");
-    assert!(mismatched.contains("<td>PowerOn</td>"), "{mismatched}");
-    assert!(mismatched.contains("pill verdict-partial"), "{mismatched}");
-    assert!(!mismatched.contains("drift"), "{mismatched}");
+    assert_eq!(
+        row_ids(&page("/recorder?migrated=show").await),
+        [24, 23, 22, 21, 20]
+    );
+    assert_eq!(row_ids(&page("/recorder?role=room").await), [24, 21]);
+    assert_eq!(row_ids(&page("/recorder?group=drift").await), [24, 21]);
+    assert_eq!(row_ids(&page("/recorder?would=hide").await), [24, 23, 21]);
+    assert_eq!(row_ids(&page("/recorder?reason=drift").await), [21]);
+    let empty = page("/recorder?role=room&verdict=partial").await;
+    assert!(row_ids(&empty).is_empty());
+    assert!(empty.contains("No decisions match these filters"));
+    // The poll keeps the same query.
+    assert!(
+        page("/recorder?role=room")
+            .await
+            .contains("hx-get=\"/p/recorder?role=room\"")
+    );
+    let rows = page("/p/recorder?role=room").await;
+    assert!(rows.starts_with("<div id=\"recorder-results\""), "{rows}");
+    assert_eq!(row_ids(&rows), [24, 21]);
+    assert!(
+        rows.contains("Showing 2 of 5 decisions in memory"),
+        "{rows}"
+    );
+}
+
+#[tokio::test]
+async fn recorder_pages_by_cursor_and_only_the_first_page_polls() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    let start = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+    snapshot.decisions.extend((1..=130).map(|id| DecisionView {
+        id,
+        timestamp: start + chrono::TimeDelta::seconds(i64::try_from(id).unwrap()),
+        ..verdict_decision()
+    }));
+    h.state.publish(snapshot, []);
+    let first = body(h.get("/recorder", Some(&cookie)).await).await;
+    let ids = row_ids(&first);
+    assert_eq!((ids.len(), ids[0], ids[99]), (100, 130, 31));
+    assert!(first.contains("href=\"/recorder?before=31\">Older →</a>"));
+    assert!(!first.contains("← Newest"));
+    let second = body(h.get("/recorder?before=31", Some(&cookie)).await).await;
+    let ids = row_ids(&second);
+    assert_eq!((ids.len(), ids[0], ids[29]), (30, 30, 1));
+    assert!(!second.contains("Older →"));
+    assert!(second.contains("href=\"/recorder\">← Newest</a>"));
+    assert!(
+        !second.contains("hx-get=\"/p/recorder"),
+        "older pages do not poll"
+    );
+}
+
+/// The `Older →` cursor of a list page, if any.
+fn older_cursor(html: &str) -> Option<u64> {
+    let at = html.find("\">Older →</a>")?;
+    let link = &html[..at];
+    link[link.rfind("before=")? + "before=".len()..]
+        .parse()
+        .ok()
+}
+
+#[tokio::test]
+async fn recorder_poll_refreshes_rows_and_pager_from_one_snapshot() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let start = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+    let decision = |id: u64| DecisionView {
+        id,
+        timestamp: start + chrono::TimeDelta::seconds(i64::try_from(id).unwrap()),
+        verdict: crate::action::Verdict::Pending,
+        ..verdict_decision()
+    };
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend((1..=130).map(decision));
+    h.state.publish(snapshot, []);
+    let first = body(h.get("/recorder", Some(&cookie)).await).await;
+    assert_eq!(older_cursor(&first), Some(31));
+
+    // A decision arrives before the next poll: the polled block's Older cursor follows
+    // its own last row, so decision 31 is still reachable.
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.push_back(decision(131));
+    h.state.publish(snapshot, []);
+    let polled = body(h.get("/p/recorder", Some(&cookie)).await).await;
+    assert!(
+        polled.starts_with("<div id=\"recorder-results\""),
+        "{polled}"
+    );
+    let ids = row_ids(&polled);
+    assert_eq!((ids.len(), ids[0], ids[99]), (100, 131, 32));
+    assert_eq!(older_cursor(&polled), Some(32));
+    assert!(
+        polled.contains("Showing 131 of 131 decisions"),
+        "count refreshed"
+    );
+    let older = body(h.get("/recorder?before=32", Some(&cookie)).await).await;
+    let mut seen = ids.clone();
+    seen.extend(row_ids(&older));
+    assert_eq!(
+        seen,
+        (1..=131).rev().collect::<Vec<_>>(),
+        "no gap, no repeat"
+    );
+
+    // With a verdict filter, settlement removes a row from page one: the poll pulls the
+    // next one up and moves the cursor with it, so page two does not repeat it.
+    let pending = "/recorder?verdict=pending";
+    assert_eq!(
+        older_cursor(&body(h.get(pending, Some(&cookie)).await).await),
+        Some(32)
+    );
+    let mut snapshot = h.state.snapshot();
+    for row in snapshot.decisions.iter_mut().filter(|row| row.id == 100) {
+        row.verdict = crate::action::Verdict::Achieved;
+    }
+    h.state.publish(snapshot, []);
+    let polled = body(h.get("/p/recorder?verdict=pending", Some(&cookie)).await).await;
+    let ids = row_ids(&polled);
+    assert_eq!((ids.len(), ids[0], ids[99]), (100, 131, 31));
+    assert!(!ids.contains(&100));
+    assert_eq!(older_cursor(&polled), Some(31));
+    assert!(polled.contains("Showing 130 of 131 decisions"), "{polled}");
+    let older = body(
+        h.get("/recorder?verdict=pending&before=31", Some(&cookie))
+            .await,
+    )
+    .await;
+    let mut seen = ids.clone();
+    seen.extend(row_ids(&older));
+    let expected: Vec<u64> = (1..=131).rev().filter(|id| *id != 100).collect();
+    assert_eq!(seen, expected, "no gap, no repeat");
+}
+
+#[tokio::test]
+async fn recorder_poll_keeps_fractional_custom_bounds() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let at: chrono::DateTime<chrono::Utc> = "2026-11-07T23:54:03.500Z".parse().unwrap();
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.push_back(DecisionView {
+        id: 844,
+        timestamp: at,
+        ..verdict_decision()
+    });
+    h.state.publish(snapshot, []);
+    let page = body(
+        h.get(
+            "/recorder?range=custom&from=2026-11-07T23%3A54%3A02.000Z&to=2026-11-07T23%3A54%3A03.999Z",
+            Some(&cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(row_ids(&page), [844]);
+    let poll = between(&page, "<div id=\"recorder-results\" hx-get=\"", "\"").replace("&#38;", "&");
+    assert_eq!(
+        poll,
+        "/p/recorder?range=custom&from=2026-11-07T23%3A54%3A02Z&to=2026-11-07T23%3A54%3A03.999Z"
+    );
+    let polled = body(h.get(&poll, Some(&cookie)).await).await;
+    assert_eq!(row_ids(&polled), [844], "the poll matches the same rows");
+}
+
+/// A wake by a frame, with one met and one missed expectation, actions, and a child.
+fn frame_wake() -> Vec<DecisionView> {
+    let wake = DecisionView {
+        id: 30,
+        trigger: crate::action::Trigger::Frame {
+            from: 4,
+            to: 15,
+            data: "822100".to_owned(),
+        },
+        actions: vec![
+            r#"{"kind":"wake_tv"}"#.to_owned(),
+            r#"{"kind":"cec_send","to":8,"data":[54]}"#.to_owned(),
+        ],
+        ..verdict_decision()
+    };
+    let settled = DecisionView {
+        id: 31,
+        parent: Some(30),
+        reason: "takeover_settled".to_owned(),
+        verdict: crate::action::Verdict::Achieved,
+        expectations: vec![],
+        timestamp: wake.timestamp + chrono::TimeDelta::seconds(2),
+        ..verdict_decision()
+    };
+    vec![wake, settled]
+}
+
+#[tokio::test]
+async fn decision_detail_renders_trigger_actions_expectations_and_family() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    for missing in ["/recorder/30", "/recorder/abc", "/p/window/30"] {
+        assert_eq!(
+            h.get(missing, Some(&cookie)).await.status(),
+            StatusCode::NOT_FOUND,
+            "{missing}"
+        );
+    }
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend(frame_wake());
+    snapshot.decisions.push_back(shadow_decision());
+    h.state.publish(snapshot, []);
+    let response = h.get("/recorder/30", Some(&cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(
+        html.contains("<h1>Test Streamer woke; console_b taken over — partial</h1>"),
+        "{html}"
+    );
+    assert!(html.contains("Decision #30 · wake"));
+    let trigger = between(&html, "id=\"trigger\"", "</section>");
+    assert!(
+        trigger.contains("<span class=\"chip info\">frame</span>"),
+        "{trigger}"
+    );
+    assert!(
+        trigger.contains("<dd>4 · LA 4</dd>") && trigger.contains("<dd>15 · broadcast</dd>"),
+        "{trigger}"
+    );
+    assert!(
+        trigger.contains("Active Source") && trigger.contains("PA 2.1.0.0"),
+        "{trigger}"
+    );
+    let actions = between(&html, "id=\"actions\"", "</section>");
+    assert!(actions.contains("via configured tv.wake"), "{actions}");
+    assert!(
+        actions.contains("LA 8 · LA 8") && actions.contains("36 · Standby"),
+        "{actions}"
+    );
+    assert_eq!(actions.matches(">sent</span>").count(), 2, "{actions}");
+    let expectations = between(&html, "id=\"expectations\"", "</section>");
+    assert!(
+        expectations.contains("<strong>tv_direct</strong> <span class=\"dim\">ha</span>"),
+        "{expectations}"
+    );
+    assert!(
+        expectations.contains("<span class=\"chip ok\">met via tv_direct</span>"),
+        "{expectations}"
+    );
+    assert!(expectations.contains(">3.4 s<"), "{expectations}");
+    assert!(
+        expectations.contains("role:console_b.power"),
+        "{expectations}"
+    );
+    assert!(
+        expectations.contains("<span class=\"chip bad\">missed · read on</span>"),
+        "{expectations}"
+    );
+    let family = between(&html, "id=\"family\"", "</section>");
+    assert!(family.contains("href=\"/recorder/31\""), "{family}");
+    assert!(family.contains("takeover_settled"), "{family}");
+    let neighbours = between(&html, "id=\"neighbours\"", "</section>");
+    assert!(
+        neighbours.contains("href=\"/recorder?role=streamer\">Other decisions for Test Streamer →"),
+        "{neighbours}"
+    );
+    assert!(
+        neighbours.contains("href=\"/recorder?reason=PowerOn\">Other PowerOn rows →"),
+        "{neighbours}"
+    );
+    // The window loads after the page; next exists, previous does not.
+    assert!(html.contains("hx-get=\"/p/window/30?from=-5"), "{html}");
+    assert!(html.contains("href=\"/recorder/31\" rel=\"next\""));
+    assert!(!html.contains("rel=\"prev\""));
+    // The child names its parent.
+    let child = body(h.get("/recorder/31", Some(&cookie)).await).await;
+    assert!(between(&child, "id=\"family\"", "</section>").contains("href=\"/recorder/30\""));
+
+    // A shadow row's suppressed action shows `would`, the identify query that ran does not.
+    let shadow = body(h.get("/recorder/7", Some(&cookie)).await).await;
+    let actions = between(&shadow, "id=\"actions\"", "</section>");
+    assert!(
+        !actions.contains("would: "),
+        "the prefix becomes the status: {actions}"
+    );
+    let suppressed = row_containing(actions, "media_player.turn_on media_player.test_receiver");
+    assert!(
+        suppressed.contains("<span class=\"chip would\">would</span>"),
+        "{suppressed}"
+    );
+    let identify = row_containing(actions, "cec.give_osd_name 4");
+    assert!(identify.contains(">sent</span>"), "{identify}");
+    assert!(shadow.contains("recorded as would"));
+}
+
+/// A frame in the memory ring, `offset_ms` after `at`.
+fn wire(
+    at: chrono::DateTime<chrono::Utc>,
+    offset_ms: i64,
+    direction: FrameDirection,
+    (from, to): (u8, u8),
+    bytes: &[u8],
+) -> FrameView {
+    FrameView {
+        timestamp: at + chrono::TimeDelta::milliseconds(offset_ms),
+        direction,
+        opcode: bytes.first().copied(),
+        params: bytes.get(1..).unwrap_or_default().to_vec(),
+        data: bytes.iter().map(|byte| format!("{byte:02X}")).collect(),
+        ack: Some(true),
+        ..frame(from, to, 0, "")
+    }
+}
+
+#[tokio::test]
+async fn bus_window_from_memory_tags_trigger_ours_and_replies() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    let ring = frame_wake();
+    let at = ring[0].timestamp;
+    snapshot.recent_frames.extend([
+        wire(
+            at,
+            -60_000,
+            FrameDirection::Received,
+            (4, 15),
+            &[0x87, 0x00, 0x10, 0xFA],
+        ),
+        wire(at, -1_000, FrameDirection::Received, (4, 4), &[]),
+        wire(
+            at,
+            5,
+            FrameDirection::Received,
+            (4, 15),
+            &[0x82, 0x21, 0x00],
+        ),
+        wire(at, 500, FrameDirection::Received, (5, 4), &[0x46]),
+        wire(at, 1_000, FrameDirection::Sent, (0, 8), &[0x8F]),
+        wire(at, 1_300, FrameDirection::Received, (8, 0), &[0x90, 0x01]),
+    ]);
+    snapshot.decisions.extend(ring);
+    h.state.publish(snapshot, []);
+    for bad in ["?from=-301", "?to=601", "?from=5", "?to=-1"] {
+        assert_eq!(
+            h.get(&format!("/p/window/30{bad}"), Some(&cookie))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    let html = body(h.get("/p/window/30", Some(&cookie)).await).await;
+    let tag = |text: &str| {
+        let row = row_containing(&html, text);
+        between(row, "<span class=\"chip ", "</span>").to_owned()
+    };
+    assert_eq!(tag("82 21 00"), "info\">trigger");
+    assert_eq!(tag("Give OSD Name"), "dim\">other");
+    assert_eq!(tag("Give Device Power Status"), "ours\">ours");
+    assert_eq!(tag("Report Power Status: standby"), "ok\">reply");
+    assert!(!html.contains("87 00 10 FA"), "outside the window");
+    // The decision and its settle row sit in the window as decision rows.
+    assert!(html.contains("<a class=\"mono\" href=\"/recorder/30\">#30</a>"));
+    assert!(html.contains("<tr class=\"wdec own\""));
+    assert!(html.contains("href=\"/recorder/31\">#31</a> <span class=\"dim\">↳ 30</span>"));
+    assert!(html.contains("Frames from memory (last ~6 h)"));
+    assert!(html.contains("Widen to −30 s / +2 m"));
+    assert!(html.contains("−5 s → +45 s"));
+    assert!(html.contains(">poll<"), "polls are shown by default");
+    let without_polls = body(
+        h.get("/p/window/30?from=-5&to=45&set=1&obs=on", Some(&cookie))
+            .await,
+    )
+    .await;
+    assert!(
+        !without_polls.contains(">poll<"),
+        "unticked polls are hidden"
+    );
+    assert!(without_polls.contains("82 21 00"));
+    let wide = body(h.get("/p/window/30?from=-120&to=45", Some(&cookie)).await).await;
+    assert!(wide.contains("87 00 10 FA"));
+    assert!(wide.contains("Back to −5 s / +45 s"));
+}
+
+#[tokio::test]
+async fn bus_window_reads_the_trace_day_file_with_observations() {
+    use crate::runtime::trace::{TraceEntry, day_file, line};
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let directory = tempfile::tempdir().unwrap();
+    h.state.set_trace_directory(directory.path().to_path_buf());
+    let mut snapshot = h.state.snapshot();
+    let ring = frame_wake();
+    let at = ring[0].timestamp;
+    let ms = |offset| at + chrono::TimeDelta::milliseconds(offset);
+    let mut text = String::new();
+    for (ts, entry) in [
+        (
+            ms(-10),
+            TraceEntry::Decision(
+                serde_json::json!({"id": 30, "timestamp": at, "reason": "PowerOn", "role": "streamer", "verdict": "pending"}),
+            ),
+        ),
+        (
+            ms(5),
+            TraceEntry::Received {
+                bridge: "cec_bridge".to_owned(),
+                frame: crate::cec::Frame::from_hex(4, 15, "822100").unwrap(),
+            },
+        ),
+        (
+            ms(1_000),
+            TraceEntry::TvPower {
+                state: crate::state::DirectPower::Unreachable,
+                at: ms(1_000),
+            },
+        ),
+        (
+            ms(3_400),
+            TraceEntry::TvPower {
+                state: crate::state::DirectPower::On,
+                at: ms(3_400),
+            },
+        ),
+    ] {
+        text.push_str(&line(ts, &entry));
+    }
+    let path = day_file(directory.path(), at.date_naive());
+    std::fs::write(&path, text).unwrap();
+    snapshot.decisions.extend(ring);
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/window/30", Some(&cookie)).await).await;
+    let file = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        html.contains(&format!("Frames from the trace file {file}.")),
+        "{html}"
+    );
+    assert!(html.contains("tv/state unreachable · tv_direct"), "{html}");
+    let settled = row_containing(&html, "tv/state on · tv_direct");
+    assert!(
+        settled.contains("<strong>— tv.power met (3.4 s)</strong>"),
+        "{settled}"
+    );
+    assert!(row_containing(&html, "82 21 00").contains("trigger"));
+    // The ring's verdict wins over the trace's creation-time one.
+    assert!(row_containing(&html, "wdec own\"").contains("chip warn\">partial"));
+    // Observations can be hidden.
+    let quiet = body(h.get("/p/window/30?set=1&polls=on", Some(&cookie)).await).await;
+    assert!(!quiet.contains("tv/state"));
+}
+
+#[tokio::test]
+async fn bus_window_shows_its_decision_when_the_trace_lacks_the_creation_line() {
+    use crate::runtime::trace::{TraceEntry, day_file, line};
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let directory = tempfile::tempdir().unwrap();
+    h.state.set_trace_directory(directory.path().to_path_buf());
+    let ring = frame_wake();
+    let at = ring[0].timestamp;
+    // Capture began after the decision was made: the day file has only a later sample.
+    let path = day_file(directory.path(), at.date_naive());
+    std::fs::write(
+        &path,
+        line(
+            at + chrono::TimeDelta::seconds(1),
+            &TraceEntry::TvPower {
+                state: crate::state::DirectPower::On,
+                at: at + chrono::TimeDelta::seconds(1),
+            },
+        ),
+    )
+    .unwrap();
+    let mut snapshot = h.state.snapshot();
+    // Memory holds a frame for the window; a valid trace window must not fall back to it.
+    snapshot.recent_frames.push_back(wire(
+        at,
+        5,
+        FrameDirection::Received,
+        (4, 15),
+        &[0x82, 0x21, 0x00],
+    ));
+    snapshot.decisions.extend(ring);
+    h.state.publish(snapshot, []);
+    let html = body(h.get("/p/window/30", Some(&cookie)).await).await;
+    assert_eq!(html.matches("<tr class=\"wdec own\"").count(), 1, "{html}");
+    assert!(
+        row_containing(&html, "wdec own\"").contains("href=\"/recorder/30\">#30</a>"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("82 21 00"),
+        "no memory frames in a trace window"
+    );
+    let file = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        html.contains(&format!(
+            "No frames for this window in the trace file {file}."
+        )),
+        "{html}"
+    );
+    assert!(html.contains("tv/state on · tv_direct"));
+}
+
+#[tokio::test]
+async fn old_routes_are_gone_and_navigation_points_at_the_recorder() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    for gone in ["/bus", "/bus/events", "/decisions"] {
+        assert_eq!(
+            h.get(gone, Some(&cookie)).await.status(),
+            StatusCode::NOT_FOUND,
+            "{gone}"
+        );
+    }
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend(frame_wake());
+    h.state.publish(snapshot, []);
+    let cockpit = body(h.get("/", Some(&cookie)).await).await;
+    assert!(!cockpit.contains("/decisions") && !cockpit.contains("/bus"));
+    assert!(
+        cockpit.contains("<a href=\"/recorder\">Recorder</a>"),
+        "{cockpit}"
+    );
+    assert!(cockpit.contains("href=\"/recorder\">Open Recorder →</a>"));
+    assert!(cockpit.contains("<a href=\"/recorder/31\">31</a>"));
+    let live = body(h.get("/recorder/live", Some(&cookie)).await).await;
+    assert!(
+        live.contains("href=\"/recorder/30\">#30</a>"),
+        "decision rows open the detail"
+    );
+    let glossary = body(h.get("/recorder/glossary", Some(&cookie)).await).await;
+    assert!(glossary.contains("<dt id=\"r-off_timer_expired\"><a class=\"mono\" href=\"/recorder?reason=off_timer_expired\">off_timer_expired</a></dt>"));
+    assert_eq!(glossary.matches("<dt id=\"r-").count(), 38);
 }
 
 /// Publishes the current snapshot after `edit`; returns the polled top-bar status block.
@@ -1092,19 +1656,31 @@ async fn consistency_badge_follows_warming_shadow_drift_and_tv_reachability() {
 }
 
 #[tokio::test]
-async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
+async fn live_stream_resyncs_from_history_then_streams_filtered_rows() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
     let mut snapshot = h.state.snapshot();
     let history = frame(4, 15, 0x82, "<Active Source>");
     snapshot.recent_frames.extend([history.clone()]);
     h.state.publish(snapshot.clone(), []);
-    let page = body(h.get("/bus", Some(&cookie)).await).await;
+    let page = body(h.get("/recorder/live", Some(&cookie)).await).await;
     assert!(page.contains("&#60;Active Source&#62;") || page.contains("&lt;Active Source&gt;"));
     assert!(page.contains("21 00"));
-    assert!(page.contains("sse-connect=\"/bus/events\""));
+    assert!(page.contains("sse-connect=\"/recorder/live/events\""));
+    // Follow off: the same rows, no stream.
+    let frozen = body(h.get("/recorder/live?follow=off", Some(&cookie)).await).await;
+    assert!(frozen.contains("21 00"));
+    assert!(
+        !frozen.contains("sse-connect"),
+        "follow off renders no stream"
+    );
+    assert!(
+        frozen.contains("href=\"/recorder/live\""),
+        "follow on is a link back to now"
+    );
+    assert!(page.contains("href=\"/recorder/live?follow=off\""));
 
-    let response = h.get("/bus/events?la=4", Some(&cookie)).await;
+    let response = h.get("/recorder/live/events?la=4", Some(&cookie)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],
@@ -1146,10 +1722,10 @@ async fn bus_stream_resyncs_from_history_then_streams_filtered_rows() {
 }
 
 #[tokio::test]
-async fn bus_stream_re_renders_the_ring_when_a_verdict_settles() {
+async fn live_stream_re_renders_the_ring_when_a_verdict_settles() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
-    let response = h.get("/bus/events", Some(&cookie)).await;
+    let response = h.get("/recorder/live/events", Some(&cookie)).await;
     let mut stream = response.into_body().into_data_stream();
     let mut received = String::new();
     macro_rules! pump {

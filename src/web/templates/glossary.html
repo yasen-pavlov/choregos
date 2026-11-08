@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}glossary · recorder · choregos{% endblock %}
+{% block content %}
+<div class="page-h">
+  <a class="small" href="/recorder">← Recorder</a>
+  <h1>Reason glossary</h1>
+</div>
+<p class="note">Every reason a decision row can carry, by group, with the rule the group applies. Rows from before v0.3.0 may still carry the three old standby-verification reasons.</p>
+{% for entry in groups %}
+{% let group = entry.group %}
+<section class="panel flush" id="g-{{ group.label() }}" aria-label="{{ group.label() }}">
+  <div class="ph"><h2 class="grow">{{ group.label() }}</h2><a class="small" href="/recorder?group={{ group.label() }}">rows →</a></div>
+  <div class="pb stack">
+    <p class="dim small">{{ entry.rule }}</p>
+    <dl class="gloss">
+      {% for (literal, sentence) in entry.reasons %}
+      <dt id="r-{{ literal }}"><a class="mono" href="/recorder?reason={{ literal }}">{{ literal }}</a></dt>
+      <dd>{{ sentence }}</dd>
+      {% endfor %}
+    </dl>
+  </div>
+</section>
+{% endfor %}
+{% endblock %}

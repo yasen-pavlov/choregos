@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}live frames · recorder · choregos{% endblock %}
+{% block content %}
+{% let tab = "live" %}
+<div class="page-h">
+  <h1>Recorder</h1>
+  {% include "partials/recorder_nav.html" %}
+  <span class="grow"></span>
+  {% if stream_url.is_some() %}<span class="chip ok"><span class="dot"></span>stream</span>{% else %}<span class="chip dim">paused</span>{% endif %}
+</div>
+<form class="panel filters" method="get" action="/recorder/live">
+  <a class="chip {% if stream_url.is_some() %}info{% else %}dim{% endif %}" href="{{ follow_url }}" title="{% if stream_url.is_some() %}Freeze the list{% else %}Reload to now and follow{% endif %}">follow {% if stream_url.is_some() %}on{% else %}off{% endif %}</a>
+  <label>LA <input name="la" value="{{ filter.la_text() }}" inputmode="numeric" size="3" placeholder="0–15"></label>
+  <label>opcode <input name="opcode" value="{{ filter.opcode_text() }}" class="mono" size="4" placeholder="82"></label>
+  <label class="check"><input type="checkbox" name="hide_decisions"{% if filter.hide_decisions %} checked{% endif %}> hide decisions</label>
+  {% if stream_url.is_none() %}<input type="hidden" name="follow" value="off">{% endif %}
+  <button type="submit" class="btn sm">Filter</button>
+  <a href="/recorder/live">Clear</a>
+  <span class="hint live">{% if let Some(oldest) = oldest %}from {{ view::when(oldest) }} · {% endif %}{{ frames }} frames in memory (~6 h) · newest first</span>
+</form>
+<div class="panel scroll"{% if let Some(url) = stream_url %} hx-ext="sse" sse-connect="{{ url }}"{% endif %}>
+  {# `reset` (on every (re)connect or lag) replaces the table from the server's buffer; #}
+  {# `row` prepends one live frame or decision. #}
+  {% if stream_url.is_some() %}<div hidden sse-swap="reset" hx-target="#bus-rows" hx-swap="innerHTML"></div>{% endif %}
+  <table class="grid bus">
+    <thead><tr><th scope="col">time</th><th scope="col">dir</th><th scope="col">from</th><th scope="col">to</th><th scope="col">op</th><th scope="col">name</th><th scope="col">operands</th></tr></thead>
+    <tbody id="bus-rows"{% if stream_url.is_some() %} sse-swap="row" hx-swap="afterbegin"{% endif %}>
+      {% include "partials/bus_rows.html" %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
