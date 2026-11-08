@@ -3778,7 +3778,7 @@ async fn timeline_renders_lanes_at_percent_positions_from_memory() {
     );
     assert_eq!(lanes.matches("data-seq=").count(), 4, "{lanes}");
     assert!(lanes.contains("data-id=\"30\"") && lanes.contains("data-id=\"31\""));
-    assert!(lanes.contains("aria-label=\"30 Test Streamer woke; console_b taken over — partial\""));
+    assert!(lanes.contains("<title>30 Test Streamer woke; console_b taken over — partial · "));
     assert!(html.contains("frames from memory · <span id=\"tl-n-frames\">4</span> frames"));
     // Each address and observation track is an image named by its summary, with its
     // frames or runs as a visually hidden text list.

@@ -26,15 +26,15 @@
         </svg></div>
         <div class="lane decisions"><span class="lbl k">Decisions</span><svg class="track" height="36" id="tl-marks" role="img" aria-label="Decisions · {{ t.lanes.decisions.len() }} in this window">
           {%- for m in t.lanes.decisions %}
-          {%- if m.linked %}<a class="mk {{ m.class }}{% if m.selected %} selected{% endif %}" href="/recorder/{{ m.id }}" data-id="{{ m.id }}" aria-label="{{ m.id }} {{ m.headline }}">{% else %}<g class="mk {{ m.class }}" data-id="{{ m.id }}" role="img" aria-label="{{ m.id }} {{ m.headline }}">{% endif -%}
-          <title>{{ m.title }}</title><svg x="{{ view::timeline::pct(m.x) }}%" y="18" overflow="visible" data-t="{{ view::iso(m.at) }}"><rect class="dia" x="-6" y="-6" width="12" height="12" transform="rotate(45)"></rect>{% if m.show_id %}<text x="11" y="4">{{ m.id }}</text>{% endif %}</svg>
+          {%- if m.linked %}<a class="mk {{ m.class }}{% if m.selected %} selected{% endif %}" href="/recorder/{{ m.id }}" data-id="{{ m.id }}">{% else %}<g class="mk {{ m.class }}" data-id="{{ m.id }}">{% endif -%}
+          <title>{{ m.id }} {{ m.headline }} · {{ m.title }}</title><svg x="{{ view::timeline::pct(m.x) }}%" y="18" overflow="visible" data-t="{{ view::iso(m.at) }}" aria-hidden="true"><rect class="dia" x="-6" y="-6" width="12" height="12" transform="rotate(45)"></rect>{% if m.show_id %}<text x="11" y="4">{{ m.id }}</text>{% endif %}</svg>
           {%- if m.linked %}</a>{% else %}</g>{% endif %}
           {%- endfor %}
         </svg></div>
         {%- for lane in t.lanes.addresses %}
         <div class="lane addr{% if lane.focus %} focus{% endif %}" data-la="{{ lane.la }}"><span class="lbl mono">{{ lane.la }} <span class="dim">{{ lane.name }}</span></span><svg class="track" height="32" role="img" aria-label="{{ lane.summary }}">
           {%- if let Some(empty) = lane.empty %}<text class="empty" x="8" y="20">{{ empty }}</text>{% endif %}
-          {%- for tick in lane.ticks %}<rect class="tk {{ tick.kind }}" x="{{ view::timeline::pct(tick.x) }}%" y="{{ tick.y() }}" width="{{ tick.width() }}" height="{{ tick.height() }}" data-seq="{{ tick.seq }}" data-t="{{ view::iso(tick.at) }}"><title>{{ tick.title }}</title></rect>{% if let Some(note) = tick.note %}<svg x="{{ view::timeline::pct(tick.x) }}%" y="0" overflow="visible" data-t="{{ view::iso(tick.at) }}"><text class="tk-note" x="6" y="21">{{ note }}</text></svg>{% endif %}{% endfor -%}
+          {%- for tick in lane.ticks %}<rect class="tk {{ tick.kind }}" x="{{ view::timeline::pct(tick.x) }}%" y="{{ tick.y() }}" width="{{ tick.width() }}" height="{{ tick.height() }}" data-seq="{{ tick.seq }}" data-t="{{ view::iso(tick.at) }}"><title>{{ tick.title }}</title></rect>{% if let Some(note) = tick.note %}<svg x="{{ view::timeline::pct(tick.x) }}%" y="0" overflow="visible" data-t="{{ view::iso(tick.at) }}" aria-hidden="true"><text class="tk-note" x="6" y="21">{{ note }}</text></svg>{% endif %}{% endfor -%}
         </svg>{% if !lane.ticks.is_empty() %}<ul class="sr-only">{% for tick in lane.ticks %}<li>{{ tick.line }}</li>{% endfor %}</ul>{% endif %}</div>
         {%- endfor %}
         {%- for lane in t.lanes.observations %}
