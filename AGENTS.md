@@ -8,7 +8,7 @@ review in `docs/decisions.md` (date, what, why).
 - The engine (`src/engine.rs`, `src/cec/*`, `src/identity.rs`) is pure: no I/O, no clocks, no globals. Time is an injected `now`.
 - Shadow mode must never cause a side effect other than identification queries and the startup resync. Enforce it in the executor, not in callers.
 - Secrets only from environment variables; never in the config file, logs, UI, or tests. Redact on every output path.
-- No JavaScript build step: htmx + askama templates + one CSS file. Vendored htmx lives in `src/web/static/` with its version in the filename.
+- No JavaScript build step: htmx + askama templates + one CSS file, plus one vendored recorder script. Vendored htmx lives in `src/web/static/` with its version in the filename.
 - Version in `Cargo.toml` stays `0.0.0`; releases are tags.
 - Tests: behaviour, boundaries, transitions, error paths. No tests of wiring, copies, or defaults. Fixture replays live in `tests/replay.rs`.
 - Engine changes that alter golden output must re-bless `tests/golden/` and explain the behaviour change in the same PR.

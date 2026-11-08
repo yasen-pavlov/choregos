@@ -878,7 +878,20 @@ action "Would …".
   name, operands) interleaved with decisions; filters by LA/opcode; last 2000
   kept in memory (ring buffer in `AppState`); `follow=off` renders without the
   stream. `/recorder/glossary` lists every reason literal by group with its
-  sentence. The timeline (`/recorder/timeline`) is a later slice.
+  sentence. `/recorder/timeline?at&zoom&select` draws one window (1 m to 1 h,
+  trace day files else memory) as lanes: the room's intent replayed from the ring,
+  decision markers coloured by verdict, one lane per logical address (frames by
+  sender, presence polls by target; bound roles shown when silent) and the
+  TV / receiver / probe observation runs with their settle notes; positions are
+  server-side percentages, so it is complete without JavaScript, and each address
+  and observation lane carries an accessible name and a visually hidden text list
+  of its frames or runs; `select` opens the side panel (`/p/timeline/select/{id}`);
+  `/p/timeline` is the block the zoom and pan links swap (`at=now` keeps the live
+  edge with a selection); `/p/timeline/window.json?from&to` (≤ 1 h, ≤ 5000
+  entries) is the same window as JSON. Phones get a "desk only" note. The one
+  vendored script (`recorder-<n>.js`, Recorder pages only) adds keys, hover cards
+  and live tail (frame ticks appended from the SSE stream; the block re-fetched on
+  every decision, reset and 30 s).
 - `/devices` Registry, polled every 5 s (`/p/devices`): roles, outputs (TV,
   receiver with its audio-system CEC entry, speakers), the bridge and unbound bus
   entries, each with kind, LA · PA, vendor · OSD, identity (bound / restored /

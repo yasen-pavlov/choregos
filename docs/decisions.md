@@ -2,6 +2,62 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-08 — Phase 2 slice 5: Recorder timeline and the recorder script
+
+- One vendored, hand-written script, `src/web/static/recorder-2.js` (no dependencies, no
+  build step, served like htmx with a version suffix and an immutable cache header; bump
+  the suffix on any change). It loads only on Recorder pages (`{% block scripts %}` in
+  `base.html`) and adds: list keys (`/` filter, `j`/`k` row focus, `Enter` open, `t`
+  timeline), timeline keys (`-`/`+` zoom, `←`/`→` pan by clicking the toolbar links,
+  `[`/`]` select the previous/next decision into the side panel, `Esc` close), hover/tap
+  cards that show an element's own SVG `<title>` text, and live tail. It sets SSE text
+  with `textContent` only, reads SSE rows through `DOMParser`, uses no `eval`, and is one
+  IIFE; server HTML enters the page only as htmx-swapped partials.
+- No-JS baseline: every position is a server-side percentage written as an SVG attribute
+  (`x="18.10%"`), so the timeline is complete without the script and without inline
+  styles; zoom, pan, close and the decision links are ordinary links (htmx swaps the
+  `#timeline` block when it is there); the live-tail checkbox renders disabled.
+- Window: `at` is the centre; without `at` the window centres on `select`, else it ends
+  now (the live edge) rather than centring on now, so half the default view is not the
+  future and live tail appends at the right edge. `at=now` keeps the live edge even with a
+  selection (the zoom links of such a window carry it, and so does live tail's re-fetch).
+  Pan steps a tenth of the zoom; "→" is disabled at the live edge. Trace day files first,
+  memory otherwise (the slice-2 reader, now shared and with no focal decision); every
+  ring decision in the window tags its trigger and settles its observations.
+- Lanes: the room band replays intent from the ring as the engine sets it (a role on
+  turns the room on with it; the active role off leaves it on with no role; the off timer
+  turns it off; `service_started` forgets it). `record_would` rows are skipped: they say
+  what a `would` start policy would have done, never the intent (`late_announcement`
+  would-rows always, since a real one stops a role that is not active; `console_start*`
+  would-rows in their Off → Off shape only, since shadow mode marks real transitions
+  `would` too and those always change power). The receiver input is named only from a
+  recorded `media_player.select_source` action on a row (its `source`), never from the
+  current config, so with `select_source = false` no input is shown; the first input of
+  the role already on is named inside its band rather than starting one. Frames sit in
+  their sender's lane, presence polls in their target's. Observation lanes take TV,
+  receiver and probe samples; with no sample in the window a lane shows the device's
+  current sample from when it was taken (memory holds no history). Home Assistant
+  observations get no lane.
+- Accessibility: the room, address and observation tracks are `role="img"` with a
+  summary as their name (`LA 11 Console · 4 frames · trigger at :40.8`, `tv · webos:
+  unreachable → on at :56.4`); each address and observation lane also renders a
+  visually hidden list of its frames (`time from→to opcode meaning`) or runs as the text
+  alternative. Markers stay links with their headline as `aria-label`. The header counts
+  are the drawn ticks and markers.
+- Ticks for our own frames are drawn in the text colour, not amber (board 06: amber
+  marks shadow only).
+- `/p/timeline/window.json?from&to` returns the window's entries (frames with tags,
+  observations, decisions) and lanes (`WindowJson`), bounded to an hour and 5000 entries
+  like the bus window. The script does not use it.
+- Live tail keeps no model of its own: frames from the SSE stream are appended as ticks
+  and everything slides each second; every decision row and every reset (connect,
+  reconnect, lag, settled verdict) re-fetches `/p/timeline?at=now&zoom&select`
+  (debounced 500 ms, one request at a time; a response is dropped when the tail stopped or
+  another swap replaced the window meanwhile), and so does a 30 s timer for observation
+  runs. Ticks that streamed in while a re-fetch was in flight are put back unless the
+  partial already has them. Room bands, markers, verdicts, observations, the lane text and
+  counts therefore always come from the server.
+
 ## 2026-11-08 — Phase 2 slice 4: Config
 
 - Document-preserving edits: the form never serialises `Config` back to text. Each edit

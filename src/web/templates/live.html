@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}live frames · recorder · choregos{% endblock %}
+{% block scripts %}<script src="/static/{{ crate::web::RECORDER_JS }}" defer></script>{% endblock %}
 {% block content %}
 {% let tab = "live" %}
 <div class="page-h">

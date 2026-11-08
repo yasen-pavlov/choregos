@@ -6,6 +6,7 @@
 pub(crate) mod config;
 pub(crate) mod devices;
 pub(crate) mod recorder;
+pub(crate) mod timeline;
 pub(crate) mod window;
 
 use chrono::{DateTime, Utc};

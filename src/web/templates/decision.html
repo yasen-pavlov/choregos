@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}#{{ decision.id }} · recorder · choregos{% endblock %}
+{% block scripts %}<script src="/static/{{ crate::web::RECORDER_JS }}" defer></script>{% endblock %}
 {% block content %}
 {% let tab = "decisions" %}
 <div class="page-h">
@@ -132,6 +133,7 @@
     <section class="panel flush" id="neighbours" aria-label="Neighbours">
       <div class="ph"><h2 class="grow">Neighbours</h2></div>
       <div class="pb stack small">
+        <a class="desk-only" href="/recorder/timeline?select={{ decision.id }}">Open in timeline →</a>
         {% if let Some(role) = decision.role %}{% let name = role_name.as_deref().unwrap_or(role) %}
         <a href="/recorder?role={{ role|urlencode }}">Other decisions for {{ name }} →</a>
         {% endif %}

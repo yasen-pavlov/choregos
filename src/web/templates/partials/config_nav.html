@@ -4,7 +4,7 @@
     <li>{% include "partials/config_nav_link.html" %}</li>
     {%- endfor %}
   </ul>
-  {#- Phones get the same links in a disclosure, not a <select>: a link asks before leaving
+  {#- Phones get the same links in a disclosure, not a select element: a link asks before leaving
       pending edits and, on cancel, nothing has moved; a select would already show the new
       section, and no script may put it back. -#}
   <details class="phone-only cfg-pick">

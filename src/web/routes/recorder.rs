@@ -253,9 +253,69 @@ pub(crate) struct WindowQuery {
     set: Option<String>,
 }
 
-enum Source {
+pub(super) enum Source {
     Trace(Vec<String>),
     Memory,
+}
+
+impl Source {
+    /// `memory`, `the trace file x`, `the trace files x and y`.
+    pub(super) fn words(&self) -> String {
+        match self {
+            Self::Trace(files) => format!(
+                "the trace file{} {}",
+                if files.len() > 1 { "s" } else { "" },
+                files.join(" and ")
+            ),
+            Self::Memory => "memory".to_owned(),
+        }
+    }
+}
+
+/// A window's entries in time order, where they came from, whether the trace read hit its
+/// cap, and the trace retention it was read under.
+pub(super) struct Read {
+    pub(super) entries: Vec<Entry>,
+    pub(super) source: Source,
+    pub(super) truncated: bool,
+    pub(super) keep_days: u32,
+}
+
+/// The window `[from, to]` from the trace day files that cover it, else from memory.
+/// `focus` is the decision the window is about, if any (it is always a row).
+pub(super) async fn read(
+    web: &WebState,
+    snapshot: &Snapshot,
+    focus: Option<&DecisionView>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Read {
+    let keep_days =
+        Config::parse(&web.app.config_text()).map_or(0, |config| config.trace.keep_days);
+    if let Some((directory, files)) = trace_files(web.app.trace_directory(), keep_days, from, to) {
+        match tokio::task::spawn_blocking(move || {
+            trace::read_window(&directory, from, to, trace::ReadBudget::WINDOW)
+        })
+        .await
+        {
+            Ok(Ok(read)) => {
+                return Read {
+                    entries: window::from_trace(read.entries, snapshot, focus),
+                    source: Source::Trace(files),
+                    truncated: read.truncated,
+                    keep_days,
+                };
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "cannot read the bus trace; using memory"),
+            Err(error) => tracing::warn!(%error, "trace reader failed; using memory"),
+        }
+    }
+    Read {
+        entries: window::from_memory(snapshot, focus, from, to),
+        source: Source::Memory,
+        truncated: false,
+        keep_days,
+    }
 }
 
 #[derive(Template)]
@@ -325,32 +385,14 @@ pub(crate) async fn window(
     }
     let from = decision.timestamp + TimeDelta::seconds(from_s);
     let to = decision.timestamp + TimeDelta::seconds(to_s);
-    let keep_days =
-        Config::parse(&web.app.config_text()).map_or(0, |config| config.trace.keep_days);
-
-    let mut truncated = false;
-    let mut source = Source::Memory;
-    let mut entries = None;
-    if let Some((directory, files)) = trace_files(web.app.trace_directory(), keep_days, from, to) {
-        match tokio::task::spawn_blocking(move || {
-            trace::read_window(&directory, from, to, trace::ReadBudget::WINDOW)
-        })
-        .await
-        {
-            Ok(Ok(read)) => {
-                truncated = read.truncated;
-                entries = Some(window::from_trace(read.entries, &snapshot, &decision));
-                source = Source::Trace(files);
-            }
-            Ok(Err(error)) => tracing::warn!(%error, "cannot read the bus trace; using memory"),
-            Err(error) => tracing::warn!(%error, "trace reader failed; using memory"),
-        }
-    }
-    let mut entries =
-        entries.unwrap_or_else(|| window::from_memory(&snapshot, &decision, from, to));
+    let Read {
+        mut entries,
+        source,
+        truncated,
+        keep_days,
+    } = read(&web, &snapshot, Some(&decision), from, to).await;
     window::tag(&mut entries, &decision, snapshot.bridge_logical_address);
     window::settle(&mut entries, &decision, &snapshot);
-
     let frames = entries
         .iter()
         .filter(|entry| matches!(entry.item, Item::Frame(_)))
@@ -363,15 +405,14 @@ pub(crate) async fn window(
         Item::Decision(_) => true,
     });
     let footer = match source {
-        Source::Trace(files) => format!(
-            "{} the trace file{} {}.",
+        Source::Trace(_) => format!(
+            "{} {}.",
             if frames == 0 {
                 "No frames for this window in"
             } else {
                 "Frames from"
             },
-            if files.len() > 1 { "s" } else { "" },
-            files.join(" and ")
+            source.words()
         ),
         Source::Memory if frames == 0 => format!(
             "No bus record for this window: it is not in memory (last ~6 h) and there is no trace file for that day (trace kept {keep_days} days)."

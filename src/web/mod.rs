@@ -29,6 +29,8 @@ use crate::state::AppState;
 
 pub(crate) const HTMX_JS: &str = "htmx-2.0.11.min.js";
 pub(crate) const HTMX_SSE_JS: &str = "htmx-ext-sse-2.2.4.min.js";
+/// The one hand-written script, loaded on Recorder pages only; bump the suffix on change.
+pub(crate) const RECORDER_JS: &str = "recorder-2.js";
 pub(crate) const STYLESHEET: &str = "choregos.css";
 
 const SESSION_COOKIE: &str = "choregos_session";
@@ -78,6 +80,13 @@ pub fn router(state: AppState) -> Router {
         .route("/recorder/glossary", get(routes::recorder::glossary))
         .route("/recorder/live", get(routes::live::page))
         .route("/recorder/live/events", get(routes::live::events))
+        .route("/recorder/timeline", get(routes::timeline::page))
+        .route("/p/timeline", get(routes::timeline::block))
+        .route(
+            "/p/timeline/window.json",
+            get(routes::timeline::window_json),
+        )
+        .route("/p/timeline/select/{id}", get(routes::timeline::selected))
         .route("/recorder/{id}", get(routes::recorder::detail))
         .route("/p/window/{id}", get(routes::recorder::window))
         .route("/devices", get(routes::devices::page))

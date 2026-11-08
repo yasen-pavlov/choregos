@@ -7,6 +7,7 @@ pub(crate) mod config;
 pub(crate) mod devices;
 pub(crate) mod live;
 pub(crate) mod recorder;
+pub(crate) mod timeline;
 
 use axum::{
     Json,
@@ -15,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{HTMX_JS, HTMX_SSE_JS, STYLESHEET, WebError};
+use super::{HTMX_JS, HTMX_SSE_JS, RECORDER_JS, STYLESHEET, WebError};
 use crate::state::{AppState, Health};
 
 pub(crate) async fn healthz(State(state): State<AppState>) -> Json<Health> {
@@ -33,6 +34,11 @@ pub(crate) async fn asset(Path(file): Path<String>) -> Result<Response, WebError
         ),
         HTMX_SSE_JS => (
             include_str!("../static/htmx-ext-sse-2.2.4.min.js"),
+            "text/javascript; charset=utf-8",
+            IMMUTABLE,
+        ),
+        RECORDER_JS => (
+            include_str!("../static/recorder-2.js"),
             "text/javascript; charset=utf-8",
             IMMUTABLE,
         ),

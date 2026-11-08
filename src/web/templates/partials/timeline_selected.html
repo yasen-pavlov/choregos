@@ -1,0 +1,19 @@
+<aside id="selected" class="panel flush tl-side" aria-label="Selected decision">
+{%- if let Some(s) = selected %}
+  <div class="ph"><span class="k grow">Selected</span><a class="btn sm ghost" href="{{ s.close.page }}" hx-get="{{ s.close.partial }}" hx-target="#timeline" hx-swap="outerHTML" hx-push-url="{{ s.close.page }}" aria-label="Clear selection" data-close>{{ s.close.label }}</a></div>
+  <div class="pb stack">
+    <div class="row"><span class="mono sel-id">#{{ s.decision.id }}</span><span class="grow"></span>{% if s.decision.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(s.decision.verdict) }}">{{ s.decision.verdict }}</span>{% endif %}</div>
+    <strong>{{ s.headline }}</strong>
+    <div class="mono dim">{{ s.when }}<br>{{ s.trigger }}</div>
+    {%- if !s.expectations.is_empty() %}
+    <ul class="sel-exp">
+      {%- for e in s.expectations %}
+      <li><span class="mono grow">{{ e.name }} {{ e.expect }}</span><span class="chip {{ e.tone }}">{{ e.outcome }}</span>{% if let Some(latency) = e.latency %}<span class="mono num">{{ latency }}</span>{% endif %}</li>
+      {%- endfor %}
+    </ul>
+    {%- endif %}
+    <div class="dim small">Actions: {{ s.actions }}{% for child in s.children %} · child <a class="mono" href="/recorder/{{ child }}">#{{ child }}</a>{% endfor %}</div>
+    <a class="button btn block" href="/recorder/{{ s.decision.id }}">Open decision</a>
+  </div>
+{%- endif -%}
+</aside>

@@ -7,6 +7,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::Serialize;
 use serde_json::Value;
 
 use super::{hex_bytes, latency, recorder::la_name};
@@ -28,7 +29,8 @@ const REPLY_WITHIN: TimeDelta = TimeDelta::seconds(1);
 /// How close an observation must be to `timestamp + latency_ms` to have settled it.
 const SETTLE_SLACK: TimeDelta = TimeDelta::milliseconds(1500);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Dir {
     Rx,
     Tx,
@@ -45,7 +47,8 @@ impl Dir {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Tag {
     /// The frame that caused the decision.
     Trigger,
@@ -76,6 +79,7 @@ impl Tag {
     }
 }
 
+#[derive(Serialize)]
 pub(crate) struct WindowFrame {
     pub(crate) dir: Dir,
     pub(crate) from: u8,
@@ -166,6 +170,7 @@ fn send_word(word: &str, attempts: Option<u8>) -> String {
 }
 
 /// A device observation from the trace (direct pollers or Home Assistant).
+#[derive(Serialize)]
 pub(crate) struct Observation {
     /// The trace topic: `tv/state`, `receiver/state`, `probe/state`, `ha/state`.
     pub(crate) topic: &'static str,
@@ -222,6 +227,7 @@ impl Observation {
 }
 
 /// A decision row inside the window.
+#[derive(Serialize)]
 pub(crate) struct WindowDecision {
     pub(crate) id: u64,
     pub(crate) timestamp: DateTime<Utc>,
@@ -236,14 +242,18 @@ pub(crate) struct WindowDecision {
     pub(crate) linked: bool,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Item {
     Frame(WindowFrame),
     Obs(Observation),
     Decision(WindowDecision),
 }
 
+#[derive(Serialize)]
 pub(crate) struct Entry {
     pub(crate) at: DateTime<Utc>,
+    #[serde(flatten)]
     pub(crate) item: Item,
 }
 
@@ -251,7 +261,8 @@ fn in_range(at: DateTime<Utc>, from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
     from <= at && at <= to
 }
 
-fn ring_decision(decision: &DecisionView, own: &DecisionView) -> WindowDecision {
+/// A ring row as a window row; `own` when it is the decision the window is about.
+fn ring_decision(decision: &DecisionView, own: Option<&DecisionView>) -> WindowDecision {
     WindowDecision {
         id: decision.id,
         timestamp: decision.timestamp,
@@ -260,15 +271,16 @@ fn ring_decision(decision: &DecisionView, own: &DecisionView) -> WindowDecision 
         verdict: decision.verdict,
         would: decision.would,
         parent: decision.parent,
-        own: decision.id == own.id && decision.timestamp == own.timestamp,
+        own: own.is_some_and(|own| decision.id == own.id && decision.timestamp == own.timestamp),
         linked: true,
     }
 }
 
-/// The window from the in-memory frames and ring; memory holds no observations.
+/// The window from the in-memory frames and ring; memory holds no observations. `decision`
+/// is the row the window is about (the timeline has none).
 pub(crate) fn from_memory(
     snapshot: &Snapshot,
-    decision: &DecisionView,
+    decision: Option<&DecisionView>,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<Entry> {
@@ -345,11 +357,12 @@ fn trace_decision(at: DateTime<Utc>, payload: &Value) -> Option<WindowDecision> 
 /// go through one fresh correlation, as in replay: a send outcome becomes the result of
 /// the send the adapter matched it to (Tasmota FIFO position, aether id), directed NACKs
 /// keep their full bytes, local replies are `local` rows and an aether host transmission
-/// with no recorded send is still an `ours` row. The decision itself is always a row.
+/// with no recorded send is still an `ours` row. The decision the window is about, when
+/// there is one, is always a row.
 pub(crate) fn from_trace(
     records: Vec<(DateTime<Utc>, TraceEntry)>,
     snapshot: &Snapshot,
-    decision: &DecisionView,
+    decision: Option<&DecisionView>,
 ) -> Vec<Entry> {
     let start = Instant::now();
     let epoch = records.first().map(|(at, _)| *at);
@@ -529,13 +542,14 @@ fn settle_trace_verdict(entries: &mut [Entry], payload: &Value) {
 /// A trace row is the ring row only when the time matches too; the ring's verdict is the
 /// newest. The viewed decision is known from the ring, so it is a row exactly once even
 /// when the trace lacks its creation line (capture began later, or the line was dropped).
-fn link_ring_rows(entries: &mut Vec<Entry>, snapshot: &Snapshot, decision: &DecisionView) {
+fn link_ring_rows(entries: &mut Vec<Entry>, snapshot: &Snapshot, decision: Option<&DecisionView>) {
     let mut own = false;
     for entry in entries.iter_mut() {
         let Item::Decision(row) = &mut entry.item else {
             continue;
         };
-        row.own = row.id == decision.id && row.timestamp == decision.timestamp;
+        row.own = decision
+            .is_some_and(|decision| row.id == decision.id && row.timestamp == decision.timestamp);
         own |= row.own;
         if let Some(ring) = snapshot
             .decisions
@@ -546,7 +560,7 @@ fn link_ring_rows(entries: &mut Vec<Entry>, snapshot: &Snapshot, decision: &Deci
             row.linked = true;
         }
     }
-    if !own {
+    if let Some(decision) = decision.filter(|_| !own) {
         let index = entries
             .iter()
             .position(|entry| entry.at > decision.timestamp)
@@ -555,7 +569,7 @@ fn link_ring_rows(entries: &mut Vec<Entry>, snapshot: &Snapshot, decision: &Deci
             index,
             Entry {
                 at: decision.timestamp,
-                item: Item::Decision(ring_decision(decision, decision)),
+                item: Item::Decision(ring_decision(decision, Some(decision))),
             },
         );
     }
@@ -565,6 +579,12 @@ fn link_ring_rows(entries: &mut Vec<Entry>, snapshot: &Snapshot, decision: &Deci
 /// ±2 s), ours (sent or answered locally), replies (to the bridge within 1 s after one of
 /// ours) and the rest.
 pub(crate) fn tag(entries: &mut [Entry], decision: &DecisionView, bridge: u8) {
+    tag_frames(entries, bridge);
+    mark_trigger(entries, decision);
+}
+
+/// Tags every frame ours, reply or other, by direction and timing alone.
+pub(crate) fn tag_frames(entries: &mut [Entry], bridge: u8) {
     let mut last_ours: Option<DateTime<Utc>> = None;
     for entry in entries.iter_mut() {
         let Item::Frame(frame) = &mut entry.item else {
@@ -584,12 +604,15 @@ pub(crate) fn tag(entries: &mut [Entry], decision: &DecisionView, bridge: u8) {
             Dir::Rx => Tag::Other,
         };
     }
+}
+
+/// Tags the decision's trigger frame (equal to its trigger, closest within ±2 s) and
+/// returns its index.
+pub(crate) fn mark_trigger(entries: &mut [Entry], decision: &DecisionView) -> Option<usize> {
     let Trigger::Frame { from, to, data } = &decision.trigger else {
-        return;
+        return None;
     };
-    let Ok(bytes) = hex::decode(data) else {
-        return;
-    };
+    let bytes = hex::decode(data).ok()?;
     let distance = |at: DateTime<Utc>| (at - decision.timestamp).abs();
     let trigger = entries
         .iter()
@@ -600,10 +623,11 @@ pub(crate) fn tag(entries: &mut [Entry], decision: &DecisionView, bridge: u8) {
                 if frame.dir == Dir::Rx && frame.from == *from && frame.to == *to && frame.bytes == bytes)
         })
         .min_by_key(|(_, entry)| distance(entry.at))
-        .map(|(index, _)| index);
-    if let Some(Item::Frame(frame)) = trigger.map(|index| &mut entries[index].item) {
+        .map(|(index, _)| index)?;
+    if let Item::Frame(frame) = &mut entries[trigger].item {
         frame.tag = Tag::Trigger;
     }
+    Some(trigger)
 }
 
 /// The Home Assistant entity an expectation subject is read from, when it has one.
@@ -1160,7 +1184,7 @@ mod tests {
             timestamp: t0(),
             ..wake()
         };
-        let entries = from_trace(records, &snapshot, &decision);
+        let entries = from_trace(records, &snapshot, Some(&decision));
         let shape = shape(&entries);
         assert_eq!(
             shape,
@@ -1240,7 +1264,7 @@ mod tests {
             (ms(50), result(json!({"Ack": true}))),
         ];
         assert_eq!(
-            frames(&from_trace(tasmota, &snapshot, &decision)),
+            frames(&from_trace(tasmota, &snapshot, Some(&decision))),
             ["tx 0→4 8F -", "tx 0→4 8F nack", "tx 0→4 8F ack"]
         );
         // aether answers by id, here out of order: the second send fails first.
@@ -1262,7 +1286,7 @@ mod tests {
             (ms(30), aether(2, "s-1", "ack")),
         ];
         assert_eq!(
-            frames(&from_trace(records, &snapshot, &decision)),
+            frames(&from_trace(records, &snapshot, Some(&decision))),
             ["tx 0→4 8F ack", "tx 0→4 8F nack"]
         );
     }
@@ -1296,7 +1320,7 @@ mod tests {
                 },
             ),
         ];
-        let mut entries = from_trace(records, &snapshot, &decision);
+        let mut entries = from_trace(records, &snapshot, Some(&decision));
         tag(&mut entries, &decision, snapshot.bridge_logical_address);
         assert_eq!(
             frames(&entries),
@@ -1310,7 +1334,7 @@ mod tests {
         let snapshot = snapshot();
         let decision = wake();
         let records = vec![(ms(-100), sent(None)), (ms(5), sent(None))];
-        let rows = shape(&from_trace(records, &snapshot, &decision));
+        let rows = shape(&from_trace(records, &snapshot, Some(&decision)));
         assert_eq!(
             rows,
             [
@@ -1320,7 +1344,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            shape(&from_trace(vec![], &snapshot, &decision)),
+            shape(&from_trace(vec![], &snapshot, Some(&decision))),
             ["#844 ReportPhysicalAddress achieved own=true linked=true"]
         );
         // With its creation line, it is not added again.
@@ -1328,7 +1352,7 @@ mod tests {
         let rows = shape(&from_trace(
             vec![(ms(0), TraceEntry::Decision(line))],
             &snapshot,
-            &decision,
+            Some(&decision),
         ));
         assert_eq!(rows.len(), 1, "{rows:?}");
     }

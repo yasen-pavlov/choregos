@@ -1961,6 +1961,8 @@ async fn pages_render_and_reference_served_assets() {
         "/devices/out/bridge",
         "/recorder",
         "/recorder/glossary",
+        "/recorder/timeline",
+        "/p/timeline",
         "/config",
         "/config?tab=raw",
         "/p/cockpit",
@@ -1990,14 +1992,17 @@ async fn pages_render_and_reference_served_assets() {
             "{bad}"
         );
     }
-    let html = body(h.get("/", Some(&cookie)).await).await;
-    let assets: Vec<&str> = html
-        .match_indices("/static/")
-        .map(|(start, _)| between(&html[start..], "", "\""))
-        .collect();
-    assert_eq!(assets.len(), 3);
-    for asset in assets {
-        assert_eq!(h.get(asset, None).await.status(), StatusCode::OK, "{asset}");
+    // Every page loads the stylesheet and htmx; Recorder pages add the recorder script.
+    for (page, count) in [("/", 3), ("/recorder", 4)] {
+        let html = body(h.get(page, Some(&cookie)).await).await;
+        let assets: Vec<&str> = html
+            .match_indices("/static/")
+            .map(|(start, _)| between(&html[start..], "", "\""))
+            .collect();
+        assert_eq!(assets.len(), count, "{page}");
+        for asset in assets {
+            assert_eq!(h.get(asset, None).await.status(), StatusCode::OK, "{asset}");
+        }
     }
     assert_eq!(
         h.get("/static/missing.js", None).await.status(),
@@ -3709,4 +3714,298 @@ async fn anonymous_session_flood_does_not_displace_a_logged_in_user() {
         assert_eq!(h.get("/login/local", None).await.status(), StatusCode::OK);
     }
     assert_eq!(h.get("/", Some(&cookie)).await.status(), StatusCode::OK);
+}
+
+fn iso(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// The bus-window memory fixture (frame_wake plus frames around it), published.
+fn timeline_snapshot(h: &Harness) -> chrono::DateTime<chrono::Utc> {
+    let mut snapshot = h.state.snapshot();
+    let ring = frame_wake();
+    let at = ring[0].timestamp;
+    snapshot.recent_frames.extend([
+        wire(at, -1_000, FrameDirection::Sent, (0, 4), &[]),
+        wire(
+            at,
+            5,
+            FrameDirection::Received,
+            (4, 15),
+            &[0x82, 0x21, 0x00],
+        ),
+        wire(at, 500, FrameDirection::Received, (5, 4), &[0x46]),
+        wire(at, 1_000, FrameDirection::Sent, (0, 8), &[0x8F]),
+        // Outside a one-minute window around the wake.
+        wire(at, -120_000, FrameDirection::Received, (5, 15), &[0x87]),
+    ]);
+    snapshot.decisions.extend(ring);
+    h.state.publish(snapshot, []);
+    at
+}
+
+#[tokio::test]
+async fn timeline_renders_lanes_at_percent_positions_from_memory() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let at = timeline_snapshot(&h);
+    // The TV's current sample, taken before the window: memory's only observation.
+    let mut snapshot = h.state.snapshot();
+    snapshot.tv_direct = Some((
+        crate::state::DirectPower::On,
+        at - chrono::TimeDelta::seconds(10),
+    ));
+    h.state.publish(snapshot, []);
+    let html = ok_page(
+        &h,
+        &cookie,
+        &format!("/recorder/timeline?at={}&zoom=1m", iso(at)),
+    )
+    .await;
+    let lanes = between(&html, "<div class=\"lanes\">", "<p class=\"legend");
+    // Lanes per address: the bridge's own sends, the poll in its target's lane, senders.
+    for la in ["0", "4", "5"] {
+        assert!(
+            lanes.contains(&format!("data-la=\"{la}\"")),
+            "lane {la}: {lanes}"
+        );
+    }
+    assert!(!lanes.contains("data-la=\"15\""), "broadcast is no lane");
+    // The wake sits in the middle, its trigger tick too; the minute-old frame is outside.
+    assert!(
+        lanes.contains("<rect class=\"tk trigger\" x=\"50.01%\""),
+        "{lanes}"
+    );
+    assert_eq!(lanes.matches("data-seq=").count(), 4, "{lanes}");
+    assert!(lanes.contains("data-id=\"30\"") && lanes.contains("data-id=\"31\""));
+    assert!(lanes.contains("aria-label=\"Test Streamer woke; console_b taken over — partial\""));
+    assert!(html.contains("frames from memory · <span id=\"tl-n-frames\">4</span> frames"));
+    // Each address and observation track is an image named by its summary, with its
+    // frames or runs as a visually hidden text list.
+    let lane = between(lanes, "data-la=\"4\">", "</div>");
+    assert!(
+        lane.contains("role=\"img\" aria-label=\"LA 4 · 2 frames · trigger at :"),
+        "{lane}"
+    );
+    let list = between(lane, "<ul class=\"sr-only\">", "</ul>");
+    assert_eq!(list.matches("<li>").count(), 2, "{list}");
+    assert!(list.contains(" 0→4 poll</li>"), "{list}");
+    assert!(
+        list.contains(" 4→15 82 Active Source · trigger of #30</li>"),
+        "{list}"
+    );
+    let tv = between(lanes, "data-obs=\"tv\">", "</div>");
+    assert!(
+        tv.contains("role=\"img\" aria-label=\"tv · webos: on\""),
+        "{tv}"
+    );
+    assert!(tv.contains("<ul class=\"sr-only\"><li>on · "), "{tv}");
+    // Every x is a percentage in [0, 100].
+    for (start, _) in lanes.match_indices(" x=\"") {
+        let value = between(&lanes[start..], " x=\"", "\"");
+        if let Some(percent) = value.strip_suffix('%') {
+            let percent: f64 = percent.parse().expect("numeric percentage");
+            assert!((0.0..=100.0).contains(&percent), "{value}");
+        }
+    }
+    // Nothing selected: the panel is an empty element. The phone note is rendered too.
+    assert!(html.contains("aria-label=\"Selected decision\"></aside>"));
+    assert!(html.contains("<h1>The timeline is desk only</h1>"));
+    assert!(!html.contains("Open decision #"));
+    // The Timeline tab is live and current; no inline styles anywhere.
+    assert!(html.contains("<a href=\"/recorder/timeline\" aria-current=\"page\">Timeline</a>"));
+    assert!(!html.contains("style="));
+    // The live-tail toggle needs the script.
+    assert!(html.contains(
+        "title=\"needs the recorder script\"><input type=\"checkbox\" id=\"tl-tail\" disabled>"
+    ));
+}
+
+#[tokio::test]
+async fn timeline_select_opens_the_panel_and_centres_on_the_decision() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let at = timeline_snapshot(&h);
+    let html = ok_page(&h, &cookie, "/recorder/timeline?select=30").await;
+    let half = chrono::TimeDelta::seconds(150);
+    assert!(
+        html.contains(&format!(
+            "data-from=\"{}\" data-to=\"{}\" data-zoom=\"5m\" data-at=\"{}\"",
+            iso(at - half),
+            iso(at + half),
+            iso(at)
+        )),
+        "{html}"
+    );
+    let panel = between(&html, "<aside id=\"selected\"", "</aside>");
+    assert!(
+        panel.contains("#30") && panel.contains("chip warn\">partial"),
+        "{panel}"
+    );
+    assert!(panel.contains("href=\"/recorder/30\">Open decision</a>"));
+    assert!(panel.contains("child <a class=\"mono\" href=\"/recorder/31\">#31</a>"));
+    assert!(panel.contains("tv.power on"), "{panel}");
+    assert!(html.contains("<a class=\"mk warn selected\" href=\"/recorder/30\""));
+    // The trigger's address lane is highlighted; zoom and pan keep the selection.
+    assert!(html.contains("<div class=\"lane addr focus\" data-la=\"4\">"));
+    let zoom = between(&html, "data-zoom=\"1m\" href=\"", "\"").replace("&#38;", "&");
+    assert!(zoom.ends_with("zoom=1m&select=30"), "{zoom}");
+    // `at=now` keeps the live edge with the selection, and its zoom links keep it too.
+    let edge = ok_page(&h, &cookie, "/p/timeline?at=now&zoom=1m&select=30").await;
+    assert!(edge.contains("data-zoom=\"1m\" data-at=\"\""), "{edge}");
+    assert!(edge.contains("<a class=\"mk warn selected\" href=\"/recorder/30\""));
+    let zoom = between(&edge, "data-zoom=\"5m\" href=\"", "\"").replace("&#38;", "&");
+    assert_eq!(zoom, "/recorder/timeline?at=now&zoom=5m&select=30");
+    assert!(
+        html.contains("Open decision #30</a>"),
+        "the phone note links the decision"
+    );
+    // The panel partial alone, for the [ and ] keys.
+    let partial = ok_page(&h, &cookie, "/p/timeline/select/31?zoom=1m").await;
+    assert!(partial.starts_with("<aside id=\"selected\""));
+    assert!(partial.contains("href=\"/recorder/31\">Open decision</a>"));
+    let close = between(&partial, "<a class=\"btn sm ghost\" href=\"", "\"");
+    assert_eq!(close, "/recorder/timeline?zoom=1m");
+    // The decision page links here.
+    let detail = ok_page(&h, &cookie, "/recorder/30").await;
+    assert!(detail.contains("href=\"/recorder/timeline?select=30\">Open in timeline →</a>"));
+}
+
+#[tokio::test]
+async fn timeline_query_is_validated_and_bounded() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let at = timeline_snapshot(&h);
+    for (path, status) in [
+        ("/recorder/timeline?zoom=2h", StatusCode::BAD_REQUEST),
+        ("/recorder/timeline?zoom=90s", StatusCode::BAD_REQUEST),
+        ("/p/timeline?at=yesterday", StatusCode::BAD_REQUEST),
+        ("/recorder/timeline?select=x", StatusCode::BAD_REQUEST),
+        ("/recorder/timeline?select=999", StatusCode::NOT_FOUND),
+        ("/p/timeline/select/999", StatusCode::NOT_FOUND),
+        ("/p/timeline/window.json", StatusCode::BAD_REQUEST),
+        (
+            "/p/timeline/window.json?from=x&to=y",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(h.get(path, Some(&cookie)).await.status(), status, "{path}");
+    }
+    let json = |from, to| format!("/p/timeline/window.json?from={}&to={}", iso(from), iso(to));
+    let hour = chrono::TimeDelta::hours(1);
+    for bad in [
+        json(at, at),
+        json(at, at - hour),
+        json(at, at + hour + chrono::TimeDelta::milliseconds(1)),
+    ] {
+        assert_eq!(
+            h.get(&bad, Some(&cookie)).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        h.get(&json(at, at + hour), Some(&cookie)).await.status(),
+        StatusCode::OK
+    );
+    // Every zoom renders; the window never runs past now on the live edge.
+    for zoom in ["1m", "5m", "15m", "1h"] {
+        let html = ok_page(&h, &cookie, &format!("/p/timeline?zoom={zoom}")).await;
+        assert!(html.starts_with("<div id=\"timeline\""), "{zoom}");
+        assert!(
+            html.contains("title=\"The window already ends now\""),
+            "{zoom}"
+        );
+    }
+    assert_eq!(
+        h.get("/p/timeline/window.json?from=x", None).await.status(),
+        StatusCode::SEE_OTHER,
+        "the JSON is behind the login"
+    );
+}
+
+#[tokio::test]
+async fn timeline_json_returns_the_frames_the_partial_draws() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let at = timeline_snapshot(&h);
+    let half = chrono::TimeDelta::seconds(30);
+    let html = ok_page(&h, &cookie, &format!("/p/timeline?at={}&zoom=1m", iso(at))).await;
+    let response = h
+        .get(
+            &format!(
+                "/p/timeline/window.json?from={}&to={}",
+                iso(at - half),
+                iso(at + half)
+            ),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let json: serde_json::Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(json["source"], "memory");
+    let mut drawn: Vec<u64> = html
+        .match_indices("data-seq=\"")
+        .map(|(start, _)| {
+            between(&html[start..], "data-seq=\"", "\"")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    drawn.sort_unstable();
+    let entries = json["entries"].as_array().unwrap();
+    let frames: Vec<u64> = (0u64..)
+        .zip(entries)
+        .filter(|(_, entry)| entry["kind"] == "frame")
+        .map(|(seq, _)| seq)
+        .collect();
+    assert_eq!(drawn, frames);
+    let mut ticks: Vec<u64> = json["lanes"]["addresses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|lane| lane["ticks"].as_array().unwrap().clone())
+        .map(|tick| tick["seq"].as_u64().unwrap())
+        .collect();
+    ticks.sort_unstable();
+    assert_eq!(ticks, frames);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "decision")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn versioned_scripts_are_cached_immutably_and_old_versions_are_gone() {
+    let h = harness(UNREACHABLE_ISSUER);
+    for asset in ["/static/recorder-2.js", "/static/htmx-2.0.11.min.js"] {
+        let response = h.get(asset, None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{asset}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable",
+            "{asset}"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+    }
+    // A cached copy never goes stale: a changed script is a new name, the old one is gone.
+    for gone in ["/static/recorder-1.js", "/static/recorder.js"] {
+        assert_eq!(
+            h.get(gone, None).await.status(),
+            StatusCode::NOT_FOUND,
+            "{gone}"
+        );
+    }
 }

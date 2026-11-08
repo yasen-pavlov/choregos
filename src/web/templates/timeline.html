@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}timeline · recorder · choregos{% endblock %}
+{% block scripts %}<script src="/static/{{ crate::web::RECORDER_JS }}" defer></script>{% endblock %}
+{% block content %}
+{% let tab = "timeline" %}
+<div class="page-h">
+  <h1>Recorder</h1>
+  {% include "partials/recorder_nav.html" %}
+</div>
+<div class="desk-only">
+{% include "partials/timeline.html" %}
+<p class="note">Positions are computed server-side as percentages of the window, so the timeline renders without JavaScript. The recorder script adds zoom, pan and decision keys, hover cards on ticks and live tail (new frames appear at the right edge and the window slides).</p>
+</div>
+<section class="phone-only tl-phone" aria-label="Timeline">
+  <svg width="40" height="40" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="9" width="32" height="20" rx="2"></rect><path d="M14 33h12M8 15h10M8 20h18M8 25h6"></path></svg>
+  <h1>The timeline is desk only</h1>
+  <p class="dim">It draws one lane per bus address across a minute to an hour, which needs a wide screen. On the phone, each decision has its own bus window instead.</p>
+  {% if let Some(id) = timeline.select %}<a class="button btn block" href="/recorder/{{ id }}">Open decision #{{ id }}</a>{% endif %}
+  <a class="button btn block ghost" href="/recorder">Back to the list</a>
+</section>
+{% endblock %}
