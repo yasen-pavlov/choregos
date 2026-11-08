@@ -393,55 +393,9 @@ fn alerts(snapshot: &Snapshot) -> Vec<Alert> {
 }
 
 fn role_card(snapshot: &Snapshot, role: &RoleView) -> RoleCard {
-    let shadow = snapshot.mode == Mode::Shadow;
-    let entry = role.logical_address.and_then(|la| {
-        snapshot
-            .bus
-            .iter()
-            .find(|entry| entry.logical_address == la)
-    });
-    // Bound entries are verified (identity binds nothing else); a restored role is unbound
-    // and only matches an entry the state file brought back.
-    let restored = role.restored && role.logical_address.is_none();
-    let identity = if role.conflicted {
-        ("conflict", "bad")
-    } else if restored {
-        ("restored", "pend")
-    } else if role.logical_address.is_some() {
-        ("bound", "ok")
-    } else {
-        ("unbound", "dim")
-    };
-
-    let mut cec = match entry {
-        Some(entry) => Segment::new("cec", view::bus_power(&entry.power), role.last_seen),
-        None if restored => Segment::absent("cec", "silent since restore"),
-        None => Segment::absent("cec", "—"),
-    };
-    let ha = match (
-        role.media_player.is_some(),
-        view::ha_entity_for(snapshot, role),
-    ) {
-        (true, Some(entity)) => Segment::new("ha", entity.state.clone(), entity.last_changed),
-        (true, None) => Segment::absent("ha", "unknown"),
-        (false, _) => Segment::absent("ha", "not configured"),
-    };
-    let mut probe = match (role.probe_configured, role.direct) {
-        (false, _) => Segment::absent("probe", "—"),
-        (true, _) if shadow => Segment::absent("probe", "not sampled (shadow)"),
-        (true, Some((state, at))) => Segment::new("probe", state.to_string(), Some(at)),
-        (true, None) => Segment::absent("probe", "not sampled"),
-    };
-    // Power follows CEC; a probe sample newer than the last CEC word is what was used last.
-    let probe_newer = !shadow
-        && role
-            .direct
-            .is_some_and(|(_, at)| role.last_seen.is_none_or(|seen| at > seen));
-    if role.probe_configured && probe_newer {
-        probe.used = true;
-    } else if entry.is_some() {
-        cec.used = true;
-    }
+    let restored = view::is_restored(role);
+    let identity = view::role_identity(role);
+    let view::RoleSources { cec, ha, probe } = view::role_sources(snapshot, role);
 
     let last = view::last_decision_for(snapshot, &role.role);
     let line = last.and_then(|decision| match view::wake_row(snapshot, decision) {

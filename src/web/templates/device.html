@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · devices · choregos{% endblock %}
+{% block content %}
+<div class="page-h"><a class="small" href="/devices">← Devices</a></div>
+{% match body %}
+{% when Body::Role(page) %}{% include "partials/device_role.html" %}
+{% when Body::Output(page) %}{% include "partials/device_output.html" %}
+{% when Body::Bridge(page) %}{% include "partials/device_bridge.html" %}
+{% when Body::Entry(page) %}{% include "partials/device_entry.html" %}
+{% endmatch %}
+{% endblock %}

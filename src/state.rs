@@ -73,6 +73,7 @@ impl AppState {
                     source: device.source.clone(),
                     power: RolePower::Off,
                     logical_address: None,
+                    last_logical_address: None,
                     physical_address: None,
                     vendor: None,
                     osd: None,
@@ -469,6 +470,10 @@ pub struct RoleView {
     pub source: String,
     pub power: RolePower,
     pub logical_address: Option<u8>,
+    /// The address the role is or was last known at: its binding, else its restored entry's,
+    /// else the last binding this service saw (or, after a restart, the address of its last
+    /// `identity_lost` row). Display only; identity history follows the role through it.
+    pub last_logical_address: Option<u8>,
     pub physical_address: Option<String>,
     pub vendor: Option<String>,
     pub osd: Option<String>,
@@ -496,6 +501,12 @@ pub struct BusEntryView {
     pub identified: bool,
     pub verified: bool,
     pub matched_role: Option<String>,
+    /// When the last Report Physical Address confirmed this entry (kept from the state file
+    /// for a restored entry until it is confirmed again).
+    pub confirmed_at: Option<DateTime<Utc>>,
+    /// When the next identification query for this entry is due; `None` when it needs none
+    /// or the bridge is offline (no queries are sent then). Display only.
+    pub next_identify_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -568,6 +579,20 @@ pub struct DecisionView {
     pub verdict: crate::action::Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<crate::action::DriftDetail>,
+}
+
+impl DecisionView {
+    /// The logical address the row's trigger names: the frame's sender, or an identify/forget
+    /// command's target.
+    pub fn trigger_logical_address(&self) -> Option<u8> {
+        match &self.trigger {
+            crate::action::Trigger::Frame { from, .. } => Some(*from),
+            crate::action::Trigger::Command {
+                command: Command::Identify(la) | Command::Forget(la),
+            } => Some(*la),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

@@ -1,0 +1,16 @@
+<div class="scroll-x">
+  <table class="tbl stats{% if read_as %} with-read{% endif %}">
+    <thead><tr><th scope="col">Measure</th><th scope="col" class="r">Value</th><th scope="col" class="r">n</th><th scope="col">Source</th>{% if read_as %}<th scope="col">Read as</th>{% endif %}</tr></thead>
+    <tbody>
+      {% for m in measures %}
+      <tr>
+        <td>{{ m.name }}</td>
+        <td class="mono num r">{{ m.value }}{% if let Some((tone, text)) = m.chip %} <span class="chip {{ tone }}">{{ text }}</span>{% endif %}</td>
+        <td class="mono num r st-n">{{ m.n }}</td>
+        <td class="mono dim">{{ m.source }}</td>
+        {% if read_as %}<td class="small dim">{{ m.read_as }}</td>{% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

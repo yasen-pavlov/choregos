@@ -1,0 +1,70 @@
+<header class="dev-head">
+  <div class="grow">
+    <span class="k">Role · {{ page.role }}</span>
+    <div class="row"><h1>{{ page.name }}</h1><span class="chip {{ page.identity.1 }}">{{ page.identity.0 }}</span>{% if page.active %}<span class="chip info">active</span>{% endif %}<span class="chip {% if page.on %}ok{% else %}dim{% endif %}">{% if page.on %}on{% else %}off{% endif %}</span></div>
+    <span class="mono dim small">{{ page.sub }}</span>
+  </div>
+  <div class="dev-actions">
+    {% if let Some(la) = page.la %}<button type="button" id="identify-{{ page.role }}" class="btn sm ghost" hx-post="/actions/identify/{{ la }}" hx-swap="none"{% if page.warming %} disabled title="warming: actions are refused until the bus model settles"{% endif %}>Identify</button>{% endif %}
+    {% if page.show_takeover %}<button type="button" id="takeover-{{ page.role }}" class="btn sm{% if page.shadow %} would{% endif %}" hx-post="/actions/takeover/{{ page.role|urlencode_strict }}" hx-swap="none"{% if !page.shadow %} hx-confirm="Take over the room with {{ page.name }}?"{% endif %}{% if let Some(why) = page.disabled %} disabled title="{{ why }}"{% endif %}>{% if page.shadow %}Would take over…{% else %}Take over…{% endif %}</button>{% endif %}
+    {% if page.show_standby %}<button type="button" id="standby-{{ page.role }}" class="btn sm{% if page.shadow %} would{% endif %}" hx-post="/actions/standby/{{ page.role|urlencode_strict }}" hx-swap="none"{% if !page.shadow %} hx-confirm="Put {{ page.name }} in standby?"{% endif %}{% if let Some(why) = page.disabled %} disabled title="{{ why }}"{% endif %}>{% if page.shadow %}Would standby…{% else %}Standby…{% endif %}</button>{% endif %}
+    {% if let Some(la) = page.la %}<button type="button" id="forget-{{ page.role }}" class="btn sm danger" hx-post="/actions/forget/{{ la }}" hx-swap="none" hx-confirm="Forget {{ page.name }} at LA {{ la }}? It will be re-learned if it talks again.">Forget…</button>{% endif %}
+  </div>
+</header>
+
+{% if let Some(restored) = page.restored %}
+<section class="panel restored-state" aria-label="Restored">
+  <div class="stack">
+    <h2>Restored, waiting for the device to talk</h2>
+    <p>Choregos remembered {{ page.name }}{% if let Some(stored) = restored.stored %} as <span class="mono">{{ stored }}</span>{% endif %} from before the{% if let Some(at) = restored.at %} {{ view::hms(at) }}{% endif %} restart. Until {{ page.name }} reports that physical address again on the bus, it cannot trigger a wake or a takeover, so a stale memory can never switch the room.</p>
+    <div class="row">
+      {% if let Some(la) = restored.la %}<button type="button" id="identify-now" class="btn sm" hx-post="/actions/identify/{{ la }}" hx-swap="none"{% if page.warming %} disabled title="warming: actions are refused until the bus model settles"{% endif %}>Identify now</button>{% endif %}
+      <a class="button btn sm ghost" href="/recorder?role={{ page.role|urlencode }}">Last decisions</a>
+    </div>
+    <p class="help">Identify asks{% if let Some(la) = restored.la %} LA {{ la }}{% endif %} to report its identity (allowed in shadow too). Most players answer only when awake.</p>
+  </div>
+  <dl class="dl">
+    <dt>Stored</dt><dd class="mono">{% if let Some(stored) = restored.stored %}{{ stored }}{% else %}—{% endif %}</dd>
+    <dt>Restored</dt><dd class="mono">{% if let Some(at) = restored.at %}{{ view::when_ms(at) }} · {% endif %}from state file</dd>
+    <dt>Heard since</dt><dd>{{ restored.heard }}</dd>
+    <dt>HA</dt><dd class="mono">{% if let Some(ha) = restored.ha %}{{ ha }}{% else %}not configured{% endif %}</dd>
+    <dt>Expires</dt><dd>forgotten after {{ crate::web::view::devices::IDENTITY_LIFETIME_DAYS }} days unheard</dd>
+  </dl>
+</section>
+{% else %}
+<section class="panel flush" aria-label="Power, by source">
+  <div class="ph"><h2 class="grow">Power, by source</h2><span class="chip {{ page.agreement.tone() }}">{{ page.agreement.label() }}</span><span class="note desk-only">{{ page.sources_note }}</span></div>
+  {% include "partials/source_cols.html" %}
+</section>
+{% endif %}
+
+{# Each section is in the DOM once: an open details element that reads as a plain panel on
+   desktop and is a disclosure on phones (choregos.css, .fold). #}
+<div class="two">
+  <details class="panel flush fold" open>
+    <summary class="ph"><h2 class="grow">Identity</h2><span class="chip {{ page.identity.1 }}">{{ page.identity.0 }}</span></summary>
+    {% include "partials/role_identity.html" %}
+  </details>
+  <details class="panel flush fold" open>
+    <summary class="ph"><h2 class="grow">Identity events</h2><span class="small dim">{{ page.events.len() }}</span></summary>
+    {% include "partials/role_events.html" %}
+  </details>
+</div>
+
+<section class="panel flush" aria-label="How it behaves">
+  <div class="ph"><h2 class="grow">How it behaves</h2><span class="note desk-only">over the decisions in memory · would and migrated rows excluded · n on every figure · p95 hidden under n = {{ crate::web::view::devices::P95_MIN_N }}</span></div>
+  {% let read_as = true %}{% let measures = page.measures %}
+  {% include "partials/measures.html" %}
+</section>
+
+<details class="panel flush fold" open>
+  <summary class="ph"><h2 class="grow">Quirks</h2><span class="small dim">{{ page.quirks.len() }} sentences</span></summary>
+  {% include "partials/role_quirks.html" %}
+  <p class="pb"><a class="small" href="/config">Edit in Config →</a></p>
+</details>
+
+<details class="panel flush fold" open>
+  <summary class="ph"><h2 class="grow">Decisions involving {{ page.name }}</h2><span class="small dim">{{ page.involved.len() }}</span></summary>
+  {% include "partials/role_involved.html" %}
+  <p class="pb"><a class="small" href="/recorder?role={{ page.role|urlencode }}">All in Recorder →</a></p>
+</details>

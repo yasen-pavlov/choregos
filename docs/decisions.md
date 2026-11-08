@@ -2,6 +2,64 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-08 — Phase 2 slice 3: Devices
+
+- `/devices` is the registry: roles (config order), outputs (TV, receiver, speakers),
+  the bridge and unbound bus entries (no role bound; the bridge, the receiver's
+  audio-system entry — the first unbound `device_type = 5` — and entries a restored role
+  waits on are listed elsewhere). `/p/devices` returns the `#registry` block, polled every
+  5 s. `/devices/{role}` (404 for an unknown role), `/devices/out/{tv,receiver,speakers,
+  bridge}` and `/devices/la/{n}` are the detail pages; an LA page for a bound role, the
+  bridge, the audio system or a restored role's entry redirects (303) to that page, an
+  unknown LA is 404. Device profiles come from the configuration text, parsed per request.
+  The receiver page's CEC entry panel carries Identify and a confirmed Forget for the
+  audio-system LA (same action routes and warming rule as an LA page), so the redirect
+  loses no operator control.
+- Statistics ("How it behaves", output timings) are computed from the ring on request.
+  Excluded everywhere: `would` rows and migrated history; latencies of 0 ms (already
+  satisfied when decided). Percentiles are nearest-rank, `sorted[ceil(p·n/100) − 1]`; p95
+  is hidden under n = 5; n is always shown. Wakes = rows of the role with `to = on` and a
+  settled verdict (not `none`, not `pending`), achieved / total. Wake → picture =
+  `tv.power = on` met on those wakes, restricted to `tv_direct` samples when any exist
+  (the via is shown). Receiver ready = `receiver.power = on` met on those wakes. Source
+  switch = `receiver.source` met on `takeover_settled` rows whose parent is one of those
+  wakes. Standby confirmed = settled `role:<r>` power expectations on any row: met or
+  `cec_only` of total, missed and unknown counted separately, with every allowed via.
+  Polled roles add "left the bus" = `presence_timeout` rows. Output timings use the same
+  rules over all rows: TV off (`tv.power = off`, `tv_direct` preferred), receiver on, off
+  (p50/p95) and source, speakers `playback = stopped`.
+- Agreement between truth sources compares normalised power: CEC on/standby; Home
+  Assistant `on|playing|paused|idle|buffering` → on, `off|standby` → off; probe
+  awake/standby. A CEC transition, unknown or unavailable Home Assistant, an unreachable
+  probe or Denon are not evidence; for the TV, as on the cockpit, webOS unreachable and
+  Home Assistant unavailable/unknown read as off. Fewer than two readings = "one source".
+- Identity events: the role's `identity_lost` rows, plus `conflict`, `conflict_resolved`,
+  `command_identify` and `command_forget` rows (no role) whose trigger frame sender or
+  command target is one of the role's addresses: current, last (below), restored, any in
+  a current `Snapshot.conflicts` entry naming the role, or one a loss row names. Synthetic
+  `verified` (bound entry's `confirmed_at`) and `restored` (service start) lines. An entry
+  confirmed before the service start is shown as restored and re-confirmed by vendor and
+  OSD (only a live 84 refreshes `confirmed_at`).
+- Additive snapshot fields: `BusEntryView.confirmed_at` (from `BusEntry.confirmed_at`) and
+  `BusEntryView.next_identify_at` (from the new read-only `BusModel::next_identify_at`, the
+  per-entry arithmetic of `next_identify_deadline`; `None` while the bridge is offline,
+  when no query is sent). `RoleView.last_logical_address`, view only, filled by the
+  snapshot builder: the binding, else the restored entry's LA, else the previous
+  snapshot's value (a conflict or a forget on an Off role unbinds without any row naming
+  the role), else after a restart the trigger LA of the role's newest `identity_lost` row.
+  The engine keeps no such memory.
+- Role page sections are in the DOM once: Identity, Identity events, Quirks and Decisions
+  are open `<details>` that read as plain panels on desktop and fold on phones. Phones
+  therefore open them expanded (board 04d shows them folded; no script can fold them by
+  width under the CSP); the "Edit in Config" and "All in Recorder" links sit at the foot
+  of their panels, outside the summary, at both widths. The bridge page polls its own
+  `#bridge-page-info` wrapper (`/devices/out/bridge`), the drawer its `#bridge-info`;
+  both include the same status content with id prefixes, so no id is shared.
+- Deviations from the boards: logical addresses use the CEC names (LA 9 is "recording
+  device 3", LA 11 "playback device 3"); an unbound entry an identity conflict involves
+  reads `conflict`; the LA page notes say why no role matches (unidentified, conflict or
+  unmatched).
+
 ## 2026-11-08 — Phase 2 slice 2: the Recorder
 
 - `/recorder` (decision list), `/recorder/{id}` (one decision), `/recorder/live` (live

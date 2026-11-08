@@ -879,7 +879,21 @@ action "Would …".
   kept in memory (ring buffer in `AppState`); `follow=off` renders without the
   stream. `/recorder/glossary` lists every reason literal by group with its
   sentence. The timeline (`/recorder/timeline`) is a later slice.
-- `/devices` Bus table (every LA with learned fields, identified/unidentified, matched role) and the role → source mapping; "identify" and confirmed "forget" controls per non-bridge LA.
+- `/devices` Registry, polled every 5 s (`/p/devices`): roles, outputs (TV,
+  receiver with its audio-system CEC entry, speakers), the bridge and unbound bus
+  entries, each with kind, LA · PA, vendor · OSD, identity (bound / restored /
+  unbound / conflict; unmatched / unidentified with the next identify query),
+  power, sources, last decision and last seen. `/devices/{role}`: power by source
+  (CEC, Home Assistant, probe; the used one marked, agreement shown), identity keys
+  against the match rule with identity events, statistics from the ring (wakes,
+  wake → picture, receiver ready, source switch, standby confirmed, left the bus;
+  nearest-rank p50/p95, n always shown), quirks from the device profile, the
+  decisions involving it, and identify / take over / standby / confirmed forget; a
+  restored role waiting for its device shows its stored keys and "Identify now".
+  `/devices/out/{tv,receiver,speakers}`: direct vs Home Assistant, timings, drift
+  history, how Choregos drives it; `/devices/out/bridge`: the bridge status.
+  `/devices/la/{n}`: an unbound entry's keys, identify backoff, recent frames,
+  identify and confirmed forget.
 - `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
 Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; local username/password break-glass form at `/login/local`; signed session cookie (`tower-sessions` or axum-extra signed cookies); CSRF for POSTs via same-site cookie + hidden token. Visual design: dark, dense, monospace for bus data; mocked before implementation (see `docs/ui.md` once written).

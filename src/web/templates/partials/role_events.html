@@ -1,0 +1,17 @@
+<div class="scroll-x">
+  <table class="tbl events">
+    <thead><tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">What happened</th></tr></thead>
+    <tbody>
+      {% for event in page.events %}
+      <tr>
+        <td class="mono num" title="{{ view::iso(event.at) }}">{% if let Some(id) = event.id %}<a href="/recorder/{{ id }}">{{ view::when_ms(event.at) }}</a>{% else %}{{ view::when_ms(event.at) }}{% endif %}</td>
+        <td><span class="chip {{ event.tone }}">{{ event.word }}</span></td>
+        <td class="small">{{ event.sentence }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="empty">No identity events in memory.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="note pb">Moves between logical addresses are silent and do not appear here.</p>

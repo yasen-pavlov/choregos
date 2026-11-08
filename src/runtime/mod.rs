@@ -1140,36 +1140,64 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     let timestamp = |seen: Instant| {
         wall - chrono::Duration::from_std(now.saturating_duration_since(seen)).unwrap_or_default()
     };
-    snapshot.roles = engine
+    let previous: std::collections::BTreeMap<String, u8> = snapshot
+        .roles
+        .iter()
+        .filter_map(|role| Some((role.role.clone(), role.last_logical_address?)))
+        .collect();
+    let roles = engine
         .config
         .device
         .iter()
         .map(|device| {
             let la = engine.identity.roles.get(&device.role).copied();
             let entry = la.and_then(|la| engine.bus.entries.get(&la));
+            let restored_la = engine
+                .bus
+                .entries
+                .iter()
+                .find(|&(&address, entry)| {
+                    la.is_none()
+                        && !entry.verified
+                        && crate::identity::matches(device, address, entry, engine.bus.bridge)
+                })
+                .map(|(&address, _)| address);
+            // View only: the engine keeps no memory of an address it no longer binds.
+            let last_logical_address = la
+                .or(restored_la)
+                .or_else(|| previous.get(&device.role).copied())
+                .or_else(|| {
+                    snapshot
+                        .decisions
+                        .iter()
+                        .rev()
+                        .find(|row| {
+                            row.reason == "identity_lost"
+                                && row.role.as_deref() == Some(device.role.as_str())
+                        })
+                        .and_then(DecisionView::trigger_logical_address)
+                });
             RoleView {
                 role: device.role.clone(),
                 name: device.name.clone(),
                 source: device.source.clone(),
                 power: engine.roles[&device.role].power,
                 logical_address: la,
+                last_logical_address,
                 physical_address: entry.and_then(|e| e.physical).map(physical_address),
                 vendor: entry.and_then(|e| e.vendor).map(|v| format!("{v:06X}")),
                 osd: entry.and_then(|e| e.osd.clone()),
                 last_event: engine.roles[&device.role].last_event.clone(),
                 last_seen: entry.and_then(|e| e.last_seen).map(timestamp),
                 conflicted: engine.identity.blocked.contains(&device.role),
-                restored: la.is_none()
-                    && engine.bus.entries.iter().any(|(&la, entry)| {
-                        !entry.verified
-                            && crate::identity::matches(device, la, entry, engine.bus.bridge)
-                    }),
+                restored: restored_la.is_some(),
                 direct: engine.roles[&device.role].direct,
                 probe_configured: device.probe.is_some(),
                 media_player: device.media_player.clone(),
             }
         })
         .collect();
+    snapshot.roles = roles;
     snapshot.bus = engine
         .bus
         .entries
@@ -1190,6 +1218,15 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
                 .iter()
                 .find(|(_, addr)| **addr == la)
                 .map(|(r, _)| r.clone()),
+            confirmed_at: entry.confirmed_at,
+            next_identify_at: engine
+                .bridge_online
+                .then(|| engine.bus.next_identify_at(la))
+                .flatten()
+                .map(|due| {
+                    wall + chrono::Duration::from_std(due.saturating_duration_since(now))
+                        .unwrap_or_default()
+                }),
         })
         .collect();
     let entity = |id: &str| {
@@ -1554,8 +1591,73 @@ mod tests {
         let streamer = role("streamer");
         assert_eq!(streamer.logical_address, None);
         assert!(streamer.restored);
+        assert_eq!(streamer.last_logical_address, Some(4));
         // Kodi matches by OSD name, which the restored entry does not carry.
         assert!(!role("kodi").restored);
+    }
+
+    #[test]
+    fn a_role_keeps_its_last_address_after_forget_or_conflict_unbinds_it() {
+        let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
+        let now = Instant::now() + Duration::from_secs(4);
+        let wall: DateTime<Utc> = "2026-11-07T12:00:00Z".parse().unwrap();
+        let streamer = |snapshot: &Snapshot| {
+            snapshot
+                .roles
+                .iter()
+                .find(|role| role.role == "streamer")
+                .map(|role| (role.logical_address, role.last_logical_address))
+                .unwrap()
+        };
+        let bound = |la: u8| {
+            let mut engine = Engine::new(config.clone(), now - Duration::from_secs(4), vec![], 1);
+            let mut snapshot = AppState::new(config.clone(), String::new()).snapshot();
+            for data in ["84210004", "870010FA"] {
+                engine.handle(
+                    Event::Frame(Frame::from_hex(la, 15, data).unwrap()),
+                    now,
+                    wall,
+                );
+            }
+            update_snapshot(&mut snapshot, &engine, now, wall);
+            assert_eq!(streamer(&snapshot), (Some(la), Some(la)));
+            assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+            (engine, snapshot)
+        };
+
+        // Forget while Off: no transition, so no identity_lost row records the address.
+        let (mut engine, mut snapshot) = bound(4);
+        engine.handle(Event::Command(Command::Forget(4)), now, wall);
+        update_snapshot(&mut snapshot, &engine, now, wall);
+        assert_eq!(streamer(&snapshot), (None, Some(4)));
+
+        // A second verified match blocks the role; blocked roles never get identity_lost.
+        let (mut engine, mut snapshot) = bound(4);
+        for data in ["84220004", "870010FA"] {
+            engine.handle(
+                Event::Frame(Frame::from_hex(9, 15, data).unwrap()),
+                now,
+                wall,
+            );
+        }
+        update_snapshot(&mut snapshot, &engine, now, wall);
+        assert!(snapshot.conflicts.iter().any(|c| c.roles == ["streamer"]));
+        assert_eq!(streamer(&snapshot), (None, Some(4)));
+
+        // A fresh service (no previous snapshot) falls back to the ring's identity_lost row.
+        let mut fresh = AppState::new(config.clone(), String::new()).snapshot();
+        fresh.decisions.push_back(
+            serde_json::from_value(serde_json::json!({
+                "id": 7, "trigger": {"kind": "command", "command": {"kind": "forget", "data": 6}},
+                "parent": null, "timestamp": "2026-11-07T11:00:00Z", "role": "streamer",
+                "from": "on", "to": "off", "reason": "identity_lost", "actions": [],
+                "would": false
+            }))
+            .unwrap(),
+        );
+        let engine = Engine::new(config, now, vec![], 1);
+        update_snapshot(&mut fresh, &engine, now, wall);
+        assert_eq!(streamer(&fresh), (None, Some(6)));
     }
 }
 

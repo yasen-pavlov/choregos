@@ -1,0 +1,11 @@
+        <tr>
+          <td class="c-name"><a href="{{ row.href }}"><strong>{{ row.name }}</strong></a>{% if let Some(tag) = row.tag %} <span class="mono dim">{{ tag }}</span>{% endif %}</td>
+          <td class="c-kind small dim">{{ row.kind }}</td>
+          <td class="c-la mono">{{ row.la_pa }}</td>
+          <td class="c-vendor mono">{{ row.vendor_osd }}</td>
+          <td class="c-id">{% if let Some((label, tone)) = row.identity %}<span class="chip {{ tone }}">{{ label }}</span>{% else %}<span class="dim">—</span>{% endif %}{% if let Some(note) = row.identity_note %} <span class="small dim idn">{{ note }}</span>{% endif %}</td>
+          <td class="c-power">{% if let Some((tone, label)) = row.power %}<span class="chip {{ tone }}">{{ label }}</span>{% else %}<span class="dim">—</span>{% endif %}{% if !row.power_note.is_empty() %} <span class="mono dim pn">{{ row.power_note }}</span>{% endif %}</td>
+          <td class="c-src mono dim">{{ row.sources }}</td>
+          <td class="c-last">{% if let Some(last) = row.last %}<a class="mono" href="/recorder/{{ last.id }}">#{{ last.id }}</a> {% if last.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(last.verdict) }}">{{ last.verdict }}</span>{% endif %}{% else %}<span class="dim">—</span>{% endif %}</td>
+          <td class="c-seen mono num r">{{ row.seen }}</td>
+        </tr>

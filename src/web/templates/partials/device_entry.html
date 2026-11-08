@@ -1,0 +1,36 @@
+<header class="dev-head">
+  <div class="grow">
+    <span class="k">Bus entry · not a role</span>
+    <div class="row"><h1>LA {{ page.la }}</h1><span class="dim">{{ page.label }}</span><span class="chip {{ page.identity.1 }}">{{ page.identity.0 }}</span></div>
+  </div>
+  <div class="dev-actions">
+    <button type="button" id="identify-la-{{ page.la }}" class="btn sm ghost" hx-post="/actions/identify/{{ page.la }}" hx-swap="none"{% if page.warming %} disabled title="warming: actions are refused until the bus model settles"{% endif %}>Identify</button>
+    <button type="button" id="forget-la-{{ page.la }}" class="btn sm danger" hx-post="/actions/forget/{{ page.la }}" hx-swap="none" hx-confirm="Forget LA {{ page.la }}? It will be re-learned if it talks again.">Forget…</button>
+  </div>
+</header>
+<section class="panel flush" aria-label="Identity keys">
+  <div class="ph"><h2 class="grow">Identity keys</h2></div>
+  <dl class="dl pb">{% for (key, value) in page.rows %}<dt>{{ key }}</dt><dd class="mono">{{ value }}</dd>{% endfor %}</dl>
+  <p class="note pb">{% if page.identity.0 == "unidentified" %}It has not answered every identification query yet, so no role can match it.{% else if page.identity.0 == "conflict" %}More than one role claims this device; those roles are blocked until the conflict clears.{% else %}No role's match rule fits this device.{% endif %} Add or change a role in <a href="/config">Config</a> if it should take part.</p>
+</section>
+<section class="panel flush" aria-label="Recent frames">
+  <div class="ph"><h2 class="grow">Recent frames</h2><span class="note">from and to LA {{ page.la }}, newest first, from memory</span></div>
+  <div class="scroll-x">
+    <table class="tbl">
+      <thead><tr><th scope="col">Time</th><th scope="col">Dir</th><th scope="col">From → to</th><th scope="col">Data</th><th scope="col">Meaning</th></tr></thead>
+      <tbody>
+        {% for frame in page.frames %}
+        <tr>
+          <td class="mono num" title="{{ view::iso(frame.timestamp) }}">{{ view::when_ms(frame.timestamp) }}</td>
+          <td class="mono dim">{{ view::direction(frame.direction) }}</td>
+          <td class="mono">{{ frame.from }} → {{ frame.to }} <span class="dim small">{{ frame.from_name }} → {{ frame.to_name }}</span></td>
+          <td class="mono">{{ frame.data }}</td>
+          <td>{{ frame.opcode_name }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">No frames from or to LA {{ page.la }} in memory.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

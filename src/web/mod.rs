@@ -81,6 +81,10 @@ pub fn router(state: AppState) -> Router {
         .route("/recorder/{id}", get(routes::recorder::detail))
         .route("/p/window/{id}", get(routes::recorder::window))
         .route("/devices", get(routes::devices::page))
+        .route("/p/devices", get(routes::devices::partial))
+        .route("/devices/out/{name}", get(routes::devices::output))
+        .route("/devices/la/{la}", get(routes::devices::entry))
+        .route("/devices/{role}", get(routes::devices::role))
         .route(
             "/config",
             get(routes::config::page).post(routes::config::submit),

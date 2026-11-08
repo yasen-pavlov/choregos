@@ -137,7 +137,7 @@
         {% endif %}
         <a href="/recorder?reason={{ decision.reason|urlencode }}">Other {{ decision.reason }} rows →</a>
         {% if let Some(role) = decision.role %}{% let name = role_name.as_deref().unwrap_or(role) %}
-        <a href="/devices">{{ name }} in Devices →</a>
+        <a href="/devices/{{ role|urlencode_strict }}">{{ name }} in Devices →</a>
         {% endif %}
       </div>
     </section>

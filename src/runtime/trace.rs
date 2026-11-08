@@ -375,68 +375,110 @@ pub fn read_window(
     to: DateTime<Utc>,
     budget: ReadBudget,
 ) -> std::io::Result<WindowRead> {
-    use std::io::BufRead;
-    #[derive(Deserialize)]
-    struct Stamp {
-        ts: DateTime<Utc>,
-    }
-    let mut read = WindowRead::default();
-    let (mut bytes, mut lines) = (0u64, 0u64);
-    let mut line = Vec::new();
+    let mut scan = WindowScan {
+        budget,
+        from,
+        to,
+        bytes: 0,
+        lines: 0,
+        line: Vec::new(),
+        read: WindowRead::default(),
+    };
     let mut date = from.date_naive();
-    'days: while date <= to.date_naive() {
-        let file = match std::fs::File::open(day_file(directory, date)) {
-            Ok(file) => Some(file),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        if let Some(file) = file {
-            let mut reader = std::io::BufReader::new(file);
-            loop {
-                let allowance = budget.scan_bytes.saturating_sub(bytes);
-                if lines >= budget.scan_lines || allowance == 0 {
-                    read.truncated = !reader.fill_buf()?.is_empty();
-                    if read.truncated {
-                        break 'days;
-                    }
+    while date <= to.date_naive() {
+        match std::fs::File::open(day_file(directory, date)) {
+            Ok(file) => {
+                if !scan.file(&mut std::io::BufReader::new(file))? {
                     break;
-                }
-                let Some((consumed, whole)) =
-                    bounded_line(&mut reader, &mut line, budget.line_bytes, allowance)?
-                else {
-                    break;
-                };
-                bytes += consumed;
-                lines += 1;
-                if !whole {
-                    continue;
-                }
-                let Ok(text) = std::str::from_utf8(&line) else {
-                    continue;
-                };
-                let Ok(Stamp { ts }) = serde_json::from_str(text) else {
-                    continue;
-                };
-                if ts > to {
-                    break;
-                }
-                if ts >= from
-                    && let Some(entry) = parse(text)
-                {
-                    if read.entries.len() == budget.entries {
-                        read.truncated = true;
-                        break 'days;
-                    }
-                    read.entries.push(entry);
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let Some(next) = date.succ_opt() else {
             break;
         };
         date = next;
     }
-    Ok(read)
+    Ok(scan.read)
+}
+
+/// What one whole trace line means for a window read.
+enum WindowLine {
+    /// Torn, unknown, or before the window.
+    Skip,
+    /// After the window: the rest of the file is later still.
+    After,
+    Entry((DateTime<Utc>, TraceEntry)),
+}
+
+/// Lines before `from` are judged on their timestamp alone, without a full parse.
+fn window_line(line: &[u8], from: DateTime<Utc>, to: DateTime<Utc>) -> WindowLine {
+    #[derive(Deserialize)]
+    struct Stamp {
+        ts: DateTime<Utc>,
+    }
+    let Ok(text) = std::str::from_utf8(line) else {
+        return WindowLine::Skip;
+    };
+    let Ok(Stamp { ts }) = serde_json::from_str(text) else {
+        return WindowLine::Skip;
+    };
+    if ts > to {
+        WindowLine::After
+    } else if ts >= from
+        && let Some(entry) = parse(text)
+    {
+        WindowLine::Entry(entry)
+    } else {
+        WindowLine::Skip
+    }
+}
+
+/// The running state of one window read across its day files.
+struct WindowScan {
+    budget: ReadBudget,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    bytes: u64,
+    lines: u64,
+    line: Vec<u8>,
+    read: WindowRead,
+}
+
+impl WindowScan {
+    /// Scans one day file to its end, its first line after the window, or the budget.
+    /// `false` when the whole read stops, flagged `truncated`.
+    fn file(&mut self, reader: &mut impl std::io::BufRead) -> std::io::Result<bool> {
+        loop {
+            let allowance = self.budget.scan_bytes.saturating_sub(self.bytes);
+            if self.lines >= self.budget.scan_lines || allowance == 0 {
+                self.read.truncated = !reader.fill_buf()?.is_empty();
+                return Ok(!self.read.truncated);
+            }
+            let Some((consumed, whole)) =
+                bounded_line(reader, &mut self.line, self.budget.line_bytes, allowance)?
+            else {
+                return Ok(true);
+            };
+            self.bytes += consumed;
+            self.lines += 1;
+            if !whole {
+                continue;
+            }
+            match window_line(&self.line, self.from, self.to) {
+                WindowLine::Skip => {}
+                WindowLine::After => return Ok(true),
+                WindowLine::Entry(entry) => {
+                    if self.read.entries.len() == self.budget.entries {
+                        self.read.truncated = true;
+                        return Ok(false);
+                    }
+                    self.read.entries.push(entry);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]

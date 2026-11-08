@@ -335,7 +335,43 @@ fieldset.seg > legend { margin-right: 8px; }
 .chip.ours { color: var(--text); border-color: var(--line-2); background: var(--panel-2); }
 .chip.obs { color: var(--cyan); border-color: var(--edge-cyan); }
 
-/* ---- legacy (slices 3–4): live frames table, devices, config, login --------------- */
+/* ---- devices: registry, role and output pages ------------------------------------- */
+.dot.info { background: var(--accent); }
+.stack-16 { display: flex; flex-direction: column; gap: 16px; }
+.reg td { vertical-align: middle; }
+.reg .c-name { white-space: nowrap; }
+.reg .c-la, .reg .c-vendor, .reg .c-src, .reg .c-seen, .reg .c-last { white-space: nowrap; }
+.reg-notes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.reg-note { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.dev-head { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
+.dev-head > .grow { display: flex; flex-direction: column; gap: 4px; }
+.dev-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.src-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.src-col { display: flex; flex-direction: column; gap: 4px; padding: 12px; border-left: 1px solid var(--line); min-width: 0; }
+.src-col:first-child { border-left: 0; }
+.src-col .k { display: inline-flex; align-items: center; gap: 6px; }
+.src-col.use { background: var(--panel-2); }
+.src-col.use .k { color: var(--text); }
+.src-col.dis { background: var(--tint-orange); box-shadow: inset 0 0 0 1px var(--edge-orange); }
+.src-col.dis .k, .src-col.dis .value { color: var(--orange); }
+.src-col.na .value { color: var(--dim); }
+.two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+@media (max-width: 1180px) { .two { grid-template-columns: minmax(0, 1fr); } }
+.idrows dd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+pre.rule { margin: 4px 0 0; padding: 8px 10px; font: 12px/1.4 var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; }
+.quirks { margin: 0; padding-left: 28px; display: flex; flex-direction: column; gap: 6px; }
+.quirks code { color: var(--accent); }
+.restored-state { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; padding: 20px; }
+@media (max-width: 1180px) { .restored-state { grid-template-columns: minmax(0, 1fr); } }
+.drifts td { white-space: nowrap; }
+/* Role-page sections render once as open <details>: a plain panel header on desktop (the
+   pointer cannot fold it), a disclosure on phones. A folded one always shows its marker. */
+.fold > summary { list-style: none; pointer-events: none; }
+.fold > summary::-webkit-details-marker { display: none; }
+.fold:not([open]) > summary { pointer-events: auto; cursor: pointer; border-bottom: 0; }
+.fold:not([open]) > summary::after { content: "▾"; color: var(--dim); }
+
+/* ---- legacy (slice 4): live frames table, config, login ---------------------------- */
 .panel > h2, .panel-h > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin-bottom: 8px; }
 .panel-h { display: flex; align-items: baseline; gap: 12px; }
 .warn { color: var(--amber); }
@@ -346,10 +382,6 @@ fieldset.seg > legend { margin-right: 8px; }
   font-family: var(--mono); text-transform: uppercase; letter-spacing: .05em;
   border: 1px solid var(--line); color: var(--dim);
 }
-.pill.power-on, .pill.state-on, .pill.state-playing { color: var(--green); border-color: var(--green); }
-.pill.power-standby, .pill.state-paused, .pill.state-idle { color: var(--amber); border-color: var(--amber); }
-.pill.power-transition { color: var(--accent); border-color: var(--accent); }
-.pill.state-unavailable { color: var(--red); border-color: var(--red); }
 .pill.verdict-achieved { color: var(--green); border-color: var(--green); }
 .pill.verdict-partial { color: var(--orange); border-color: var(--orange); }
 .pill.verdict-pending { color: var(--cyan); border-color: var(--cyan); }
@@ -358,8 +390,6 @@ fieldset.seg > legend { margin-right: 8px; }
 .flash { display: block; padding: 6px 10px; border-radius: var(--radius); border: 1px solid; margin-bottom: 8px; }
 .flash.ok { border-color: var(--green); background: var(--tint-green); color: var(--green); }
 .flash.err { border-color: var(--red); background: var(--tint-red); color: var(--red); }
-button.small { padding: 1px 8px; font-size: 12px; }
-.group { display: flex; align-items: center; gap: 8px; }
 .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .live { margin-left: auto; }
 .grid { width: 100%; border-collapse: collapse; }
@@ -381,8 +411,6 @@ tr.decision.would .dir { color: var(--purple); }
 .reason { color: var(--dim); margin: 0 6px; }
 .action { display: inline-block; margin: 1px 4px 1px 0; padding: 0 6px; border: 1px solid var(--line); border-radius: var(--radius); }
 .action.would { border-style: dashed; color: var(--purple); }
-tr.unidentified td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
-tr.conflicted td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 .config { display: flex; flex-direction: column; gap: 8px; }
 .config textarea {
   width: 100%; min-height: 60vh; resize: vertical; color: var(--text); background: var(--bg);
@@ -454,4 +482,37 @@ body.bare main { min-height: 100vh; justify-content: center; align-items: center
   .trig-frame { font-size: 18px; }
   .window-tbl .hm, .window-tbl .names { display: none; }
   .window-tbl tr.wf td { white-space: nowrap; }
+  /* Registry rows as cards: name, identity and power, then LA · PA and last seen. The dropped
+     columns stay readable to screen readers (same technique as the recorder list). */
+  .reg thead tr, .reg td.c-kind, .reg td.c-vendor, .reg td.c-src, .reg td.c-last, .reg .pn,
+  .stats thead tr, .stats td:nth-child(4), .stats td:nth-child(5) {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+  }
+  .reg tbody tr { display: block; border-bottom: 1px solid var(--row); }
+  .reg tbody tr:not(.day) {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "name id power" "la seen seen";
+    align-items: center; gap: 2px 8px; padding: 8px 10px;
+  }
+  .reg tbody td { padding: 0; border: 0; }
+  .reg tbody tr.day td { display: block; }
+  .reg tbody td.empty { grid-column: 1 / -1; }
+  .reg .c-name { grid-area: name; white-space: normal; overflow-wrap: anywhere; }
+  /* The chip, with the next-query note on its own line beneath it, so the note never widens
+     the identity track into the name's space. */
+  .reg .c-id { grid-area: id; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+  .reg .c-id .idn { font-size: 11px; white-space: nowrap; }
+  .reg .c-power { grid-area: power; }
+  .reg .c-la { grid-area: la; font-size: 11px; color: var(--dim); }
+  .reg .c-seen { grid-area: seen; font-size: 11px; color: var(--dim); }
+  .stats tbody tr { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--row); }
+  .stats tbody td { padding: 0; border: 0; }
+  .stats td.st-n::before { content: "n "; color: var(--dim); }
+  .src-cols { grid-template-columns: minmax(0, 1fr); }
+  .src-col { border-left: 0; border-top: 1px solid var(--line); }
+  .src-col:first-child { border-top: 0; }
+  .dev-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dev-actions .btn { height: var(--tap); font-size: 14px; }
+  .fold > summary { min-height: var(--tap); pointer-events: auto; cursor: pointer; }
+  .fold > summary::after { content: "▾"; color: var(--dim); }
+  .fold[open] > summary::after { content: "▴"; }
 }

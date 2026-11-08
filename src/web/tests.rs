@@ -252,6 +252,10 @@ async fn unauthenticated_requests_are_sent_to_login() {
         "/recorder/live",
         "/recorder/live/events",
         "/devices",
+        "/p/devices",
+        "/devices/streamer",
+        "/devices/out/tv",
+        "/devices/la/3",
         "/config",
         "/p/cockpit",
         "/p/status",
@@ -536,26 +540,443 @@ fn bus_entry(la: u8) -> BusEntryView {
         identified: false,
         verified: false,
         matched_role: None,
+        confirmed_at: None,
+        next_identify_at: None,
+    }
+}
+
+/// A bus entry bound to `role`, confirmed live a minute ago.
+fn bound_entry(la: u8, physical: &str, osd: &str, role: &str) -> BusEntryView {
+    BusEntryView {
+        physical_address: Some(physical.to_owned()),
+        device_type: Some(4),
+        osd: Some(osd.to_owned()),
+        power: BusPower::Standby,
+        last_seen: Some(chrono::Utc::now() - chrono::TimeDelta::seconds(26)),
+        identified: true,
+        verified: true,
+        matched_role: Some(role.to_owned()),
+        confirmed_at: Some(chrono::Utc::now() - chrono::TimeDelta::minutes(1)),
+        ..bus_entry(la)
+    }
+}
+
+/// The bridge, the streamer bound at LA 4, the receiver's audio system at LA 5, an
+/// unmatched tuner at LA 3 and an unidentified LA 9 with its next query due in 4½ min.
+fn registry_bus(snapshot: &mut Snapshot) {
+    let now = chrono::Utc::now();
+    let mut audio = bus_entry(5);
+    audio.device_type = Some(5);
+    audio.physical_address = Some("2.0.0.0".to_owned());
+    let mut tuner = bus_entry(3);
+    tuner.identified = true;
+    tuner.verified = true;
+    tuner.osd = Some("Tuner".to_owned());
+    let mut unknown = bus_entry(9);
+    unknown.verified = true;
+    unknown.next_identify_at = Some(now + chrono::TimeDelta::seconds(270));
+    snapshot.bus = vec![
+        bus_entry(snapshot.bridge_logical_address),
+        tuner,
+        bound_entry(4, "2.1.0.0", "Streamer", "streamer"),
+        audio,
+        unknown,
+    ];
+    snapshot.roles[0].logical_address = Some(4);
+    snapshot.roles[0].physical_address = Some("2.1.0.0".to_owned());
+    snapshot.roles[0].osd = Some("Streamer".to_owned());
+    snapshot.roles[0].last_seen = Some(now - chrono::TimeDelta::seconds(26));
+}
+
+#[tokio::test]
+async fn registry_lists_roles_outputs_bridge_then_unbound_entries() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    registry_bus(&mut snapshot);
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices").await;
+    let at = |text: &str| {
+        html.find(text)
+            .unwrap_or_else(|| panic!("{text:?} is rendered"))
+    };
+    let order = [
+        "Roles · 2",
+        "href=\"/devices/streamer\"",
+        "href=\"/devices/console\"",
+        "Outputs · 3",
+        "href=\"/devices/out/tv\"",
+        "href=\"/devices/out/receiver\"",
+        "href=\"/devices/out/speakers\"",
+        "href=\"/devices/out/bridge\"",
+        "Unbound bus entries · 2",
+        "href=\"/devices/la/3\"",
+        "href=\"/devices/la/9\"",
+    ];
+    for pair in order.windows(2) {
+        assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
+    }
+    // The audio system belongs to the receiver row, the bridge to its own section.
+    assert!(!html.contains("href=\"/devices/la/5\""));
+    assert!(!html.contains("href=\"/devices/la/0\""));
+    assert!(row_containing(&html, "href=\"/devices/out/receiver\"").contains("5 · 2.0.0.0"));
+    let streamer = row_containing(&html, "href=\"/devices/streamer\"");
+    assert!(streamer.contains(">bound<") && streamer.contains("4 · 2.1.0.0"));
+    assert!(
+        streamer.contains("cec · ha"),
+        "the streamer has a media player"
+    );
+    assert!(row_containing(&html, "href=\"/devices/console\"").contains(">unbound<"));
+    let unknown = row_containing(&html, "href=\"/devices/la/9\"");
+    assert!(unknown.contains(">unidentified<"));
+    assert!(unknown.contains("next query in 4 m"), "{unknown}");
+    assert!(row_containing(&html, "href=\"/devices/la/3\"").contains(">unmatched<"));
+    // Footer notes only for states present: no restored role here.
+    assert!(html.contains("LA 9 has talked but not yet answered every identification query."));
+    assert!(html.contains("LA 3 is fully identified but no role"));
+    assert!(!html.contains("came from the state file"));
+    // The page polls the rows block.
+    assert!(html.contains("hx-get=\"/p/devices\" hx-trigger=\"every 5s\""));
+}
+
+#[tokio::test]
+async fn registry_poll_returns_the_rows_block_only() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    registry_bus(&mut snapshot);
+    h.state.publish(snapshot, []);
+    let partial = ok_page(&h, &cookie, "/p/devices").await;
+    assert!(partial.contains("id=\"registry\""));
+    assert!(partial.contains("href=\"/devices/la/9\""));
+    for chrome in [
+        "<html",
+        "class=\"topbar\"",
+        "id=\"status\"",
+        "<h1>Devices</h1>",
+    ] {
+        assert!(!partial.contains(chrome), "{chrome}");
     }
 }
 
 #[tokio::test]
-async fn devices_rows_offer_forget_except_for_the_bridge() {
+async fn role_page_shows_sources_identity_stats_quirks_and_decisions() {
+    use crate::action::{Expectation, Field, Outcome, Verdict, Via};
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    assert_eq!(
+        h.get("/devices/nope", Some(&cookie)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut snapshot = h.state.snapshot();
+    registry_bus(&mut snapshot);
+    snapshot.ha.media_players[0].state = "playing".to_owned();
+    snapshot.recent_frames = vec![frame(4, 0, 0x90, "Report Power Status")].into();
+    let tv_on = Expectation {
+        subject: "tv".to_owned(),
+        field: Field::Power,
+        expect: "on".to_owned(),
+        via: vec![Via::TvDirect],
+        deadline_ms: 45_000,
+        attempts: 0,
+        outcome: Outcome::Met {
+            via: Via::TvDirect,
+            observed: "on".to_owned(),
+            latency_ms: 7_400,
+        },
+    };
+    snapshot.decisions = vec![DecisionView {
+        id: 40,
+        role: Some("streamer".to_owned()),
+        from: Some(RolePower::Off),
+        to: Some(RolePower::On),
+        reason: "ActiveSource".to_owned(),
+        would: false,
+        expectations: vec![tv_on],
+        verdict: Verdict::Achieved,
+        ..shadow_decision()
+    }]
+    .into();
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices/streamer").await;
+    for expected in [
+        // Power, by source: CEC standby is used; Home Assistant says playing.
+        "CEC · bus · used",
+        "last frame 4 → 0 · 90 21 00 Report Power Status",
+        "media_player.test_streamer",
+        ">disagree<",
+        // Identity against the rule.
+        "4 · playback device 1",
+        ">matches rule<",
+        "match = { osd = &#34;Streamer&#34; }",
+        "live Report Physical Address matched the stored 2.1.0.0",
+        ">verified<",
+        // How it behaves.
+        "1 / 1 achieved",
+        "p50 7.4 s · p95 hidden",
+        // Quirks from the profile.
+        "<code>takeover = cec_standby</code>",
+        "Edit in Config →",
+        // Decisions involving it.
+        "triggered: off → on",
+        "href=\"/recorder?role=streamer\"",
+        // The same commands as before.
+        "hx-post=\"/actions/identify/4\"",
+        "hx-post=\"/actions/takeover/streamer\"",
+        "hx-post=\"/actions/forget/4\"",
+        "hx-confirm=\"Forget Test Streamer at LA 4? It will be re-learned if it talks again.\"",
+    ] {
+        assert!(html.contains(expected), "role page lacks {expected}");
+    }
+    // Shadow (the test config): a would take-over without confirmation.
+    assert!(html.contains("Would take over…"));
+    assert!(!html.contains("hx-confirm=\"Take over the room"));
+}
+
+#[tokio::test]
+async fn restored_role_waits_for_its_device_with_identify_now() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, _) = h.login().await;
     let mut snapshot = h.state.snapshot();
-    let bridge = snapshot.bridge_logical_address;
-    snapshot.bus = vec![bus_entry(bridge), bus_entry(3)];
+    // The console's rule is `physical = "2.3.0.0"`: the state file brought LA 11 back.
+    let mut stored = bound_entry(11, "2.3.0.0", "Console", "console");
+    stored.verified = false;
+    stored.matched_role = None;
+    stored.power = BusPower::Unknown;
+    snapshot.bus = vec![stored];
+    snapshot.roles[1].restored = true;
     h.state.publish(snapshot, []);
-    let html = body(h.get("/devices", Some(&cookie)).await).await;
-    let row = between(&html, "<td class=\"mono\">3</td>", "</tr>");
-    assert!(row.contains(r#"hx-post="/actions/forget/3""#));
-    assert!(row.contains("hx-confirm=\"Forget LA 3? It will be re-learned if it talks again.\""));
-    assert!(row.contains(r#"hx-post="/actions/identify/3""#));
-    // Both buttons share the last cell: the row keeps the header's nine columns.
-    assert_eq!(row.matches("<td").count(), 8, "plus the LA cell = 9");
-    assert!(!html.contains(&format!("/actions/forget/{bridge}\"")));
-    assert!(html.contains(&format!("/actions/identify/{bridge}\"")));
+
+    let registry = ok_page(&h, &cookie, "/devices").await;
+    let row = row_containing(&registry, "href=\"/devices/console\"");
+    assert!(row.contains(">restored<") && row.contains("before restart"));
+    assert!(
+        row.contains("11 · 2.3.0.0"),
+        "keys of the entry it waits on"
+    );
+    assert!(
+        !registry.contains("href=\"/devices/la/11\""),
+        "not an unbound entry"
+    );
+    assert!(registry.contains("identity came from the state file after the"));
+
+    let html = ok_page(&h, &cookie, "/devices/console").await;
+    for expected in [
+        "Restored, waiting for the device to talk",
+        "id=\"identify-now\" class=\"btn sm\" hx-post=\"/actions/identify/11\"",
+        "LA 11 · 2.3.0.0",
+        "nothing on the bus",
+        "forgotten after 30 days unheard",
+    ] {
+        assert!(html.contains(expected), "restored page lacks {expected}");
+    }
+    assert!(
+        !html.contains("hx-post=\"/actions/forget/"),
+        "forget is for bound roles"
+    );
+    let entry = h.get("/devices/la/11", Some(&cookie)).await;
+    assert_eq!(entry.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&entry), "/devices/console");
+}
+
+#[tokio::test]
+async fn unbound_entry_page_offers_identify_and_forget_and_others_redirect() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    registry_bus(&mut snapshot);
+    snapshot.recent_frames = vec![frame(3, 0, 0x87, "Device Vendor ID")].into();
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices/la/3").await;
+    assert!(html.contains("hx-post=\"/actions/identify/3\""));
+    assert!(html.contains(
+        "hx-post=\"/actions/forget/3\" hx-swap=\"none\" hx-confirm=\"Forget LA 3? It will be re-learned if it talks again.\""
+    ));
+    assert!(html.contains("Device Vendor ID"), "its recent frames");
+    let unidentified = ok_page(&h, &cookie, "/devices/la/9").await;
+    assert!(unidentified.contains("next query in 4 m"));
+    for (path, to) in [
+        ("/devices/la/4", "/devices/streamer"),
+        ("/devices/la/0", "/devices/out/bridge"),
+        ("/devices/la/5", "/devices/out/receiver"),
+    ] {
+        let response = h.get(path, Some(&cookie)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(location(&response), to, "{path}");
+    }
+    for missing in ["/devices/la/12", "/devices/la/x", "/devices/out/nope"] {
+        assert_eq!(
+            h.get(missing, Some(&cookie)).await.status(),
+            StatusCode::NOT_FOUND,
+            "{missing}"
+        );
+    }
+    let bridge = ok_page(&h, &cookie, "/devices/out/bridge").await;
+    assert!(
+        bridge.contains(
+            "id=\"bridge-page-info\" class=\"pb-flow\" hx-get=\"/devices/out/bridge\" hx-trigger=\"every 3s\" hx-select=\"#bridge-page-info\""
+        ),
+        "the page polls its own wrapper"
+    );
+    // The drawer's ids stay free, so opening it here never duplicates one.
+    assert!(!bridge.contains("id=\"bridge-info\""));
+    assert!(
+        !bridge.contains("/actions/send-raw"),
+        "raw send stays in the drawer"
+    );
+}
+
+#[tokio::test]
+async fn receiver_page_identifies_and_forgets_its_audio_system_entry() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    registry_bus(&mut snapshot);
+    snapshot.warming = false;
+    h.state.publish(snapshot.clone(), []);
+    let html = ok_page(&h, &cookie, "/devices/out/receiver").await;
+    assert!(html.contains("hx-post=\"/actions/identify/5\" hx-swap=\"none\">Identify<"));
+    assert!(html.contains(
+        "hx-post=\"/actions/forget/5\" hx-swap=\"none\" hx-confirm=\"Forget the receiver's CEC entry at LA 5? It will be re-learned if it talks again.\""
+    ));
+    snapshot.warming = true;
+    h.state.publish(snapshot.clone(), []);
+    let html = ok_page(&h, &cookie, "/devices/out/receiver").await;
+    assert!(html.contains(
+        "hx-post=\"/actions/identify/5\" hx-swap=\"none\" disabled title=\"warming: actions are refused until the bus model settles\""
+    ));
+    // No audio system on the bus: nothing to identify or forget.
+    snapshot.bus.retain(|entry| entry.logical_address != 5);
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices/out/receiver").await;
+    assert!(!html.contains("hx-post=\"/actions/identify/"));
+    assert!(!html.contains("hx-post=\"/actions/forget/"));
+}
+
+#[tokio::test]
+async fn role_page_renders_each_section_once() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    registry_bus(&mut snapshot);
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices/streamer").await;
+    for once in [
+        "<h2 class=\"grow\">Identity</h2>",
+        "<h2 class=\"grow\">Identity events</h2>",
+        "class=\"tbl events\"",
+        "<h2 class=\"grow\">Quirks</h2>",
+        "class=\"pb quirks\"",
+        "<h2 class=\"grow\">Decisions involving Test Streamer</h2>",
+        "class=\"tbl involved\"",
+        "href=\"/config\">Edit in Config →",
+    ] {
+        assert_eq!(html.matches(once).count(), 1, "{once}");
+    }
+    assert!(!html.contains("phone-only"), "no copy for the other width");
+}
+
+/// A drift on `tv.power` that opened at `since` and resolved 2 min 9 s later.
+fn tv_drift_pair(since: chrono::DateTime<chrono::Utc>) -> [DecisionView; 2] {
+    let detail = |observed: &str, via| DriftDetail {
+        subject: "tv".to_owned(),
+        observed: observed.to_owned(),
+        via,
+        ..drift_detail("off", since)
+    };
+    [
+        drift_decision(
+            52,
+            "drift",
+            chrono::TimeDelta::seconds(30),
+            detail("off", crate::action::Via::Ha),
+        ),
+        drift_decision(
+            53,
+            "drift_resolved",
+            chrono::TimeDelta::seconds(129),
+            detail("on", crate::action::Via::TvDirect),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn tv_page_compares_webos_with_home_assistant_and_pairs_drift_rows() {
+    let text = config_text(UNREACHABLE_ISSUER, PUBLIC_URL).replace(
+        "port = 9 }\n",
+        "port = 9 }\noff = { kind = \"webos\", host = \"tv.test\", key_env = \"CHOREGOS_TV_KEY\" }\n",
+    );
+    let h = harness_from(text);
+    let (cookie, _) = h.login().await;
+    let now = chrono::Utc::now();
+    let mut snapshot = h.state.snapshot();
+    snapshot.mode = crate::state::Mode::Active;
+    snapshot.tv_direct = Some((crate::state::DirectPower::On, now));
+    snapshot.ha.tv.state = "unavailable".to_owned();
+    snapshot.decisions = tv_drift_pair(now - chrono::TimeDelta::hours(1)).into();
+    h.state.publish(snapshot.clone(), []);
+    let html = ok_page(&h, &cookie, "/devices/out/tv").await;
+    for expected in [
+        "webOS at tv.test",
+        "webOS · direct · used",
+        ">disagree<",
+        "Home Assistant reconnects to the TV about 30 s after a wake.",
+        "<code>CHOREGOS_TV_KEY</code>",
+        "Wake → picture, Test Streamer",
+        "href=\"/recorder/52\"",
+        "href=\"/recorder/53\"",
+        "on via tv_direct",
+        "2m 9s",
+    ] {
+        assert!(html.contains(expected), "TV page lacks {expected}");
+    }
+    snapshot.ha.tv.state = "on".to_owned();
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices/out/tv").await;
+    assert!(html.contains(">agree<"));
+    assert!(!html.contains("Home Assistant reconnects"));
+}
+
+#[tokio::test]
+async fn receiver_page_times_power_and_source_expectations() {
+    use crate::action::{Expectation, Field, Outcome, Verdict, Via};
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let receiver = |field, expect: &str, latency_ms| Expectation {
+        subject: "receiver".to_owned(),
+        field,
+        expect: expect.to_owned(),
+        via: vec![Via::Ha],
+        deadline_ms: 10_000,
+        attempts: 0,
+        outcome: Outcome::Met {
+            via: Via::Ha,
+            observed: expect.to_owned(),
+            latency_ms,
+        },
+    };
+    let row = |id, expectations| DecisionView {
+        id,
+        would: false,
+        expectations,
+        verdict: Verdict::Achieved,
+        ..shadow_decision()
+    };
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions = vec![
+        row(60, vec![receiver(Field::Power, "on", 2_000)]),
+        row(61, vec![receiver(Field::Power, "off", 5_000)]),
+        row(62, vec![receiver(Field::Source, "Streamer Input", 52)]),
+    ]
+    .into();
+    h.state.publish(snapshot, []);
+    let html = ok_page(&h, &cookie, "/devices/out/receiver").await;
+    let measure = |name: &str| row_containing(&html, &format!("<td>{name}</td>")).to_owned();
+    assert!(measure("Turn on → on").contains("p50 2.0 s"));
+    assert!(measure("Turn off → off").contains("p50 5.0 s · p95 hidden"));
+    assert!(measure("Source switch").contains("p50 52 ms"));
+    assert!(html.contains("No audio-system device has talked on the bus."));
+    assert!(html.contains("<code>select_source = true</code>"));
 }
 
 #[tokio::test]
@@ -565,6 +986,13 @@ async fn pages_render_and_reference_served_assets() {
     for path in [
         "/recorder/live?la=4&opcode=82",
         "/devices",
+        "/p/devices",
+        "/devices/streamer",
+        "/devices/console",
+        "/devices/out/tv",
+        "/devices/out/receiver",
+        "/devices/out/speakers",
+        "/devices/out/bridge",
         "/recorder",
         "/recorder/glossary",
         "/config",

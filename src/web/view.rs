@@ -3,6 +3,7 @@
 //! Colour and tone helpers return class names only; templates never branch on raw strings
 //! to pick a colour.
 
+pub(crate) mod devices;
 pub(crate) mod recorder;
 pub(crate) mod window;
 
@@ -12,8 +13,8 @@ use super::auth::{Ctx, SessionUser};
 use crate::{
     action::{DriftDetail, Expectation, Field, Outcome, ServiceKind, Trigger, Verdict},
     state::{
-        BridgeTelemetry, BusPower, DecisionView, DirectPower, FrameDirection, HaEntityView, Health,
-        Mode, RolePower, RoleView, RoomPower, Snapshot,
+        BridgeTelemetry, BusEntryView, BusPower, DecisionView, DirectPower, FrameDirection,
+        HaEntityView, Health, Mode, RolePower, RoleView, RoomPower, Snapshot,
     },
 };
 
@@ -713,6 +714,77 @@ impl Segment {
     pub(crate) fn title(&self) -> Option<String> {
         self.at.as_ref().map(iso)
     }
+}
+
+/// A role's power by truth source: CEC (its bus entry), Home Assistant (its media player,
+/// when configured) and the probe. The one Choregos used is marked: the probe when its
+/// sample is newer than the last CEC word, else CEC.
+pub(crate) struct RoleSources {
+    pub(crate) cec: Segment,
+    pub(crate) ha: Segment,
+    pub(crate) probe: Segment,
+}
+
+/// The bus entry a role is bound to.
+pub(crate) fn bound_entry<'a>(snapshot: &'a Snapshot, role: &RoleView) -> Option<&'a BusEntryView> {
+    role.logical_address.and_then(|la| {
+        snapshot
+            .bus
+            .iter()
+            .find(|entry| entry.logical_address == la)
+    })
+}
+
+/// Unbound, waiting for an entry restored from the state file to be confirmed live.
+pub(crate) fn is_restored(role: &RoleView) -> bool {
+    role.restored && role.logical_address.is_none()
+}
+
+/// A role's identity chip, `(label, tone)`: conflict, restored, bound or unbound. Bound
+/// entries are verified (identity binds nothing else); a restored role is unbound and only
+/// matches an entry the state file brought back.
+pub(crate) fn role_identity(role: &RoleView) -> (&'static str, &'static str) {
+    if role.conflicted {
+        ("conflict", "bad")
+    } else if is_restored(role) {
+        ("restored", "pend")
+    } else if role.logical_address.is_some() {
+        ("bound", "ok")
+    } else {
+        ("unbound", "dim")
+    }
+}
+
+pub(crate) fn role_sources(snapshot: &Snapshot, role: &RoleView) -> RoleSources {
+    let shadow = snapshot.mode == Mode::Shadow;
+    let entry = bound_entry(snapshot, role);
+    let mut cec = match entry {
+        Some(entry) => Segment::new("cec", bus_power(&entry.power), role.last_seen),
+        None if is_restored(role) => Segment::absent("cec", "silent since restore"),
+        None => Segment::absent("cec", "—"),
+    };
+    let ha = match (role.media_player.is_some(), ha_entity_for(snapshot, role)) {
+        (true, Some(entity)) => Segment::new("ha", entity.state.clone(), entity.last_changed),
+        (true, None) => Segment::absent("ha", "unknown"),
+        (false, _) => Segment::absent("ha", "not configured"),
+    };
+    let mut probe = match (role.probe_configured, role.direct) {
+        (false, _) => Segment::absent("probe", "—"),
+        (true, _) if shadow => Segment::absent("probe", "not sampled (shadow)"),
+        (true, Some((state, at))) => Segment::new("probe", state.to_string(), Some(at)),
+        (true, None) => Segment::absent("probe", "not sampled"),
+    };
+    // Power follows CEC; a probe sample newer than the last CEC word is what was used last.
+    let probe_newer = !shadow
+        && role
+            .direct
+            .is_some_and(|(_, at)| role.last_seen.is_none_or(|seen| at > seen));
+    if role.probe_configured && probe_newer {
+        probe.used = true;
+    } else if entry.is_some() {
+        cec.used = true;
+    }
+    RoleSources { cec, ha, probe }
 }
 
 // Askama passes call arguments by reference, hence the `&` parameters below.

@@ -1,0 +1,73 @@
+<header class="dev-head">
+  <div class="grow">
+    <span class="k">Output · {{ page.kind.subject() }}</span>
+    <div class="row"><h1>{{ page.name() }}</h1><span class="chip {{ page.chip.0 }}">{{ page.chip.1 }}</span></div>
+    <span class="mono dim small">{{ page.sub }}</span>
+  </div>
+</header>
+
+<section class="panel flush" aria-label="Power, by source">
+  <div class="ph"><h2 class="grow">Power, by source</h2>{% if let Some(agreement) = page.agreement %}<span class="chip {{ agreement.tone() }}">{{ agreement.label() }}</span>{% endif %}<span class="note desk-only">{{ page.agreement_note }}</span></div>
+  {% include "partials/source_cols.html" %}
+  {% if let Some(explain) = page.explain %}<p class="pb small explain">{{ explain }}</p>{% endif %}
+  {% if !page.attributes.is_empty() %}
+  <dl class="dl pb">{% for (key, value) in page.attributes %}<dt>{{ key }}</dt><dd class="mono">{{ value }}</dd>{% endfor %}</dl>
+  {% endif %}
+</section>
+
+{% if let Some(cec) = page.cec %}
+<section class="panel flush" aria-label="CEC entry">
+  <div class="ph"><h2 class="grow">CEC entry</h2><span class="note">audio system</span></div>
+  {% if cec.is_empty() %}
+  <p class="pb dim">No audio-system device has talked on the bus.</p>
+  {% else %}
+  <dl class="dl pb">{% for (key, value) in cec %}<dt>{{ key }}</dt><dd class="mono">{{ value }}</dd>{% endfor %}</dl>
+  {% if let Some(la) = page.cec_la %}
+  <div class="row pb">
+    <button type="button" id="identify-la-{{ la }}" class="btn sm ghost" hx-post="/actions/identify/{{ la }}" hx-swap="none"{% if page.warming %} disabled title="warming: actions are refused until the bus model settles"{% endif %}>Identify</button>
+    <button type="button" id="forget-la-{{ la }}" class="btn sm danger" hx-post="/actions/forget/{{ la }}" hx-swap="none" hx-confirm="Forget the receiver's CEC entry at LA {{ la }}? It will be re-learned if it talks again.">Forget…</button>
+  </div>
+  {% endif %}
+  {% endif %}
+</section>
+{% endif %}
+
+<div class="two">
+  <section class="panel flush" aria-label="Timings">
+    <div class="ph"><h2 class="grow">Timings</h2><span class="note">decisions in memory · p95 hidden under n = {{ crate::web::view::devices::P95_MIN_N }}</span></div>
+    {% let read_as = false %}{% let measures = page.measures %}
+    {% include "partials/measures.html" %}
+  </section>
+  {% if let Some(drifts) = page.drifts %}
+  <section class="panel flush" aria-label="Drift history">
+    <div class="ph"><h2 class="grow">Drift history</h2><span class="chip {% if drifts.is_empty() %}dim{% else %}warn{% endif %}">{{ drifts.len() }} in memory</span></div>
+    <div class="scroll-x">
+      <table class="tbl drifts">
+        <thead><tr><th scope="col">Field</th><th scope="col">Opened</th><th scope="col">Resolved</th><th scope="col" class="r">Lasted</th></tr></thead>
+        <tbody>
+          {% for drift in drifts %}
+          <tr>
+            <td><span class="mono">{{ page.kind.subject() }}.{{ drift.field }}</span><br><span class="small dim">intended {{ drift.intended }}{% if let Some(observed) = drift.observed %}, observed {{ observed }}{% endif %}</span></td>
+            <td class="mono">{% if let Some((id, at)) = drift.opened %}<a href="/recorder/{{ id }}">#{{ id }}</a> {{ view::when_ms(at) }}<br>{% endif %}<span class="small dim">since {{ view::when(drift.since) }}</span></td>
+            <td class="mono">{% if let Some((id, at, value)) = drift.resolved %}<a href="/recorder/{{ id }}">#{{ id }}</a> {{ view::when_ms(at) }}<br><span class="small dim">{{ value }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+            <td class="mono num r">{{ drift.lasted }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">No drift in memory.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="note pb"><span class="mono">drift</span> — the room disagreed with its intended state for longer than the grace period{% if let Some(grace) = page.drift_grace_s %} ({{ grace }} s){% endif %}; reporting only.</p>
+  </section>
+  {% endif %}
+</div>
+
+<section class="panel flush" aria-label="How Choregos drives it">
+  <div class="ph"><h2 class="grow">How Choregos drives it</h2>{% if page.kind == crate::web::view::devices::OutputKind::Tv %}<span class="chip dim">restart to change</span>{% endif %}</div>
+  {% if page.drive.is_empty() %}
+  <p class="pb dim">The configuration on disk could not be read.</p>
+  {% else %}
+  <ul class="pb quirks">{% for sentence in page.drive %}<li>{% include "partials/sentence.html" %}</li>{% endfor %}</ul>
+  {% endif %}
+</section>
