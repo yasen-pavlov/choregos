@@ -7,11 +7,21 @@ Use a matching local `choregos` CLI for offline replay and extraction.
 
 ## Files in the config volume
 
-- **`choregos.toml`** is the configuration source of truth. The UI validates
-  and atomically replaces the editor text, preserving comments and order.
-  Secrets are environment-only and are not serialized into the configuration;
-  saving is not a scrubber for secrets pasted into comments. Back up the file
-  before manual edits, and stop the service while editing it outside the UI.
+- **`choregos.toml`** is the configuration source of truth. The UI's Config page
+  (section forms, the role editor and the raw TOML editor) reads the file itself
+  and applies each edit to the file's own text, so comments, ordering and
+  formatting survive, and every save goes through a review of the line diff. A
+  section form writes only the fields you changed, never the others.
+  Right before writing, Choregos reads the file again and refuses the save (with
+  a fresh review of your changes against the file as it is now) if it changed
+  since the editor read it — a hand edit of the mounted file or a mode switch;
+  review again. This is a check, not a lock: a
+  writer outside Choregos landing in the last moment between that check and the
+  atomic rename is not caught, so stop the service while editing the file outside
+  the UI. Secrets are environment-only and are not serialized into the
+  configuration; the UI shows only their variable names and whether each is set,
+  and saving is not a scrubber for secrets pasted into comments. Back up the file
+  before manual edits.
 - **`choregos.state.json`** version 2 holds learned identities, the newest 2000
   decisions (newest last), and `next_decision_id`; version 1 is migrated in place.
   It contains no live power or active-source state. Deleting it while stopped
@@ -248,7 +258,8 @@ polls: it is not a network-isolated diagnostic mode.
 
 A successful UI save restarts both MQTT and HA adapters. Retained bridge online
 availability then triggers a resync burst. Bridge settings are live-editable;
-`web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` changes require stopping,
+`web`, `mqtt`, `home_assistant`, `tv.wake` and `tv.off` are read-only in the UI
+(the raw editor rejects changes to them at validation) and require stopping,
 editing the mounted file and restarting. Validate startup configuration with
 `choregos check-config --config ./choregos/choregos.toml` (required secret
 environment variables must be present; output is redacted).

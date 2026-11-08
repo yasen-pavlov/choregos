@@ -1,0 +1,13 @@
+<div id="r{{ role.index }}-b" class="busline small"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {%- if !role.filled %}<p class="note">Fill a key to look for this player on the bus.</p>
+  {%- else if role.on_bus.is_empty() %}<p class="note">Nothing on the bus matches these keys now.</p>{% endif %}
+  {%- for candidate in role.on_bus %}
+  <p>On the bus now: <span class="mono">{{ candidate.line }}</span> — <span class="ok-text">matches</span>. <button type="button" class="link" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"fill:{{ role.index }}:{{ candidate.la }}"}'>Fill from this entry</button></p>
+  {%- endfor %}
+  {%- if !role.unbound.is_empty() %}
+  <p class="note">Unbound entries on the bus:</p>
+  {%- for candidate in role.unbound %}
+  <p><span class="mono">{{ candidate.line }}</span> <button type="button" class="link" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"fill:{{ role.index }}:{{ candidate.la }}"}'>Fill from this entry</button></p>
+  {%- endfor %}
+  {%- endif %}
+</div>

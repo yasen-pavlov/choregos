@@ -1,0 +1,1 @@
+<div id="p{{ slot.index }}-p" class="cfg-problems"{% if oob %} hx-swap-oob="true"{% endif %}>{% for problem in slot.problems %}<p class="flash err">{{ problem }}</p>{% endfor %}</div>

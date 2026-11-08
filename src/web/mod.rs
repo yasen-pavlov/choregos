@@ -85,10 +85,11 @@ pub fn router(state: AppState) -> Router {
         .route("/devices/out/{name}", get(routes::devices::output))
         .route("/devices/la/{la}", get(routes::devices::entry))
         .route("/devices/{role}", get(routes::devices::role))
-        .route(
-            "/config",
-            get(routes::config::page).post(routes::config::submit),
-        )
+        .route("/config", get(routes::config::page))
+        .route("/p/config/{section}", get(routes::config::partial))
+        .route("/config/validate", post(routes::config::validate))
+        .route("/config/preview", post(routes::config::preview))
+        .route("/config/save", post(routes::config::save))
         .route("/actions/mode", post(routes::actions::mode))
         .route("/actions/all-off", post(routes::actions::all_off))
         .route("/actions/identify/{la}", post(routes::actions::identify))
@@ -162,12 +163,18 @@ pub(crate) enum WebError {
     BadRequest(String),
     #[error("not found")]
     NotFound,
+    /// The configuration file could not be read through the runtime.
+    #[error("configuration file unavailable: {0}")]
+    ConfigFile(#[from] crate::config::ConfigError),
 }
 
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::Render(_) | Self::Session(_) => {
+            Self::ConfigFile(crate::config::ConfigError::Unavailable) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::Render(_) | Self::Session(_) | Self::ConfigFile(_) => {
                 tracing::error!(error = %self, "web request failed");
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }

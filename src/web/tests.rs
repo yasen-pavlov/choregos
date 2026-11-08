@@ -14,7 +14,7 @@ use tower::ServiceExt;
 use super::router;
 use crate::{
     action::DriftDetail,
-    config::Config,
+    config::{Config, ConfigError},
     state::{
         AppState, BridgeTelemetry, BusEntryView, BusPower, Command, CommandError, DecisionView,
         FrameDirection, FrameView, RolePower, Snapshot, UiEvent,
@@ -122,6 +122,12 @@ username = "admin"
 struct Harness {
     app: Router,
     state: AppState,
+    /// The config file the fake runtime reads and saves through the runtime's own
+    /// `read_config` / `reload`.
+    path: std::path::PathBuf,
+    /// Errors the fake runtime answers the next saves with, before touching the file.
+    rejections: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ConfigError>>>,
+    _directory: tempfile::TempDir,
 }
 
 fn harness(issuer: &str) -> Harness {
@@ -142,14 +148,78 @@ fn harness_from(text: String) -> Harness {
             })
         })
         .expect("test secrets resolve");
-    let state = AppState::new(config, text);
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("choregos.toml");
+    std::fs::write(&path, &text).expect("test config is written");
+    let state = AppState::new(config.clone(), text);
+    let rejections = std::sync::Arc::default();
+    fake_runtime(
+        &state,
+        config,
+        path.clone(),
+        std::sync::Arc::clone(&rejections),
+    );
     Harness {
         app: router(state.clone()),
         state,
+        path,
+        rejections,
+        _directory: directory,
     }
 }
 
+/// Answers config reads and saves as the runtime does, against the harness file: a save is
+/// checked, compared with the file's hash and written by `runtime::reload`, then becomes the
+/// running config. Commands get no answer (the runtime is "unavailable" to them).
+fn fake_runtime(
+    state: &AppState,
+    mut running: Config,
+    path: std::path::PathBuf,
+    rejections: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ConfigError>>>,
+) {
+    let (sender, mut inputs) = tokio::sync::mpsc::channel(8);
+    state.attach(sender);
+    let state = state.clone();
+    tokio::spawn(async move {
+        while let Some(input) = inputs.recv().await {
+            match input {
+                crate::runtime::Input::Request(crate::runtime::Request::ReadConfig(reply)) => {
+                    let _ = reply.send(crate::runtime::read_config(&path).await);
+                }
+                crate::runtime::Input::Request(crate::runtime::Request::SaveConfig(
+                    text,
+                    expected,
+                    reply,
+                )) => {
+                    let rejection = rejections.lock().unwrap().pop_front();
+                    let result = match rejection {
+                        Some(error) => Err(error),
+                        None => crate::runtime::reload(&text, expected, &running, &path)
+                            .await
+                            .map(|config| {
+                                running = config;
+                                state.replace_config_text(text);
+                            }),
+                    };
+                    let _ = reply.send(result);
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
 impl Harness {
+    /// The config file as it is on disk.
+    fn file(&self) -> String {
+        std::fs::read_to_string(&self.path).expect("config file")
+    }
+
+    /// The next save is answered with `error` and writes nothing.
+    fn reject_next_save(&self, error: ConfigError) {
+        self.rejections.lock().unwrap().push_back(error);
+    }
+
     async fn send(&self, request: Request<Body>) -> Response {
         self.app.clone().oneshot(request).await.expect("infallible")
     }
@@ -260,6 +330,7 @@ async fn unauthenticated_requests_are_sent_to_login() {
         "/p/cockpit",
         "/p/status",
         "/p/bridge",
+        "/p/config/timing",
     ] {
         let response = h.get(path, None).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
@@ -376,41 +447,936 @@ async fn logout_ends_the_session() {
     );
 }
 
+fn encode(pairs: &[(&str, &str)]) -> String {
+    openidconnect::url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+}
+
+/// The value of the hidden input `name` in rendered HTML, unescaped.
+fn hidden(html: &str, name: &str) -> String {
+    unescape(between(html, &format!("name=\"{name}\" value=\""), "\""))
+}
+
+/// The value a browser gives the textarea `name`: its text, unescaped, without the one
+/// newline the HTML parser drops after the start tag.
+fn textarea(html: &str, name: &str) -> String {
+    let at = html
+        .find(&format!("<textarea id=\"f-{}\"", name.replace('.', "-")))
+        .unwrap_or_else(|| panic!("textarea {name} is rendered"));
+    let content = between(&html[at..], ">", "</textarea>");
+    unescape(content.strip_prefix('\n').unwrap_or(content))
+}
+
+fn unescape(escaped: &str) -> String {
+    let mut out = String::new();
+    let mut rest = escaped;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let end = rest[at..].find(';').expect("entity end") + at;
+        let entity = &rest[at + 1..end];
+        out.push(match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            numeric => char::from_u32(numeric.trim_start_matches('#').parse().expect("entity"))
+                .expect("char"),
+        });
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[tokio::test]
-async fn invalid_config_is_reported_inline_and_not_saved() {
+async fn config_lists_every_section_and_opens_the_first_editable_one() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config").await;
+    for (section, badge) in [
+        ("mqtt", "<span class=\"chip dim\">restart</span>"),
+        ("home_assistant", "<span class=\"chip dim\">restart</span>"),
+        ("web", "<span class=\"chip dim\">restart</span>"),
+        ("tv", "<span class=\"chip dim\">partly</span>"),
+        ("devices", "<span class=\"chip plain\">2</span>"),
+        ("timing", "</a>"),
+    ] {
+        assert!(
+            page.contains(&format!("<span class=\"mono\">{section}</span>{badge}")),
+            "{section}: {page}"
+        );
+    }
+    assert!(page.contains("hx-push-url=\"/config?section=bridge\" aria-current=\"page\""));
+    assert!(page.contains("name=\"section\" value=\"bridge\""));
+    assert!(page.contains("<h2 class=\"mono\">[bridge]</h2>"));
+    assert_eq!(
+        h.get("/config?section=nope", Some(&cookie)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.get("/p/config/nope", Some(&cookie)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_section_partial_shows_defaults_bounds_and_moves_the_nav() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let html = ok_page(&h, &cookie, "/p/config/timing").await;
+    assert!(html.starts_with("<form id=\"section\""), "{html}");
+    assert!(html.contains(
+        "name=\"timing.standby_retries\" value=\"2\" inputmode=\"numeric\" min=\"0\" max=\"10\""
+    ));
+    assert!(
+        html.contains("Default 2 · 0–10."),
+        "absent key shows its default"
+    );
+    assert!(html.contains(
+        "<nav id=\"cfg-nav\" class=\"cfg-nav\" aria-label=\"Sections\" hx-swap-oob=\"true\">"
+    ));
+    assert!(html.contains("hx-push-url=\"/config?section=timing\" aria-current=\"page\""));
+    // A restart-gated section is read-only: values and secret names, no inputs, no footer.
+    let web = ok_page(&h, &cookie, "/p/config/web").await;
+    assert!(web.contains(
+        "<dt class=\"mono\">public_url</dt><dd class=\"mono\">https://choregos.example.com/</dd>"
+    ));
+    assert!(!web.contains("<textarea") && !web.contains("id=\"cfg-foot\""));
+}
+
+#[tokio::test]
+async fn secrets_appear_only_as_variable_names() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    for path in [
+        "/config?section=web",
+        "/config?section=mqtt",
+        "/config?section=home_assistant",
+        "/config?section=tv",
+        "/config?tab=raw",
+    ] {
+        let html = ok_page(&h, &cookie, path).await;
+        assert!(
+            !html.contains(PASSWORD) && !html.contains("test-only-"),
+            "{path}"
+        );
+    }
+    let web = ok_page(&h, &cookie, "/config?section=web").await;
+    for name in [
+        "CHOREGOS_SESSION_SECRET",
+        "CHOREGOS_OIDC_CLIENT_SECRET",
+        "CHOREGOS_LOCAL_PASSWORD",
+    ] {
+        assert!(
+            web.contains(&format!("env {name} <span class=\"chip")),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_pins_an_out_of_bounds_value_to_its_field_and_writes_nothing() {
     let h = harness(UNREACHABLE_ISSUER);
     let (cookie, csrf) = h.login().await;
-    let saved = h.state.config_text();
-    let page = body(h.get("/config", Some(&cookie)).await).await;
-    assert!(!page.contains(PASSWORD));
-
+    let saved = h.file();
     let response = h
         .post_form(
-            "/config",
+            "/config/validate",
             &cookie,
             Some(&csrf),
-            "action=save&config=mode+%3D+%5B%22%3Cb%3E",
+            &encode(&[("section", "timing"), ("timing.standby_retries", "12")]),
         )
         .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let html = body(response).await;
-    assert!(html.contains("invalid TOML configuration"));
-    assert!(html.contains("mode = [&#34;&#60;b&#62;") || html.contains("mode = [&quot;&lt;b&gt;"));
-    assert_eq!(h.state.config_text(), saved);
+    assert!(
+        html.contains("<p id=\"f-timing-standby_retries-e\" class=\"ferr\" hx-swap-oob=\"true\">Must be between 0 and 10.</p>"),
+        "{html}"
+    );
+    assert!(html.contains(
+        "Fix the error in <a href=\"#f-timing-standby_retries\">timing.standby_retries</a>"
+    ));
+    // Only the control whose validity flipped is re-rendered, now marked invalid; the others
+    // are left alone (they may be mid-typing).
+    assert!(
+        html.contains("<input id=\"f-timing-standby_retries\" class=\"num\" type=\"number\" name=\"timing.standby_retries\" value=\"12\" inputmode=\"numeric\" min=\"0\" max=\"10\" aria-invalid=\"true\" aria-describedby=\"f-timing-standby_retries-e f-timing-standby_retries-h\" hx-swap-oob=\"true\">"),
+        "{html}"
+    );
+    assert!(!html.contains("<input id=\"f-timing-off_delay_s\""));
+    assert!(html.contains(
+        "<input type=\"hidden\" id=\"cfg-invalid\" name=\"_invalid\" value=\"timing.standby_retries\" hx-swap-oob=\"true\">"
+    ));
+    // Still wrong and already marked: nothing to re-render. Fixed: the mark comes off.
+    for (value, restated) in [("11", false), ("3", true)] {
+        let html = body(
+            h.post_form(
+                "/config/validate",
+                &cookie,
+                Some(&csrf),
+                &encode(&[
+                    ("section", "timing"),
+                    ("_invalid", "timing.standby_retries"),
+                    ("timing.standby_retries", value),
+                ]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            html.contains("<input id=\"f-timing-standby_retries\""),
+            restated,
+            "{value}: {html}"
+        );
+        assert!(!html.contains("aria-invalid") || !restated, "{html}");
+    }
+    assert_eq!(h.file(), saved);
 
-    let valid = config_text(UNREACHABLE_ISSUER, PUBLIC_URL);
-    let encoded: String = openidconnect::url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("action", "validate")
-        .append_pair("config", &valid)
-        .finish();
-    let response = h.post_form("/config", &cookie, Some(&csrf), &encoded).await;
+    let response = h
+        .post_form(
+            "/config/validate",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("section", "timing"), ("timing.off_delay_s", "5")]),
+        )
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(
+        html.contains("<span class=\"chip info\">changed · was 3</span>"),
+        "{html}"
+    );
+    assert!(html.contains("<span class=\"chip info\">1 changed</span>"));
+    assert_eq!(h.file(), saved);
+}
+
+#[tokio::test]
+async fn the_raw_editor_reports_lines_and_rejects_restart_gated_edits() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let saved = h.file();
+    let gated = saved.replace("host = \"mqtt.test\"", "host = \"broker.test\"");
+    let response = h
+        .post_form(
+            "/config/validate",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("raw", &gated)]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = body(response).await;
+    assert!(html.contains("mqtt changes require a restart"), "{html}");
+    assert!(html.contains("<span class=\"chip info\">1 changed</span>"));
+
+    let broken = saved.replace("[timing]", "[timing]\nmode = [\"<b>");
+    let response = h
+        .post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("raw", &broken)]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = body(response).await;
+    let line = saved.lines().position(|l| l == "[timing]").unwrap() + 2;
+    assert!(html.contains(&format!("line {line}: ")), "{html}");
+    assert!(
+        html.contains("mode = [&#34;&#60;b&#62;"),
+        "the text is escaped back"
+    );
+    assert_eq!(h.file(), saved);
+}
+
+#[tokio::test]
+async fn preview_lists_sentences_the_diff_and_the_file_hash() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let response = h
+        .post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("section", "timing"), ("timing.off_delay_s", "5")]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(html.contains("<h2>Review 1 change</h2>"), "{html}");
+    assert!(html.contains("<li>The room waits 5 s instead of 3 s before turning off.</li>"));
+    assert!(
+        html.contains("<ol class=\"diff mono\">"),
+        "the diff is a list: {html}"
+    );
+    assert!(
+        html.contains("<li class=\"dl hunk\"><span class=\"sign\"></span>@@ [timing] @@</li>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<li class=\"dl del\"><span class=\"sign\">-</span>off_delay_s = 3</li>")
+    );
+    assert!(
+        html.contains("<li class=\"dl add\"><span class=\"sign\">+</span>off_delay_s = 5</li>")
+    );
+    let text = h.file();
+    assert_eq!(
+        hidden(&html, "_base"),
+        crate::web::view::config::hash(&text)
+    );
+    assert_eq!(
+        hidden(&html, "_proposed"),
+        text.replace("off_delay_s = 3", "off_delay_s = 5")
+    );
+    assert_eq!(
+        hidden(&html, "timing.off_delay_s"),
+        "5",
+        "the form rides along"
+    );
+
+    // Nothing to review: the section comes back as it is.
+    let response = h
+        .post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("section", "timing")]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(
+        html.contains("No changes yet.") && !html.contains("Review 0"),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn save_against_a_moved_file_conflicts_with_a_fresh_review() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let saved = h.file();
+    let response = h
+        .post_form(
+            "/config/save",
+            &cookie,
+            Some(&csrf),
+            &encode(&[
+                ("section", "timing"),
+                ("timing.off_delay_s", "5"),
+                ("_base", "0000000000000000"),
+                (
+                    "_proposed",
+                    &saved.replace("off_delay_s = 3", "off_delay_s = 5"),
+                ),
+            ]),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let html = body(response).await;
+    assert!(
+        html.contains("The file changed since you opened the editor"),
+        "{html}"
+    );
+    assert_eq!(
+        hidden(&html, "_base"),
+        crate::web::view::config::hash(&saved)
+    );
+    assert_eq!(h.file(), saved);
+}
+
+/// Opens the timing review that changes `off_delay_s` to 5; returns the save form.
+async fn timing_review(h: &Harness, cookie: &str, csrf: &str) -> String {
+    let preview = body(
+        h.post_form(
+            "/config/preview",
+            cookie,
+            Some(csrf),
+            &encode(&[("section", "timing"), ("timing.off_delay_s", "5")]),
+        )
+        .await,
+    )
+    .await;
+    encode(&[
+        ("section", "timing"),
+        ("timing.off_delay_s", "5"),
+        ("_base", &hidden(&preview, "_base")),
+        ("_proposed", &hidden(&preview, "_proposed")),
+    ])
+}
+
+#[tokio::test]
+async fn an_external_edit_after_review_conflicts_and_survives() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let save = timing_review(&h, &cookie, &csrf).await;
+    // Someone edits the mounted file between the review and the save.
+    let external = h
+        .file()
+        .replace("[timing]\n", "[timing]\nstandby_retries = 4\n");
+    std::fs::write(&h.path, &external).unwrap();
+    let response = h
+        .post_form("/config/save", &cookie, Some(&csrf), &save)
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let html = body(response).await;
+    assert!(
+        html.contains("The file changed since you opened the editor"),
+        "{html}"
+    );
+    assert_eq!(h.file(), external, "the external edit is kept");
+    // The fresh review is against the edited file and saves on top of it.
+    let proposed = hidden(&html, "_proposed");
+    assert_eq!(
+        proposed,
+        external.replace("off_delay_s = 3", "off_delay_s = 5")
+    );
+    let retry = encode(&[
+        ("section", "timing"),
+        ("timing.off_delay_s", "5"),
+        ("_base", &hidden(&html, "_base")),
+        ("_proposed", &proposed),
+    ]);
+    let response = h
+        .post_form("/config/save", &cookie, Some(&csrf), &retry)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.file(), proposed);
+}
+
+fn encode_owned(pairs: &[(String, String)]) -> String {
+    let pairs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    encode(&pairs)
+}
+
+/// Every `<input type="hidden" name=…>` of `html`, unescaped, as the browser posts them.
+fn hidden_inputs(html: &str) -> Vec<(String, String)> {
+    html.match_indices("<input type=\"hidden\" name=\"")
+        .map(|(at, marker)| {
+            let rest = &html[at + marker.len()..];
+            let name = between(rest, "", "\"").to_owned();
+            (name, unescape(between(rest, "value=\"", "\"")))
+        })
+        .collect()
+}
+
+/// What the browser posts from the timing page `page` (its originals included), with
+/// `edits` typed over the rendered values.
+fn timing_form(page: &str, edits: &[(&str, &str)]) -> String {
+    let mut form: Vec<(String, String)> = hidden_inputs(page)
+        .into_iter()
+        .filter(|(name, _)| name == "section" || name == "_orig")
+        .collect();
+    for (at, _) in page.match_indices("type=\"number\" name=\"") {
+        let name = between(&page[at..], "name=\"", "\"").to_owned();
+        let rendered = between(&page[at..], "value=\"", "\"").to_owned();
+        let value = edits
+            .iter()
+            .find(|(edited, _)| *edited == name)
+            .map_or(rendered, |(_, typed)| (*typed).to_owned());
+        form.push((name, value));
+    }
+    encode_owned(&form)
+}
+
+/// Whether the review's diff adds or removes a line starting with `key`.
+fn diff_touches(review: &str, key: &str) -> bool {
+    ["-", "+"]
+        .iter()
+        .any(|sign| review.contains(&format!("<span class=\"sign\">{sign}</span>{key}")))
+}
+
+#[tokio::test]
+async fn a_conflicting_save_applies_only_the_users_edit_and_keeps_the_external_one() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=timing").await;
+    let form = timing_form(&page, &[("timing.off_delay_s", "5")]);
+    let review = body(
+        h.post_form("/config/preview", &cookie, Some(&csrf), &form)
+            .await,
+    )
+    .await;
+    // Between review and save, another key of the same section changes in the file.
+    let external = h
+        .file()
+        .replace("presence_poll_s = 5", "presence_poll_s = 7");
+    std::fs::write(&h.path, &external).unwrap();
+    let response = h
+        .post_form(
+            "/config/save",
+            &cookie,
+            Some(&csrf),
+            &encode_owned(&hidden_inputs(&review)),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let html = body(response).await;
+    assert!(html.contains("<h2>Review 1 change</h2>"), "{html}");
+    assert!(diff_touches(&html, "off_delay_s = 5"));
+    assert!(!diff_touches(&html, "presence_poll_s"), "{html}");
+    let proposed = hidden(&html, "_proposed");
+    assert_eq!(
+        proposed,
+        external.replace("off_delay_s = 3", "off_delay_s = 5")
+    );
+    let response = h
+        .post_form(
+            "/config/save",
+            &cookie,
+            Some(&csrf),
+            &encode_owned(&hidden_inputs(&html)),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.file(), proposed);
+    assert!(h.file().contains("presence_poll_s = 7\n"));
+}
+
+#[tokio::test]
+async fn an_edit_back_to_the_value_the_form_showed_changes_nothing() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=timing").await;
+    // The file's off_delay_s moves outside the form; the user types 5, then back to 3.
+    let external = h.file().replace("off_delay_s = 3", "off_delay_s = 8");
+    std::fs::write(&h.path, &external).unwrap();
+    let typed = |value| timing_form(&page, &[("timing.off_delay_s", value)]);
+    let html = body(
+        h.post_form("/config/validate", &cookie, Some(&csrf), &typed("5"))
+            .await,
+    )
+    .await;
+    assert!(html.contains("1 changed"), "{html}");
+    let html = body(
+        h.post_form("/config/validate", &cookie, Some(&csrf), &typed("3"))
+            .await,
+    )
+    .await;
+    assert!(html.contains("No changes yet."), "{html}");
+    let response = h
+        .post_form("/config/preview", &cookie, Some(&csrf), &typed("3"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(
+        html.contains("No changes yet.") && !html.contains("<h2>Review"),
+        "{html}"
+    );
+    assert_eq!(h.file(), external, "the file's 8 stays");
+}
+
+#[tokio::test]
+async fn the_review_diff_never_lists_an_untouched_key() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=timing").await;
+    let external = h
+        .file()
+        .replace("presence_poll_s = 5", "presence_poll_s = 7")
+        .replace("identify_retry_s = 10", "identify_retry_s = 20");
+    std::fs::write(&h.path, &external).unwrap();
+    let review = body(
+        h.post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &timing_form(&page, &[("timing.off_delay_s", "5")]),
+        )
+        .await,
+    )
+    .await;
+    assert!(review.contains("<h2>Review 1 change</h2>"), "{review}");
+    for untouched in [
+        "takeover_settle_ms",
+        "presence_poll_s",
+        "presence_misses",
+        "identify_retry_s",
+    ] {
+        assert!(!diff_touches(&review, untouched), "{untouched}: {review}");
+    }
+    assert_eq!(
+        hidden(&review, "_proposed"),
+        external.replace("off_delay_s = 3", "off_delay_s = 5")
+    );
+}
+
+#[tokio::test]
+async fn a_file_change_the_runtime_sees_at_write_time_conflicts_too() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let before = h.file();
+    let save = timing_review(&h, &cookie, &csrf).await;
+    // The web check passes; the runtime's compare right before the write does not.
+    h.reject_next_save(ConfigError::Changed);
+    let response = h
+        .post_form("/config/save", &cookie, Some(&csrf), &save)
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     assert!(
         body(response)
             .await
-            .contains("Configuration is valid (not saved).")
+            .contains("The file changed since you opened the editor")
     );
-    assert_eq!(h.state.config_text(), saved);
+    assert_eq!(h.file(), before);
+}
+
+#[tokio::test]
+async fn save_goes_through_the_runtime_and_refreshes_the_status() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let preview = body(
+        h.post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("section", "verify"), ("verify.drift_grace_s", "45")]),
+        )
+        .await,
+    )
+    .await;
+    let proposed = hidden(&preview, "_proposed");
+    assert!(
+        proposed.contains("[verify]\ndrift_grace_s = 45\n"),
+        "{proposed}"
+    );
+    let base = hidden(&preview, "_base");
+    let save = encode(&[
+        ("section", "verify"),
+        ("verify.drift_grace_s", "45"),
+        ("_base", &base),
+        ("_proposed", &proposed),
+    ]);
+
+    let before = h.file();
+    h.reject_next_save(ConfigError::Validation("nope".to_owned()));
+    let response = h
+        .post_form("/config/save", &cookie, Some(&csrf), &save)
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = body(response).await;
+    assert!(
+        html.contains("<strong>Not saved</strong>") && html.contains("invalid configuration: nope")
+    );
+    assert_eq!(h.file(), before);
+
+    let response = h
+        .post_form("/config/save", &cookie, Some(&csrf), &save)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(html.contains("Saved and applied · adapters restarted · bridge resync sent"));
+    assert!(html.contains("1 change written"));
+    assert!(html.contains("<div id=\"status\" class=\"status\" hx-swap-oob=\"true\">"));
+    assert_eq!(h.file(), proposed);
+    assert_eq!(h.state.config_text(), proposed);
+}
+
+/// Every text field of a rendered section as the browser would post it.
+fn textareas(html: &str) -> Vec<(String, String)> {
+    html.match_indices("<textarea id=\"f-")
+        .map(|(at, _)| {
+            let name = between(&html[at..], "name=\"", "\"").to_owned();
+            let value = textarea(html, &name);
+            (name, value)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_untouched_multiline_name_survives_an_unrelated_edit() {
+    let text = config_text(UNREACHABLE_ISSUER, PUBLIC_URL).replacen(
+        "name = \"Test Streamer\"",
+        "name = \"\"\"Test\nStreamer 雪\"\"\"",
+        1,
+    );
+    let h = harness_from(text.clone());
+    let (cookie, csrf) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=device").await;
+    assert_eq!(textarea(&page, "device.0.name"), "Test\nStreamer 雪");
+    for line_break in ["\n", "\r\n"] {
+        let mut form = vec![
+            ("section".to_owned(), "device".to_owned()),
+            ("device.0.origin".to_owned(), "0".to_owned()),
+            ("device.1.origin".to_owned(), "1".to_owned()),
+        ];
+        for (name, value) in textareas(&page) {
+            let value = match name.as_str() {
+                "device.0.source" => "Streamer Input 2".to_owned(),
+                _ => value.replace('\n', line_break),
+            };
+            form.push((name, value));
+        }
+        let pairs: Vec<(&str, &str)> = form
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let review = body(
+            h.post_form("/config/preview", &cookie, Some(&csrf), &encode(&pairs))
+                .await,
+        )
+        .await;
+        assert_eq!(
+            hidden(&review, "_proposed"),
+            text.replacen(
+                "source = \"Streamer Input\"",
+                "source = \"Streamer Input 2\"",
+                1
+            ),
+            "{line_break:?}: only the edited line changes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_phone_section_list_asks_before_dropping_pending_edits() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=timing").await;
+    let phone = between(
+        &page,
+        "<details class=\"phone-only cfg-pick\">",
+        "</details>",
+    );
+    assert!(phone.contains("<span class=\"mono\">timing</span></summary>"));
+    assert!(!phone.contains("hx-confirm"), "nothing pending yet");
+    assert!(!page.contains("<select id=\"cfg-pick\""));
+    let html = body(
+        h.post_form(
+            "/config/validate",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("section", "timing"), ("timing.off_delay_s", "9")]),
+        )
+        .await,
+    )
+    .await;
+    let phone = between(
+        &html,
+        "<details class=\"phone-only cfg-pick\">",
+        "</details>",
+    );
+    assert!(
+        phone.contains("<a href=\"/config?section=verify\" hx-get=\"/p/config/verify\" hx-target=\"#section\" hx-swap=\"outerHTML\" hx-push-url=\"/config?section=verify\" hx-confirm=\"Leave [timing]? Its 1 unsaved change will be discarded.\">"),
+        "{phone}"
+    );
+}
+
+#[tokio::test]
+async fn checkbox_groups_are_fieldsets_named_by_a_legend() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=device").await;
+    let group = between(
+        &page,
+        "<fieldset class=\"chips\" id=\"f-device-0-on\"",
+        "</fieldset>",
+    );
+    assert!(group.contains("<legend class=\"sr-only\">"), "{group}");
+    assert!(
+        group.contains(
+            "<input type=\"checkbox\" id=\"f-device-0-on-0\" name=\"device.0.on\" value=\""
+        )
+    );
+    assert!(!page.contains("aria-labelledby=\"f-device-0-on-l\""));
+}
+
+#[tokio::test]
+async fn roles_are_added_and_removed_through_the_form() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let rows = [
+        ("section", "device"),
+        ("device.0.origin", "0"),
+        ("device.1.origin", "1"),
+    ];
+    let mut add = rows.to_vec();
+    add.push(("op", "add_role"));
+    let response = h
+        .post_form("/config/validate", &cookie, Some(&csrf), &encode(&add))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a blank role is incomplete"
+    );
+    let html = body(response).await;
+    assert!(html.contains("<input type=\"hidden\" name=\"device.2.origin\" value=\"\">"));
+    assert!(html.contains("<h2 class=\"mono\">[[device]] · 3 roles</h2>"));
+    assert!(
+        html.contains("device roles must be nonempty and unique"),
+        "{html}"
+    );
+
+    let mut filled = rows.to_vec();
+    filled.extend([
+        ("device.2.origin", ""),
+        ("device.2.role", "tuner"),
+        ("device.2.name", "Tuner"),
+        ("device.2.source", "Tuner Input"),
+        ("device.2.kind", "recording"),
+        ("device.2.match.osd", "Tuner"),
+        ("device.2.on", "active_source"),
+        ("device.2.off", "standby"),
+        ("device.2.takeover", "none"),
+        ("device.2.presence", "events"),
+    ]);
+    let preview = body(
+        h.post_form("/config/preview", &cookie, Some(&csrf), &encode(&filled))
+            .await,
+    )
+    .await;
+    assert!(preview.contains("<li>Adds role tuner.</li>"), "{preview}");
+    let proposed = hidden(&preview, "_proposed");
+    let config = Config::parse(&proposed).expect("the new role validates");
+    assert_eq!(config.device[2].role, "tuner");
+
+    let removed = encode(&[
+        ("section", "device"),
+        ("device.0.origin", "0"),
+        ("device.1.origin", "1"),
+        ("op", "remove_role:1"),
+    ]);
+    let html = body(
+        h.post_form("/config/validate", &cookie, Some(&csrf), &removed)
+            .await,
+    )
+    .await;
+    assert!(!html.contains("name=\"device.1.origin\""));
+    assert!(html.contains("<h2 class=\"mono\">[[device]] · 1 role</h2>"));
+    let preview = body(
+        h.post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &encode(&[("section", "device"), ("device.0.origin", "0")]),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        preview.contains("<li>Removes role console.</li>"),
+        "{preview}"
+    );
+    let roles: Vec<String> = Config::parse(&hidden(&preview, "_proposed"))
+        .unwrap()
+        .device
+        .into_iter()
+        .map(|device| device.role)
+        .collect();
+    assert_eq!(roles, ["streamer"]);
+}
+
+#[tokio::test]
+async fn fill_from_this_entry_posts_the_bus_keys_into_the_rule() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.bus.push(BusEntryView {
+        osd: Some("Console B".to_owned()),
+        physical_address: Some("2.4.0.0".to_owned()),
+        vendor: None,
+        ..bus_entry(8)
+    });
+    h.state.publish(snapshot, []);
+    let page = ok_page(&h, &cookie, "/config?section=device").await;
+    assert!(page.contains("Unbound entries on the bus:"));
+    assert!(page.contains("hx-vals='{\"op\":\"fill:1:8\"}'>Fill from this entry</button>"));
+
+    let html = body(
+        h.post_form(
+            "/config/validate",
+            &cookie,
+            Some(&csrf),
+            &encode(&[
+                ("section", "device"),
+                ("device.0.origin", "0"),
+                ("device.1.origin", "1"),
+                ("op", "fill:1:8"),
+            ]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(textarea(&html, "device.1.match.osd"), "Console B", "{html}");
+    assert_eq!(textarea(&html, "device.1.match.physical"), "2.4.0.0");
+    assert!(html.contains(
+        "On the bus now: <span class=\"mono\">LA 8 · 2.4.0.0 · — · &#34;Console B&#34;</span>"
+    ));
+}
+
+#[tokio::test]
+async fn a_role_removed_outside_the_form_refuses_the_edit_and_reopens_the_section() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let page = ok_page(&h, &cookie, "/config?section=device").await;
+    // The user edits the console (form row 1); the browser posts the page's rows.
+    let edit = |page: &str, row: &str| {
+        let mut form: Vec<(String, String)> = hidden_inputs(page)
+            .into_iter()
+            .filter(|(name, _)| name == "section" || name == "_orig" || name.ends_with(".origin"))
+            .collect();
+        form.push((format!("device.{row}.source"), "Console 2".to_owned()));
+        encode_owned(&form)
+    };
+    let form = edit(&page, "1");
+    // Before Review, the streamer (file row 0) is removed outside the form.
+    let file = h.file();
+    let first = file.find("[[device]]").unwrap();
+    let second = first + 1 + file[first + 1..].find("[[device]]").unwrap();
+    let external = format!("{}{}", &file[..first], &file[second..]);
+    std::fs::write(&h.path, &external).unwrap();
+    for path in ["/config/validate", "/config/preview"] {
+        let response = h.post_form(path, &cookie, Some(&csrf), &form).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+        // Swapped over the whole section, even from a plain change (`hx-swap="none"`).
+        assert_eq!(response.headers()["HX-Retarget"], "#section");
+        assert_eq!(response.headers()["HX-Reswap"], "outerHTML");
+        let html = body(response).await;
+        assert!(
+            html.contains("The roles in the file changed since you opened this form"),
+            "{html}"
+        );
+        assert!(!html.contains("<h2>Review"), "{html}");
+        // The section as the file has it now; the edit is gone.
+        assert!(html.contains("<h2 class=\"mono\">[[device]] · 1 role</h2>"));
+        assert!(!html.contains("Console 2"), "{html}");
+        assert_eq!(h.file(), external, "nothing is written");
+    }
+    // The reopened section edits the console where it now is.
+    let reopened = body(
+        h.post_form("/config/preview", &cookie, Some(&csrf), &form)
+            .await,
+    )
+    .await;
+    let review = body(
+        h.post_form(
+            "/config/preview",
+            &cookie,
+            Some(&csrf),
+            &edit(&reopened, "0"),
+        )
+        .await,
+    )
+    .await;
+    assert!(review.contains("<h2>Review 1 change</h2>"), "{review}");
+    assert_eq!(
+        hidden(&review, "_proposed"),
+        external.replace("Console Input", "Console 2")
+    );
+}
+
+#[tokio::test]
+async fn the_old_single_post_editor_is_gone() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    let response = h
+        .post_form("/config", &cookie, Some(&csrf), "action=save&config=x")
+        .await;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
@@ -996,12 +1962,22 @@ async fn pages_render_and_reference_served_assets() {
         "/recorder",
         "/recorder/glossary",
         "/config",
+        "/config?tab=raw",
         "/p/cockpit",
         "/p/status",
         "/p/bridge",
     ] {
         let response = h.get(path, Some(&cookie)).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    for (section, _) in crate::web::view::config::SECTIONS {
+        for path in [
+            format!("/config?section={section}"),
+            format!("/p/config/{section}"),
+        ] {
+            let response = h.get(&path, Some(&cookie)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
     for bad in [
         "/recorder/live?la=99",

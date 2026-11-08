@@ -894,7 +894,30 @@ action "Would …".
   history, how Choregos drives it; `/devices/out/bridge`: the bridge status.
   `/devices/la/{n}`: an unbound entry's keys, identify backoff, recent frames,
   identify and confirmed forget.
-- `/config` Current file TOML verbatim (comments/order preserved; secrets are environment-only), edit + validate + save (atomic), reload.
+- `/config` The file stays the source of truth: every edit is applied to its own
+  document (`toml_edit`; comments, order and formatting kept), never by serialising
+  `Config`. Form tab: a section nav (every top-level `Config` field, file order picks
+  the first editable one; badges `restart`, `partly`, role count, `n changed`,
+  `n error`) and one section at a time (`/p/config/{section}`): label, key, input
+  with the validated bounds, unit, help, `Default N · lo–hi`, `changed · was X`
+  with reset, error line; `[[device]]` is a role editor (add/remove, match keys with
+  the bus entries they match and "Fill from this entry", on/off event pickers,
+  takeover, presence, `verify_standby`, media player, probe add/remove, "In words"
+  from the device-page quirk sentences); `mode` is changed by the top-bar switch;
+  `mqtt`, `home_assistant`, `web`, `tv.wake` and `tv.off` are read-only with their
+  secrets as environment variable names and set / not set. Raw TOML tab (desktop):
+  the file text, parse and validation errors with their line. `POST
+  /config/validate` applies the pending form (or raw text) to the current file and
+  runs `Config` parsing, `validate` and `validate_reload`; pending edits live in the
+  form only. Both tabs end in `POST /config/preview` (what changes, one sentence per
+  key; what restarts; what the resync does; unified line diff) and `POST
+  /config/save`. The editor reads the file through the runtime
+  (`AppState::read_config`); the save carries the hash of the text it was reviewed
+  against, and the runtime re-reads the file immediately before the atomic write and
+  refuses with `ConfigError::Changed` when the hash moved (409, fresh review of the
+  user's changes applied to the current file; a form applies only the fields the user
+  changed, so an outside edit is never written back). Not a
+  lock: an external writer racing that last read→rename is not covered.
 - `/healthz` (unauthenticated) JSON: mqtt connected, ha connected, bridge online, mode.
 Auth: OIDC (openidconnect crate, authorization-code + PKCE) with Authentik; local username/password break-glass form at `/login/local`; signed session cookie (`tower-sessions` or axum-extra signed cookies); CSRF for POSTs via same-site cookie + hidden token. Visual design: dark, dense, monospace for bus data; mocked before implementation (see `docs/ui.md` once written).
 
@@ -916,8 +939,9 @@ impl AppState {
     pub fn snapshot(&self) -> Snapshot;                 // cheap clone of everything the UI renders
     pub fn subscribe(&self) -> broadcast::Receiver<UiEvent>; // Frame | Decision only
     pub async fn command(&self, cmd: Command) -> Result<(), CommandError>;
-    pub fn config_text(&self) -> String;                // current file text; environment secrets never serialized
-    pub async fn save_config(&self, text: &str) -> Result<(), ConfigError>; // validate + atomic write + reload
+    pub fn config_text(&self) -> String;                // running config's text; environment secrets never serialized
+    pub async fn read_config(&self) -> Result<String, ConfigError>; // the file on disk now, read by the runtime
+    pub async fn save_config(&self, text: &str, expected: u64) -> Result<(), ConfigError>; // runtime::config_hash of the text read; validate + re-read + compare (else Changed) + atomic write + reload
     pub fn health(&self) -> Health;
     pub fn auth(&self) -> &AuthConfig;                  // oidc + local login settings (secrets resolved)
 }

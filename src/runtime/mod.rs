@@ -36,7 +36,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) enum Request {
     Command(Command, Option<oneshot::Sender<Result<(), CommandError>>>),
-    SaveConfig(String, oneshot::Sender<Result<(), ConfigError>>),
+    /// The configuration file as it is on disk now.
+    ReadConfig(oneshot::Sender<Result<String, ConfigError>>),
+    /// Writes the text when the file's `config_hash` still equals the expected hash.
+    SaveConfig(String, u64, oneshot::Sender<Result<(), ConfigError>>),
 }
 pub(crate) enum Input {
     Event(Event),
@@ -531,8 +534,12 @@ impl Runtime {
             Input::Request(Request::Command(command, reply)) => {
                 self.handle_command(command, reply).await
             }
-            Input::Request(Request::SaveConfig(text, reply)) => {
-                self.handle_config_save(text, reply).await
+            Input::Request(Request::ReadConfig(reply)) => {
+                let _ = reply.send(read_config(&self.path).await);
+                return Ok(());
+            }
+            Input::Request(Request::SaveConfig(text, expected, reply)) => {
+                self.handle_config_save(text, expected, reply).await
             }
         };
         for event in &events {
@@ -592,9 +599,10 @@ impl Runtime {
     async fn handle_config_save(
         &mut self,
         text: String,
+        expected: u64,
         reply: oneshot::Sender<Result<(), ConfigError>>,
     ) -> Vec<Event> {
-        match reload(&text, &self.engine.config, &self.path).await {
+        match reload(&text, expected, &self.engine.config, &self.path).await {
             Ok(config) => {
                 self.state.replace_config_text(text);
                 self.restart_adapters(&config).await;
@@ -1010,7 +1018,8 @@ fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandErr
     };
     error.map_or(Ok(()), |error| Err(CommandError::Invalid(error.into())))
 }
-fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError> {
+/// Rejects edits to restart-gated settings; the web config editor runs it on every validate.
+pub fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError> {
     for (name, changed) in [
         (
             "web/auth",
@@ -1041,10 +1050,33 @@ fn validate_reload(config: &Config, current: &Config) -> Result<(), ConfigError>
     }
     Ok(())
 }
-async fn reload(text: &str, current: &Config, path: &Path) -> Result<Config, ConfigError> {
+/// Hash of a configuration text: the stale-file guard compares the file against the one an
+/// editor started from. Stable within one process, which is all the guard needs.
+pub(crate) fn config_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+pub(crate) async fn read_config(path: &Path) -> Result<String, ConfigError> {
+    Ok(tokio::fs::read_to_string(path).await?)
+}
+/// Validates `text` and writes it when the file still hashes to `expected`. The file is
+/// re-read right before the write, inside the runtime's serialized input loop, so an
+/// external edit or a mode switch since the editor read it is refused, not overwritten.
+/// Not a lock: a writer outside this process racing the final read→rename is not covered.
+pub(crate) async fn reload(
+    text: &str,
+    expected: u64,
+    current: &Config,
+    path: &Path,
+) -> Result<Config, ConfigError> {
     let mut config = Config::parse(text)?;
     validate_reload(&config, current)?;
     config.secrets = current.secrets.clone();
+    if config_hash(&read_config(path).await?) != expected {
+        return Err(ConfigError::Changed);
+    }
     persist_bytes(path, text.as_bytes()).await?;
     Ok(config)
 }
@@ -1410,10 +1442,11 @@ mod tests {
         let mut config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
         persist(&config, &path).await.unwrap();
         let original = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(reload("not valid = [", &config, &path).await.is_err());
+        let base = config_hash(&original);
+        assert!(reload("not valid = [", base, &config, &path).await.is_err());
         let mut changed_web = config.clone();
         changed_web.web.bind.set_port(9000);
-        let error = reload(&changed_web.redacted_text().unwrap(), &config, &path)
+        let error = reload(&changed_web.redacted_text().unwrap(), base, &config, &path)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("restart"));
@@ -1697,21 +1730,54 @@ mod review_tests {
                 }
                 _ => changed.mqtt.username = "other".into(),
             }
-            let error = reload(&changed.redacted_text().unwrap(), &current, &path)
-                .await
-                .unwrap_err();
+            let error = reload(
+                &changed.redacted_text().unwrap(),
+                config_hash(&original),
+                &current,
+                &path,
+            )
+            .await
+            .unwrap_err();
             assert!(error.to_string().contains("restart"));
             assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
         }
         let text = original.replace("off_delay_s = 3", "off_delay_s = 4");
         assert_eq!(
-            reload(&text, &current, &path)
+            reload(&text, config_hash(&original), &current, &path)
                 .await
                 .unwrap()
                 .timing
                 .off_delay_s,
             4
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_edited_since_it_was_read_is_refused_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("choregos.toml");
+        let current = config();
+        tokio::fs::write(&path, include_str!("../../choregos.example.toml"))
+            .await
+            .unwrap();
+        let read = read_config(&path).await.unwrap();
+        assert!(read.contains("off_delay_s = 3"));
+        let edit = format!("{read}# operator note\n");
+        // Someone edits the mounted file after the editor read it.
+        let external = read.replacen("off_delay_s = 3", "off_delay_s = 17", 1);
+        tokio::fs::write(&path, &external).await.unwrap();
+        let error = reload(&edit, config_hash(&read), &current, &path)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::Changed), "{error}");
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), external);
+        // Read again, the same edit lands on top of the external one.
+        let edit = format!("{external}# operator note\n");
+        let saved = reload(&edit, config_hash(&external), &current, &path)
+            .await
+            .unwrap();
+        assert_eq!(saved.timing.off_delay_s, 17);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), edit);
     }
 
     #[tokio::test]

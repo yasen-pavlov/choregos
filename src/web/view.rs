@@ -3,6 +3,7 @@
 //! Colour and tone helpers return class names only; templates never branch on raw strings
 //! to pick a colour.
 
+pub(crate) mod config;
 pub(crate) mod devices;
 pub(crate) mod recorder;
 pub(crate) mod window;

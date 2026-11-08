@@ -2,6 +2,100 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-08 — Phase 2 slice 4: Config
+
+- Document-preserving edits: the form never serialises `Config` back to text. Each edit
+  is applied to the on-disk TOML document with `toml_edit` (pinned `=0.22.27`, already in
+  the lock through `toml 0.8`; only the direct-dependency edge is new). A replaced value
+  keeps its comment and spacing; nested records (`match`, `probe`, `receiver.observe`) are
+  written through `TableLike`, so `match = { … }` and a `[device.match]` table are both
+  edited in place, and a key inserted or removed reformats only an inline record; a value
+  equal to what the file already means (an absent key at its default included) is not
+  written; list edits keep the file's order and append new entries. A removed `[[device]]`
+  (or slot) hands the comment block above its header to whatever now follows (the next
+  header, else the end of the file): it may document more than that role. Rows written as
+  an inline array (`device = []`, `device = [{ … }]`) stay as written until a row changes,
+  then become `[[device]]` tables carrying the key's comments; removing the last row leaves
+  `device = []`, since `Config` requires the key. A missing `[trace]`/`[verify]` table is
+  created after its predecessor in `Config` order, only when a value differs.
+- String fields render as one-row `<textarea>`s styled as inputs: an `<input>` drops line
+  breaks from its value, so posting a section would rewrite an untouched multiline string.
+  Text compares by trimmed lines, so a browser's CRLF is no change; a newline after the
+  start tag keeps a value's leading newline through the HTML parser (the raw editor too).
+- The field table (`view::config::FIELDS`, keyed by TOML path) holds labels, units, help,
+  defaults and the integer bounds `Config::validate` enforces; unit tests check that each
+  key is in `choregos.example.toml` (live or in its comments), that every rendered field
+  has a row and every row renders, and that every bound is no looser than `validate`.
+  Editable: `bridge` (kind, topic or node, logical address), `trace`, `tv.entity`,
+  `receiver` (entity, select_source, observe), `presets` (timezone, slots add/remove),
+  `sonos` (entity, mute switch, volume_from), `timing`, `verify`, `fake_tv` (replies,
+  osd_name; power_status and cec_version are shown as fixed values), `[[device]]`. Read-only:
+  `mode` (top-bar switch), `mqtt`, `home_assistant`, `web`, `tv.wake`, `tv.off`, with each
+  secret as its environment variable name and set / not set (read at request time).
+- Validate runs the save path's checks on the edited text: deserialisation
+  (`deny_unknown_fields` included), `Config::validate` and `runtime::validate_reload`
+  (now `pub`), so a
+  restart-gated edit is rejected before review. Input errors (not a number, outside the
+  table's bounds, unknown choice) are reported per field without touching the document.
+  Each `[[device]]` is also validated alone so a problem lands on its row; a validation
+  message is pinned to the field it names, else shown for the section. The raw editor
+  reports parser errors at their span and validation errors at the key's line.
+- Pending edits live only in the form (no server session). A plain change returns only
+  out-of-band state (changed / error marks, row headers, footer, nav), so inputs keep what
+  is being typed; structural buttons (add/remove role, probe or slot, fill, reset, back)
+  re-render the section. Leaving a section with pending changes asks first, on phones too:
+  the phone section picker is the same links in a `<details>` rather than a `<select>`,
+  because a select already shows the new section when its confirm is cancelled and no
+  script may reset it. Controls carry `aria-invalid` with their error; the form posts the
+  names it currently marks (`_invalid`) and a state response re-renders only the controls
+  whose mark flips (htmx restores focus by id). Checkbox groups are `<fieldset>`s named by
+  a visually hidden `<legend>`; the review diff is an `<ol>` with textual `+`/`-`.
+- Only the fields the user changed are applied, always, not only after a 409. The section
+  form carries `_orig`: one hidden JSON object of form name → the value that field showed
+  when the form first rendered it (string, list or null), plus the identity of each file
+  row of the section's row array at page load, in file order (`rows:device`: role ids;
+  `rows:presets.slot`: each slot's `[from, to, script]`). Validate, preview and save write
+  a field only when its posted value differs from its original, compared as the "was"
+  note compares (numbers by value, lists as sets, text trimmed with every line break —
+  CRLF or a lone CR — as LF, as an HTML textarea normalises it, a blank optional value as
+  absent): an edit back to the original is no edit, and a key changed in the file outside
+  the form is never written back, even in the same section; an untouched text keeps the
+  file's own bytes. A re-render (a structural button, Back to edit) shows an untouched
+  field at the file's current value and moves its original there; an edit keeps its own.
+  New rows carry no originals and are written whole. Structural changes stay explicit: a
+  role, slot or probe leaves the file only through its remove button; rows appended
+  outside the form (past the page-load rows) are kept. Form rows address file rows by
+  position, so the form fails closed when that position no longer holds the row it opened
+  on: if the file's first page-load-count rows are not exactly the recorded identities (a
+  row removed, reordered, a role renamed or a slot changed outside the form), validate,
+  preview and save (its 409 fresh review) refuse the form unapplied — nothing is proposed
+  or written — and answer 409 with the section re-rendered from the file, the user's edits
+  to it dropped and a note to make them again; a plain change gets `HX-Retarget: #section`
+  and `HX-Reswap: outerHTML` so the whole section swaps. Re-rendering from the file rather
+  than keeping the edits is deliberate: kept edits would sit on rows that now mean other
+  roles. A form posted without `_orig` applies every posted field and positions unchecked.
+- Review → save is one step for form and raw: one sentence per changed key (table
+  sentences, else `key: old → new`; a whole added or removed role is one sentence), the
+  static restart and resync columns, and a unified LCS line diff with `@@ [table] @@`
+  hunks. The editor reads the file through the runtime (`Request::ReadConfig`), never a
+  cache, and the review carries that text's 64-bit hash (`runtime::config_hash`). Save
+  refuses with 409 and a fresh review when the file read now hashes differently: the
+  review applies the user's changes to the current file, so its diff lists only those
+  changes and the external edit survives the save.
+  `Request::SaveConfig(text, expected_hash, reply)` repeats the check in the runtime's
+  serialized save handler: it re-reads the file immediately before the atomic write and
+  answers `ConfigError::Changed` (also 409) when it moved, so a hand edit of the mounted
+  file or a mode switch since the review is refused, not overwritten. It is not a lock: an
+  external writer landing between that read and the rename is not covered (documented in
+  operations). `POST /config` is gone.
+- Deviations from the boards: one section is edited and reviewed at a time (05a shows two
+  sections and a combined count; edits live in the form, which holds one section).
+  "On the bus now" compares the filled keys with `view::devices::rule_matches` over the
+  snapshot's `BusEntryView`s (`identity::matches` needs engine `BusEntry`s); when nothing
+  matches it lists unbound entries to fill from. The raw textarea has no line-number
+  gutter; errors name their line. The review's diff is open on phones too (no JS to fold
+  it by viewport).
+
 ## 2026-11-08 — Phase 2 slice 3: Devices
 
 - `/devices` is the registry: roles (config order), outputs (TV, receiver, speakers),

@@ -1,0 +1,12 @@
+<div id="cfg-foot" class="cfg-foot"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {%- if s.changed > 0 %}<span class="chip info">{{ s.changed }} changed</span>{% endif %}
+  {%- if s.errors > 0 %}<span class="chip bad">{{ s.errors }} error</span>{% endif %}
+  <span class="grow note">
+    {%- if let Some((name, id)) = s.first_error %}Fix the error in <a href="#{{ id }}">{{ name }}</a> to review changes.
+    {%- else if s.errors > 0 %}Fix the errors above to review changes.
+    {%- else if s.dirty %}No errors. Saving restarts the adapters in-process and sends a bridge resync; nothing restarts the container.
+    {%- else %}No changes yet.{% endif -%}
+  </span>
+  <a class="btn ghost" href="/config?section={{ s.key }}">Discard</a>
+  <button type="button" class="btn primary" hx-post="/config/preview" hx-target="#section" hx-swap="outerHTML"{% if s.errors > 0 %} disabled{% endif %}>Review changes →</button>
+</div>

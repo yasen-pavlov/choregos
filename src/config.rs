@@ -36,6 +36,8 @@ pub enum ConfigError {
     Serialize(#[from] toml::ser::Error),
     #[error("runtime is not available")]
     Unavailable,
+    #[error("the configuration file changed since it was read")]
+    Changed,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -1,9 +1,21 @@
 {% extends "base.html" %}
 {% block title %}config · choregos{% endblock %}
 {% block content %}
-<section class="panel">
-  <h2>configuration</h2>
-  <p class="hint">Secrets are never shown or accepted here; they come from environment variables. Save validates, writes atomically and reloads.</p>
-  {% include "partials/config_form.html" %}
-</section>
+<div class="page-h">
+  <h1>Config</h1>
+  <nav class="subnav" aria-label="Editor">
+    <a href="/config"{% if raw.is_none() %} aria-current="page"{% endif %}>Form</a>
+    <a class="desk-only" href="/config?tab=raw"{% if raw.is_some() %} aria-current="page"{% endif %}>Raw TOML</a>
+  </nav>
+  <span class="note mono">choregos.toml · comments and formatting are kept on save · secrets come from the environment and are never shown</span>
+</div>
+<div id="cfg" class="cfg{% if raw.is_some() %} is-raw{% endif %}">
+{%- if let Some(s) = section %}
+{% include "partials/config_nav.html" %}
+{% include "partials/config_section.html" %}
+{%- endif %}
+{%- if let Some(raw) = raw %}
+{% include "partials/config_raw.html" %}
+{%- endif %}
+</div>
 {% endblock %}

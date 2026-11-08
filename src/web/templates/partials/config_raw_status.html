@@ -1,0 +1,1 @@
+<span id="raw-status" class="row"{% if oob %} hx-swap-oob="true"{% endif %}>{% if raw.problems.is_empty() %}<span class="chip ok">parses</span>{% else %}<span class="chip bad">{{ raw.problems.len() }} error</span>{% endif %}{% if raw.changes > 0 %}<span class="chip info">{{ raw.changes }} changed</span>{% endif %}</span>

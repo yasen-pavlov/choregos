@@ -1,0 +1,18 @@
+<nav id="cfg-nav" class="cfg-nav" aria-label="Sections"{% if nav_oob %} hx-swap-oob="true"{% endif %}>
+  <ul class="desk-only">
+    {%- for item in nav %}
+    <li>{% include "partials/config_nav_link.html" %}</li>
+    {%- endfor %}
+  </ul>
+  {#- Phones get the same links in a disclosure, not a <select>: a link asks before leaving
+      pending edits and, on cancel, nothing has moved; a select would already show the new
+      section, and no script may put it back. -#}
+  <details class="phone-only cfg-pick">
+    <summary>Section <span class="mono">{% for item in nav %}{% if item.current %}{{ item.label }}{% endif %}{% endfor %}</span></summary>
+    <ul>
+      {%- for item in nav %}
+      <li>{% include "partials/config_nav_link.html" %}</li>
+      {%- endfor %}
+    </ul>
+  </details>
+</nav>

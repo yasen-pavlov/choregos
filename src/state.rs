@@ -181,7 +181,29 @@ impl AppState {
             .clone()
     }
 
-    pub async fn save_config(&self, text: &str) -> Result<(), ConfigError> {
+    /// The configuration file as it is on disk now, read by the runtime.
+    pub async fn read_config(&self) -> Result<String, ConfigError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.config_request(crate::runtime::Request::ReadConfig(reply))
+            .await?;
+        result.await.map_err(|_| ConfigError::Unavailable)?
+    }
+
+    /// Saves and applies `text` when the file still hashes to `expected`
+    /// (`crate::runtime::config_hash` of the text the editor read); otherwise
+    /// `ConfigError::Changed` and nothing is written.
+    pub async fn save_config(&self, text: &str, expected: u64) -> Result<(), ConfigError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.config_request(crate::runtime::Request::SaveConfig(
+            text.into(),
+            expected,
+            reply,
+        ))
+        .await?;
+        result.await.map_err(|_| ConfigError::Unavailable)?
+    }
+
+    async fn config_request(&self, request: crate::runtime::Request) -> Result<(), ConfigError> {
         let sender = self
             .inner
             .runtime
@@ -189,14 +211,10 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(ConfigError::Unavailable)?;
-        let (reply, result) = tokio::sync::oneshot::channel();
         sender
-            .send(crate::runtime::Input::Request(
-                crate::runtime::Request::SaveConfig(text.into(), reply),
-            ))
+            .send(crate::runtime::Input::Request(request))
             .await
-            .map_err(|_| ConfigError::Unavailable)?;
-        result.await.map_err(|_| ConfigError::Unavailable)?
+            .map_err(|_| ConfigError::Unavailable)
     }
 
     pub(crate) fn attach(&self, sender: tokio::sync::mpsc::Sender<crate::runtime::Input>) {

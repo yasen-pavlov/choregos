@@ -1,0 +1,46 @@
+<form id="section" class="panel flush review" novalidate>
+  {%- for (name, value) in review.carried %}
+  <input type="hidden" name="{{ name }}" value="{{ value }}">
+  {%- endfor %}
+  {%- if let Some(key) = review.section %}
+  <input type="hidden" name="section" value="{{ key }}">
+  {%- endif %}
+  <input type="hidden" name="_base" value="{{ review.base }}">
+  <input type="hidden" name="_proposed" value="{{ review.proposed }}">
+  <div class="ph"><h2>Review {{ review.changes.len() }} change{% if review.changes.len() != 1 %}s{% endif %}</h2><span class="grow"></span><span class="note">nothing is written until you save</span></div>
+  {%- if let Some(stale) = review.stale %}
+  <p class="flash err">{{ stale }}</p>
+  {%- endif %}
+  <div class="rev-cols">
+    <section class="rev-col">
+      <h3 class="k">What changes</h3>
+      {%- if review.changes.is_empty() %}
+      <p>Comments or formatting only; no setting changes.</p>
+      {%- else %}
+      <ul>{% for change in review.changes %}<li>{{ change.sentence }}</li>{% endfor %}</ul>
+      {%- endif %}
+    </section>
+    <section class="rev-col">
+      <h3 class="k">What restarts</h3>
+      <p><strong>No container restart.</strong> Saving restarts the adapters in-process and sends a bridge resync.</p>
+      <p class="note">Restart-gated sections cannot be changed here: <code>[web]</code>, <code>[mqtt]</code>, <code>[home_assistant]</code>, <code>tv.wake</code> and <code>tv.off</code> are rejected at validation.</p>
+    </section>
+    <section class="rev-col">
+      <h3 class="k">What the resync does</h3>
+      <p>Choregos re-reads the bus: it asks each role for its power status, then warms for up to 3 s before it acts on power again. The resync itself wakes and sleeps nothing.</p>
+    </section>
+  </div>
+  <details class="fold diff-fold" open>
+    <summary class="ph"><span>TOML diff · {{ review.diff_count }} line{% if review.diff_count != 1 %}s{% endif %}</span></summary>
+    <ol class="diff mono">
+      {%- for line in review.diff %}
+      <li class="dl {{ line.class() }}"><span class="sign">{{ line.sign() }}</span>{{ line.text }}</li>
+      {%- endfor %}
+    </ol>
+  </details>
+  <div class="cfg-foot">
+    <span class="grow note">Saving writes <code>choregos.toml</code>, reloads, restarts the adapters and sends a bridge resync; it makes no Recorder row. The file on disk is checked again first: if it changed since this review, you get the new diff instead.</span>
+    <button type="button" class="btn ghost" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"back"}'>← Back to edit</button>
+    <button type="button" class="btn primary" hx-post="/config/save" hx-target="#section" hx-swap="outerHTML">Save and apply</button>
+  </div>
+</form>

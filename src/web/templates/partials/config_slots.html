@@ -1,0 +1,12 @@
+<div class="pb slots">
+  <div class="roles-h"><h3 class="grow">Slots <span class="note">· together they cover 24 hours without gaps or overlap</span></h3>
+    <button type="button" class="btn sm" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"add_slot"}'>+ Add slot</button></div>
+  {%- for slot in s.slots %}
+  <div class="slot" id="p{{ slot.index }}">
+    <input type="hidden" name="presets.slot.{{ slot.index }}.origin" value="{{ slot.origin }}">
+    <div class="rf">{% for f in slot.fields %}{% include "partials/config_field.html" %}{% endfor %}</div>
+    {% include "partials/config_slot_problems.html" %}
+    <button type="button" class="btn sm danger" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"remove_slot:{{ slot.index }}"}' hx-confirm="Remove this preset slot? It leaves the file when you save.">Remove slot…</button>
+  </div>
+  {%- endfor %}
+</div>

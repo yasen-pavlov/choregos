@@ -1,0 +1,21 @@
+<form id="section" class="panel saved {{ saved.tone() }}" novalidate>
+  {%- if saved.ok %}
+  <div class="row"><span class="dot"></span><strong>Saved and applied · adapters restarted · bridge resync sent</strong><span class="grow"></span><a class="btn" href="/">Back to Cockpit</a></div>
+  <p class="note">{{ saved.at }} UTC · {{ saved.changes }} change{% if saved.changes != 1 %}s{% endif %} written to <code>choregos.toml</code>. A save makes no Recorder row.</p>
+  <p><a href="/config{% if let Some(key) = saved.section %}?section={{ key }}{% endif %}">Edit again</a></p>
+  {%- else %}
+  {%- for (name, value) in saved.carried %}
+  <input type="hidden" name="{{ name }}" value="{{ value }}">
+  {%- endfor %}
+  {%- if let Some(key) = saved.section %}
+  <input type="hidden" name="section" value="{{ key }}">
+  {%- endif %}
+  <div class="row"><span class="dot bad"></span><strong>Not saved</strong><span class="grow"></span><button type="button" class="btn ghost" hx-post="/config/validate" hx-target="#section" hx-swap="outerHTML" hx-vals='{"op":"back"}'>← Back to edit</button></div>
+  {%- if let Some(error) = saved.error %}<p class="flash err">{{ error }}</p>{% endif %}
+  <p class="note">Nothing was written; the running configuration is unchanged.</p>
+  {%- endif %}
+</form>
+{% include "partials/status.html" %}
+{% include "partials/bands.html" %}
+
+{% if !nav.is_empty() %}{% include "partials/config_nav.html" %}{% endif %}
