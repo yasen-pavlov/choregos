@@ -1,6 +1,6 @@
 <aside id="selected" class="panel flush tl-side" aria-label="Selected decision">
 {%- if let Some(s) = selected %}
-  <div class="ph"><span class="k grow">Selected</span><a class="btn sm ghost" href="{{ s.close.page }}" hx-get="{{ s.close.partial }}" hx-target="#timeline" hx-swap="outerHTML" hx-push-url="{{ s.close.page }}" aria-label="Clear selection" data-close>{{ s.close.label }}</a></div>
+  <div class="ph"><span class="k grow">Selected</span><a class="btn sm ghost" href="{{ s.close.page }}" hx-get="{{ s.close.partial }}" hx-target="#timeline" hx-swap="outerHTML" hx-push-url="{{ s.close.page }}" title="Clear selection" data-close><span aria-hidden="true">{{ s.close.label }}</span><span class="sr-only">Clear selection</span></a></div>
   <div class="pb stack">
     <div class="row"><span class="mono sel-id">#{{ s.decision.id }}</span><span class="grow"></span>{% if s.decision.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(s.decision.verdict) }}">{{ s.decision.verdict }}</span>{% endif %}</div>
     <strong>{{ s.headline }}</strong>

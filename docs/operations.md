@@ -70,7 +70,7 @@ curl --fail --silent --show-error http://127.0.0.1:8095/healthz
 
 The unauthenticated JSON endpoint reports `mqtt_connected`, `ha_connected`,
 `bridge_online` and `mode`. The image health check tests that the web process
-answers, not that every external connection is healthy. The dashboard header's
+answers, not that every external connection is healthy. The top bar's
 `mqtt`, `ha` and `bridge` pills show these connections; the mode and warming
 badges explain whether power actions are enabled or deferred.
 
@@ -85,7 +85,7 @@ also leaves the bridge offline. This field is not a test of every CEC device.
 HA discovery provides `binary_sensor.choregos_bridge` and diagnostic sensors
 `sensor.choregos_bridge_signal` (dBm), `sensor.choregos_bridge_link_count`
 (Wi-Fi connections since boot) and `sensor.choregos_bridge_uptime` (seconds).
-HA may retain operator-renamed entity IDs. The dashboard additionally shows
+HA may retain operator-renamed entity IDs. The cockpit additionally shows
 telemetry age, weak/stale telemetry warnings and native bridge line faults;
 old telemetry is not proof of a current connection.
 
@@ -98,7 +98,7 @@ window (default 45 seconds, range 5–300). It ends at the requested state or
 deadline, and a newer TV action replaces the previous window. Shadow mode
 does not start direct polling. HA-only TV power-off has no direct source.
 
-The dashboard TV row keeps HA state and shows the last direct state and its age.
+The cockpit TV card shows the direct sample and the HA state side by side with their ages.
 `unreachable` means the direct query failed (for example, connection failure,
 timeout, unsupported power-state service or an unrecognized response); it
 does **not** prove the TV is off. A pairing-required warning stops direct polling
@@ -252,7 +252,7 @@ golden test runs compare decisions against those expectations.
 
 ## Mode changes and config edits
 
-`select.choregos_mode` and the dashboard switch persist `mode` in the TOML.
+`select.choregos_mode` and the top-bar switch persist `mode` in the TOML.
 Shadow mode still sends read-only identification/resync queries and presence
 polls: it is not a network-isolated diagnostic mode.
 
