@@ -527,10 +527,10 @@ async fn a_section_partial_shows_defaults_bounds_and_moves_the_nav() {
     let html = ok_page(&h, &cookie, "/p/config/timing").await;
     assert!(html.starts_with("<form id=\"section\""), "{html}");
     assert!(html.contains(
-        "name=\"timing.standby_retries\" value=\"2\" inputmode=\"numeric\" min=\"0\" max=\"10\""
+        "name=\"timing.standby_retries\" value=\"3\" inputmode=\"numeric\" min=\"0\" max=\"10\""
     ));
     assert!(
-        html.contains("Default 2 · 0–10."),
+        html.contains("Default 3 · 0–10."),
         "absent key shows its default"
     );
     assert!(html.contains(

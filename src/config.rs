@@ -265,11 +265,10 @@ pub struct TimingConfig {
 }
 
 fn default_standby_retries() -> u8 {
-    2
+    3
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct VerifyConfig {
     pub tv_poll_ms: u64,
     pub tv_window_s: u64,
@@ -287,6 +286,58 @@ pub struct VerifyConfig {
     pub drift_grace_s: u64,
 }
 
+impl<'de> Deserialize<'de> for VerifyConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep omission distinct from an explicit window: legacy power deadlines
+        // may exceed the calibrated window, but explicit undersized windows fail validation.
+        #[derive(Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Input {
+            tv_poll_ms: Option<u64>,
+            tv_window_s: Option<u64>,
+            tv_idle_poll_s: Option<u64>,
+            receiver_poll_ms: Option<u64>,
+            receiver_window_s: Option<u64>,
+            receiver_idle_poll_s: Option<u64>,
+            probe_poll_ms: Option<u64>,
+            probe_window_s: Option<u64>,
+            tv_s: Option<u64>,
+            receiver_s: Option<u64>,
+            receiver_off_s: Option<u64>,
+            speakers_s: Option<u64>,
+            source_s: Option<u64>,
+            drift_grace_s: Option<u64>,
+        }
+        let input = Input::deserialize(deserializer)?;
+        let defaults = Self::default();
+        let receiver_s = input.receiver_s.unwrap_or(defaults.receiver_s);
+        let receiver_off_s = input.receiver_off_s.unwrap_or(defaults.receiver_off_s);
+        Ok(Self {
+            tv_poll_ms: input.tv_poll_ms.unwrap_or(defaults.tv_poll_ms),
+            tv_window_s: input.tv_window_s.unwrap_or(defaults.tv_window_s),
+            tv_idle_poll_s: input.tv_idle_poll_s.unwrap_or(defaults.tv_idle_poll_s),
+            receiver_poll_ms: input.receiver_poll_ms.unwrap_or(defaults.receiver_poll_ms),
+            receiver_window_s: input.receiver_window_s.unwrap_or(
+                defaults
+                    .receiver_window_s
+                    .max(receiver_s)
+                    .max(receiver_off_s),
+            ),
+            receiver_idle_poll_s: input
+                .receiver_idle_poll_s
+                .unwrap_or(defaults.receiver_idle_poll_s),
+            probe_poll_ms: input.probe_poll_ms.unwrap_or(defaults.probe_poll_ms),
+            probe_window_s: input.probe_window_s.unwrap_or(defaults.probe_window_s),
+            tv_s: input.tv_s.unwrap_or(defaults.tv_s),
+            receiver_s,
+            receiver_off_s,
+            speakers_s: input.speakers_s.unwrap_or(defaults.speakers_s),
+            source_s: input.source_s.unwrap_or(defaults.source_s),
+            drift_grace_s: input.drift_grace_s.unwrap_or(defaults.drift_grace_s),
+        })
+    }
+}
+
 impl Default for VerifyConfig {
     fn default() -> Self {
         Self {
@@ -294,13 +345,13 @@ impl Default for VerifyConfig {
             tv_window_s: 45,
             tv_idle_poll_s: 15,
             receiver_poll_ms: 1000,
-            receiver_window_s: 30,
+            receiver_window_s: 15,
             receiver_idle_poll_s: 15,
             probe_poll_ms: 2000,
             probe_window_s: 45,
             tv_s: 45,
-            receiver_s: 10,
-            receiver_off_s: 20,
+            receiver_s: 5,
+            receiver_off_s: 10,
             speakers_s: 5,
             source_s: 10,
             drift_grace_s: 30,
@@ -1430,7 +1481,7 @@ mod receiver_observation_tests {
                 config.verify.receiver_window_s,
                 config.verify.receiver_idle_poll_s
             ),
-            (1000, 30, 15)
+            (1000, 15, 15)
         );
         config.verify.receiver_s = 1;
         config.verify.receiver_off_s = 1;
@@ -1510,6 +1561,91 @@ mod console_start_tests {
         assert!(
             Config::parse(&text).is_err(),
             "a start policy outside probe is rejected"
+        );
+    }
+
+    #[test]
+    fn calibrated_defaults_keep_legacy_explicit_values_valid() {
+        let mut document: toml::Value =
+            toml::from_str(include_str!("../choregos.example.toml")).unwrap();
+        document["timing"]
+            .as_table_mut()
+            .unwrap()
+            .remove("standby_retries");
+        for key in ["receiver_s", "receiver_off_s", "receiver_window_s"] {
+            document["verify"].as_table_mut().unwrap().remove(key);
+        }
+        let defaults = Config::parse(&toml::to_string(&document).unwrap()).unwrap();
+        assert_eq!(
+            (
+                defaults.verify.receiver_s,
+                defaults.verify.receiver_off_s,
+                defaults.verify.receiver_window_s,
+                defaults.timing.standby_retries,
+            ),
+            (5, 10, 15, 3)
+        );
+        document["timing"]
+            .as_table_mut()
+            .unwrap()
+            .insert("standby_retries".into(), 2.into());
+        for (key, value) in [
+            ("receiver_s", 10),
+            ("receiver_off_s", 20),
+            ("receiver_window_s", 30),
+        ] {
+            document["verify"]
+                .as_table_mut()
+                .unwrap()
+                .insert(key.into(), value.into());
+        }
+        let legacy = Config::parse(&toml::to_string(&document).unwrap()).unwrap();
+        assert_eq!(
+            (
+                legacy.verify.receiver_s,
+                legacy.verify.receiver_off_s,
+                legacy.verify.receiver_window_s,
+                legacy.timing.standby_retries,
+            ),
+            (10, 20, 30, 2)
+        );
+        document["verify"]
+            .as_table_mut()
+            .unwrap()
+            .remove("receiver_window_s");
+        document["verify"]
+            .as_table_mut()
+            .unwrap()
+            .remove("receiver_s");
+        let partial = Config::parse(&toml::to_string(&document).unwrap()).unwrap();
+        assert_eq!(
+            (
+                partial.verify.receiver_s,
+                partial.verify.receiver_off_s,
+                partial.verify.receiver_window_s,
+            ),
+            (5, 20, 20)
+        );
+        document["verify"]
+            .as_table_mut()
+            .unwrap()
+            .insert("receiver_s".into(), 10.into());
+        for (receiver_s, receiver_off_s, expected_window) in
+            [(10, 20, 20), (25, 20, 25), (5, 10, 15)]
+        {
+            document["verify"]["receiver_s"] = receiver_s.into();
+            document["verify"]["receiver_off_s"] = receiver_off_s.into();
+            let partial = Config::parse(&toml::to_string(&document).unwrap()).unwrap();
+            assert_eq!(partial.verify.receiver_window_s, expected_window);
+        }
+        document["verify"]["receiver_off_s"] = 20.into();
+        document["verify"]
+            .as_table_mut()
+            .unwrap()
+            .insert("receiver_window_s".into(), 15.into());
+        assert!(
+            Config::parse(&toml::to_string(&document).unwrap()).is_err(),
+            "an explicitly undersized window must not be silently expanded"
         );
     }
 }

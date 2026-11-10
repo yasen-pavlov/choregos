@@ -58,7 +58,7 @@ volume_from = ["streamer"]        # roles whose remote volume keys are forwarded
 [timing]
 off_delay_s = 3                   # last device off → TV/receiver off
 takeover_settle_ms = 2000         # receiver turn_on → select_source → preset
-standby_retries = 2              # re-send the CEC stop/query sequence if standby is unconfirmed after takeover_settle_ms
+standby_retries = 3              # four attempts / 8 s at 2 s settle; covers observed 6.7 s streaming-box standby
 presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
@@ -68,13 +68,13 @@ tv_poll_ms = 2000                 # direct webOS observation cadence, 500–1000
 tv_window_s = 45                  # full action-window duration, 5–300 s; must be >= tv_s
 tv_idle_poll_s = 15               # continuous active-mode webOS idle polling, 5–120 seconds
 receiver_poll_ms = 1000           # direct receiver action-window cadence, 500–10000 ms
-receiver_window_s = 30            # full duration, 5–300 s; >= max(receiver_s, receiver_off_s)
+receiver_window_s = 15            # full duration, 5–300 s; if omitted: max(15, receiver_s, receiver_off_s)
 receiver_idle_poll_s = 15         # continuous direct receiver idle polling, 5–120 seconds
 probe_poll_ms = 2000              # configured console probes, 500–10000 ms
 probe_window_s = 45               # full action window, never stops at target, 5–300 seconds
 tv_s = 45                        # TV boot-to-service window (observed 17–30 s), not HA reconnect allowance
-receiver_s = 10                  # receiver on deadline; direct latency measures the device itself
-receiver_off_s = 20              # receiver off deadline; with direct observation not an HA polling allowance
+receiver_s = 5                   # on 1.03–1.09 s (n≈18); >4× margin on device-direct latency
+receiver_off_s = 10              # off max 2.2 s (n≈17); direct observation, not HA polling allowance
 speakers_s = 5
 source_s = 10
 drift_grace_s = 30               # reporting-only room intent disagreement grace, 5–600 seconds
@@ -120,8 +120,10 @@ takeover = "cec_standby"
 presence = "events"
 # Optional Sony console truth source; Remote Play and UDP reachability required:
 # probe = { kind = "ps5", host = "console.lan", port = 9302, idle_poll_s = 2, start_wake = "off", boot_s = 30, rest_s = 30 }
-# start_wake: off (ordering only), would (observe first), act (early room wake).
-# Unconfirmed starts retract on Standby or expire after boot_s; Remote Play can wake the room.
+# start_wake: off (default: no early wake or console_start rows), would (observe), act (early wake).
+# Off stops a console announcing within boot_s if it may predate the active device
+# (ambiguous counts as before), then restores the active source, with bounded repeats.
+# Rest-mode activity can falsely trigger act. Unconfirmed evidence retracts on Standby or expires after boot_s.
 # rest_s (5–300 s) requires settled, trusted Standby before a dark-phase start.
 # Standby runs must begin after every On frame (accepted or ignored); dark-free re-wakes use CEC order.
 # Same-probe reload preserves the run/rest clock; changed probe configuration resets it.

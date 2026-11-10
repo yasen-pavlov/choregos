@@ -219,7 +219,7 @@ volume_from = ["streamer"]        # roles whose remote volume keys are forwarded
 [timing]
 off_delay_s = 3                   # last device off → TV/receiver off
 takeover_settle_ms = 2000         # receiver turn_on → select_source → preset
-standby_retries = 2               # bounded standby retries after each takeover_settle_ms (0–10)
+standby_retries = 3               # four attempts / 8 s at default settle (0–10 retries)
 presence_poll_s = 5               # for roles with presence = "poll"
 presence_misses = 2
 identify_retry_s = 10
@@ -229,13 +229,13 @@ tv_poll_ms = 2000                 # 500–10000 ms
 tv_window_s = 45                  # 5–300 seconds
 tv_idle_poll_s = 15               # idle polling, 5–120 seconds
 receiver_poll_ms = 1000           # direct receiver window cadence, 500–10000 ms
-receiver_window_s = 30            # 5–300 seconds
+receiver_window_s = 15            # 5–300 seconds; omitted: max(15, receiver_s, receiver_off_s)
 receiver_idle_poll_s = 15         # 5–120 seconds
 probe_poll_ms = 2000              # 500–10000 ms
 probe_window_s = 45               # 5–300 seconds
 tv_s = 45                        # TV boot-to-service window (observed 17–30 s)
-receiver_s = 10
-receiver_off_s = 20
+receiver_s = 5                    # on 1.03–1.09 s (n≈18), >4× margin
+receiver_off_s = 10               # off max 2.2 s (n≈17)
 speakers_s = 5
 source_s = 10
 drift_grace_s = 30                # reporting-only drift grace, 5–600 seconds
@@ -418,18 +418,24 @@ select. Preserve winner intent/settle; newer same-field expectations close older
 ones as specified below. After the initial reversal, allow three repeat sequences
 per episode within `boot_s`; fourth/later repeats are suppressed. Configured On
 frames less than `takeover_settle_ms` after the last reversal row belong to that
-same announcement: no additional hypothetical row or repeat count. Act suppresses
-its reversal actions; would still executes ordinary live takeover. The same live
-parity applies to over-cap frames. A genuine repeat's stop is deliberate.
-In act, repeats require another active role; if its winner has released, end the
-episode and accept an ordinary wake. Would can reuse its stored winner only while
-the losing console holds the live room; its rows remain hypothetical. After boot
-expiry, use ordinary arrival-order wake behavior.
+same announcement: no additional hypothetical row or repeat count. Off/act
+suppress coalesced reversal actions; would still executes ordinary live takeover.
+The same live parity applies to over-cap frames. A genuine repeat's stop is deliberate.
+In off/act, repeats require another active role; if its winner has released, end
+the episode and accept an ordinary wake. Would can reuse its stored winner only
+while the losing console holds the live room; its rows remain hypothetical.
+After boot expiry, use ordinary arrival-order wake behavior.
 An unconfirmed evidence-only On role is also marked Off with actionless
 `taken_over` when displacement cannot send a stop because its LA is unknown.
 
-Probe `start_wake = "off"` (default) tracks ordering with no early rows.
-Both policies share eligibility: warming, blocked, already On, an older/ambiguous
+Probe `start_wake = "off"` is the default: no early wake and no
+`console_start*` rows. A console that may have started before the active device
+(ambiguous counts as before) and announces within `boot_s` is stopped per its
+takeover policy and the active source is restored, with bounded repeats.
+Otherwise CEC frames wake normally, without an early-start parent.
+Rest-mode background activity can mimic a start; stay on off to avoid phantom
+room wakes. The would experiment served its purpose; act is unsafe as designed.
+Would/act share eligibility: warming, blocked, already On, an older/ambiguous
 start, or an empty immediate wake plan silently marks Superseded. No LA is
 required for early room wake. Would never emits an empty `console_start` row.
 `"would"` records `console_start` Off→Off with exactly the ordinary wake actions,
@@ -442,7 +448,8 @@ still executes. `"act"` runs the ordinary On transition on evidence unless
 a newer role already won; frame confirmation then causes no duplicate wake.
 Retraction/expiry of an unconfirmed early wake releases it through normal Off
 and room-off scheduling. TV/receiver expectations match ordinary wakes, never
-the console's own power. Remote Play can trigger an early wake; there is no gate.
+the console's own power. Remote Play and background rest activity can trigger
+an early wake in act; there is no gate.
 This is evidence, not phase-4 anticipatory prediction.
 
 ### 5.5 Release (role turns Off)
@@ -496,16 +503,18 @@ configured source: code-to-display-name mapping is vendor-specific. Source and
 all receiver control stay on HA. `receiver_power_sources(config) -> &[Via]`
 selects `[Denon]` when observe exists, otherwise `[Ha]`; source remains `[Ha]`.
 The shared direct observer loop uses `receiver_poll_ms` (1000, 500–10000),
-`receiver_window_s` (30, 5–300), and `receiver_idle_poll_s` (15, 5–120).
-Require `receiver_window_s >= max(receiver_s, receiver_off_s)`. Dispatched receiver
+`receiver_window_s` (15, 5–300), and `receiver_idle_poll_s` (15, 5–120).
+An omitted `receiver_window_s` resolves to `max(15, receiver_s, receiver_off_s)`,
+preserving legacy explicit power deadlines. An explicit window still requires
+`receiver_window_s >= max(receiver_s, receiver_off_s)`. Dispatched receiver
 turn_on/turn_off replaces idle/older windows. Like TV, it runs the full duration
 even at target, then resumes idle. Shadow/reload/shutdown behavior matches the TV.
 Every sample
 feeds `Event::ReceiverPower { state, at, source_code }` and `receiver/state` traces.
 `Engine.receiver_direct` and `Snapshot.receiver_direct` cache
 `Option<(DirectPower, DateTime<Utc>)>`, cleared on reload and never persisted.
-Receiver deadlines stay 10 s on / 20 s off pending calibration; direct latency
-measures the receiver itself, not HA polling.
+Receiver deadlines are calibrated to 5 s on / 10 s off: device-direct on
+1.03–1.09 s (n≈18), off max 2.2 s (n≈17), not HA polling latency.
 
 Optional per-device `probe = { kind = "ps5", host = "console.lan", port = 9302 }`
 adds Sony console observations. Send one unicast datagram
@@ -557,9 +566,9 @@ Unchanged room power is not an observable effect to verify. All other rows,
 including shadow would-rows, have empty
 expectations and verdict `none`.
 
-Default deadlines under `[verify]` are TV 45 s, receiver power 10 s, speakers
-5 s, source 10 s. The TV deadline covers boot-to-service (observed 17–30 s),
-not HA reconnect allowance; default tightening remains on hold until calibration.
+Default deadlines under `[verify]` are TV 45 s, receiver power 5 s on / 10 s off,
+speakers 5 s, source 10 s. The TV deadline covers boot-to-service (observed 17–30 s);
+it remains unchanged pending cold-start calibration.
 Standby with only a CEC leg uses `takeover_settle_ms × (standby_retries + 1)`; probe-only standby
 uses `verify.probe_window_s × 1000`. With both legs, use the greater deadline
 so independent confirmation can arrive after CEC retries exhaust. The CEC

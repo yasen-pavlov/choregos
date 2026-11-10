@@ -1052,7 +1052,7 @@ pub(crate) fn quirk_sentences(device: &DeviceConfig, config: &Config) -> Vec<Sen
 fn probe_sentences(probe: &ProbeConfig) -> Vec<Sentence> {
     let start = match probe.start_wake() {
         StartWake::Off => Sentence::default()
-            .text("A wake the probe sees without any CEC announcement is ignored (")
+            .text("No early wake; a start the probe saw before the active device is stopped when it announces late (")
             .code("start_wake = off")
             .text(")."),
         StartWake::Would => Sentence::default()

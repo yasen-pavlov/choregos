@@ -155,8 +155,14 @@ adds a read-only Sony console power source. Remote Play must be enabled and UDP
 `verify.probe_window_s` window at `probe_poll_ms`, then idle resumes.
 Unreachable is not proof of standby. Role cards retain the last direct reading.
 
-Console `start_wake = "off"` tracks boot ordering only; `"would"` records inert
-early-wake/reversal decisions for observation before enabling `"act"`.
+Console `start_wake = "off"` is the default: no early wake and no
+`console_start*` rows. A console that may have started before the active device
+(ambiguous counts as before) and announces within `boot_s` is stopped per its
+takeover policy and the active source is restored, with bounded repeats.
+Otherwise CEC frames wake normally, without an early-start parent.
+Rest-mode background activity can mimic a start: stay on off to avoid phantom wakes.
+`"would"` served its observation purpose; `"act"` enables early wake and is unsafe
+as designed (three phantom starts in nine observations).
 Direct samples date query send, not reply. Two Unreachable samples after a trusted
 Standby run lasting `rest_s` (default 30 seconds, bounds 5–300) bound a boot to
 `(last Standby send, first Unreachable send]`. Trust requires Standby to begin
@@ -165,7 +171,8 @@ one rejected as late. Quick re-wakes without darkness use ordinary announcement
 order. Same-probe reload preserves the run/rest clock; changed probe config resets it.
 Only a configured CEC On frame confirms it. Standby retracts an unconfirmed
 start; `boot_s` (default 30 seconds) expires it. Act uses normal wake and release,
-including room-off delay. Remote Play can look like a start and wake the room.
+including room-off delay. Remote Play and rest-mode background activity can look
+like a start and wake the room in act; off never wakes before CEC.
 A console is newer only if its last Standby is newer than the active remote
 press; ambiguous intervals favor the active device. Idle cadence is ordering
 resolution (choose one second for finer ordering). Would uses act's eligibility
@@ -177,7 +184,7 @@ stream-path/source sequences; fourth/later repeats are suppressed until expiry.
 On frames within `takeover_settle_ms` of the last reversal form one announcement.
 Short/untrusted Standby runs preserve the rejected episode; trusted rest reaching
 `rest_s` ends it, allowing a later dark phase to identify a fresh start. If its
-winner releases, act accepts the console's next frame as ordinary wake. Would
+winner releases, off/act accept the console's next frame as ordinary wake. Would
 keeps reversals hypothetical, using its stored winner only while the console
 holds the live room; coalesced/capped frames still use ordinary live takeover.
 At startup, resync announcements cannot wake an Unknown room unless receiver
@@ -214,20 +221,25 @@ accepted **only through environment variables**, never as TOML keys:
 | `receiver` | HA `entity`, `select_source` boolean; optional `observe = {kind="denon", host, port=8080}` (non-empty host, no secrets) observes power directly; source and all control stay on HA |
 | `presets` | IANA `timezone` and `[[presets.slot]]` entries (`from`, `to` as `HH:MM`, HA `script`). Slots must cover exactly 24 hours; `24:00` is valid only as an end. |
 | `sonos` | HA `entity`, `mute_switch`, `volume_from` role IDs whose volume keys are forwarded while Sonos is `playing` |
-| `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 2, 0–10), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
-| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 10` (on), `receiver_off_s = 20` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV deadline covers boot-to-service (observed 17–30 s), not HA reconnect lag; latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Continuous TV idle cadence: `tv_idle_poll_s = 15` (5–120 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
+| `timing` | `off_delay_s`, `takeover_settle_ms`, `standby_retries` (default 3, 0–10; four attempts / 8 s with default settle), `presence_poll_s`, `presence_misses`, `identify_retry_s`. Intervals and misses must be positive. |
+| `verify` | Optional expectation deadlines `tv_s = 45`, `receiver_s = 5` (on), `receiver_off_s = 10` (off), `speakers_s = 5`, `source_s = 10` (seconds). The TV deadline covers boot-to-service (observed 17–30 s), not HA reconnect lag; latency is recorded separately. Direct windows: `tv_poll_ms` / `probe_poll_ms` (default 2000, 500–10000 ms), `tv_window_s` / `probe_window_s` (default 45, 5–300 seconds). Continuous TV idle cadence: `tv_idle_poll_s = 15` (5–120 seconds). Reporting-only drift grace: `drift_grace_s = 30` (5–600 seconds). Active-mode observation only; live-reloadable. |
 | `fake_tv` | `replies` (default `true`; `false` when the bridge firmware answers directed TV requests itself), `power_status`, `cec_version`, `osd_name` (1–14 ASCII bytes). Never answers Request Active Source. |
-| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302, idle_poll_s=2, start_wake="off", boot_s=30, rest_s=30}`. Probe idle bounds 1–60 seconds; boot bounds 5–120; settled-rest bounds 5–300; start policy `off` / `would` / `act`, live-reloadable. |
+| `[[device]]` | One per role: unique `role`, `name`, `kind` (`playback`/`recording`), `match`, unique receiver `source`, `on`/`off` event lists, `takeover`, `presence`, optional HA `media_player`, optional `probe = {kind="ps5", host, port=9302, idle_poll_s=2, start_wake="off", boot_s=30, rest_s=30}`. Probe idle bounds 1–60 seconds; boot bounds 5–120; settled-rest bounds 5–300; start policy `off` / `would` / `act`, live-reloadable. Off keeps real late-announcement ordering without early wake or console-start rows. |
 | `web` | `bind`, externally visible `public_url`; `web.oidc` (`issuer`, `client_id`); `web.local_login` (`username`) |
 
 Direct receiver cadence is `receiver_poll_ms = 1000` (500–10000 ms),
-`receiver_window_s = 30` (5–300 s), `receiver_idle_poll_s = 15` (5–120 s).
+`receiver_window_s = 15` (5–300 s), `receiver_idle_poll_s = 15` (5–120 s).
+If the window key is omitted, it resolves to `max(15, receiver_s, receiver_off_s)`,
+so legacy explicit power deadlines remain valid.
 Direct action windows keep polling after reaching a target. Configuration requires
 `tv_window_s >= tv_s` and `receiver_window_s >= max(receiver_s, receiver_off_s)`,
 so fresh evidence continues throughout contested expectations regardless of idle cadence.
-The unchanged 10 s On / 20 s Off deadlines now bound device latency with direct
-observation, not HA polling. Same-value samples retain drift grace regardless
-of timestamp; changed values restart it and unusable evidence clears it.
+Calibrated 5 s On / 10 s Off deadlines cover device-direct on 1.03–1.09 s
+(n≈18), off max 2.2 s (n≈17), rather than HA polling. The 15 s window retains
+five seconds of post-deadline samples. Three standby retries cover the observed
+streaming-box 6.7 s sleep (four attempts / 8 s at 2 s settle).
+Same-value samples retain drift grace regardless of timestamp; changed values
+restart it and unusable evidence clears it. TV and other deadlines stay unchanged.
 Native observation hosts omit scheme/path/whitespace/embedded ports; ports must
 be nonzero and IPv6 literals bracketed. Receiver input codes are optional;
 Power alone supplies its direct state.

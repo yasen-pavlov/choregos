@@ -245,7 +245,7 @@ pub(crate) static FIELDS: &[FieldDef] = &[
         .says("A takeover settles after {new} ms instead of {old} ms."),
     def("timing.standby_retries", "Standby retries", int(0, 10))
         .unit("attempts")
-        .default("2")
+        .default("3")
         .help("How many times to resend Standby when a displaced player does not confirm it. Each retry is one more CEC Standby on the bus.")
         .says("A displaced player gets {new} Standby retries instead of {old}."),
     def("timing.presence_poll_s", "Presence poll", int(1, OPEN))
@@ -278,7 +278,7 @@ pub(crate) static FIELDS: &[FieldDef] = &[
         .help("How often the receiver is asked directly during an action window."),
     def("verify.receiver_window_s", "Receiver window", int(5, 300))
         .unit(SECONDS)
-        .default("30")
+        .default("15")
         .help("How long direct receiver polling runs after an action; at least both receiver deadlines."),
     def("verify.receiver_idle_poll_s", "Receiver idle poll", int(5, 120))
         .unit(SECONDS)
@@ -299,12 +299,12 @@ pub(crate) static FIELDS: &[FieldDef] = &[
         .says("The TV gets {new} s instead of {old} s to reach its power state."),
     def("verify.receiver_s", "Receiver on deadline", int(1, 300))
         .unit(SECONDS)
-        .default("10")
+        .default("5")
         .help("How long the receiver gets to report on after a wake.")
         .says("The receiver gets {new} s instead of {old} s to report on."),
     def("verify.receiver_off_s", "Receiver off deadline", int(1, 300))
         .unit(SECONDS)
-        .default("20")
+        .default("10")
         .help("How long the receiver gets to report off; separate from the on deadline.")
         .says("The receiver gets {new} s instead of {old} s to report off."),
     def("verify.speakers_s", "Speakers deadline", int(1, 300))
@@ -2269,7 +2269,9 @@ fn start_wake_note(start_wake: &str) -> &'static str {
             "would: when the probe sees it start before any CEC event, log what Choregos would do, but do not wake the room yet."
         }
         "act" => "act: when the probe sees it start first, wake the room early.",
-        _ => "off: a start the probe sees first only orders events; CEC decides.",
+        _ => {
+            "off: a start the probe sees first only orders events as the bus reports them; CEC decides."
+        }
     }
 }
 
@@ -3442,7 +3444,7 @@ mod tests {
 
     /// `EXAMPLE` as an edit outside the form leaves it: one more standby retry.
     fn moved() -> String {
-        EXAMPLE.replacen("standby_retries = 2 ", "standby_retries = 4 ", 1)
+        EXAMPLE.replacen("standby_retries = 3 ", "standby_retries = 4 ", 1)
     }
 
     #[test]
@@ -3457,7 +3459,7 @@ mod tests {
                     .replacen("off_delay_s = 3 ", "off_delay_s = 5 ", 1)
                     .as_str()
             ),
-            "the external standby_retries = 4 is not put back to 2"
+            "the external standby_retries = 4 is not put back to 3"
         );
         assert_eq!(
             checked
@@ -3470,7 +3472,7 @@ mod tests {
         // A form posted without originals still applies every posted field.
         let mut legacy = form.clone();
         legacy.orig = None;
-        assert!(edited("timing", &moved(), &legacy).contains("standby_retries = 2 "));
+        assert!(edited("timing", &moved(), &legacy).contains("standby_retries = 3 "));
     }
 
     #[test]
@@ -3926,11 +3928,11 @@ mod tests {
             .filter(|line| !line.starts_with("standby_retries"))
             .map(|line| format!("{line}\n"))
             .collect();
-        let same = posted("timing", &text, &[("timing.standby_retries", "2")]);
+        let same = posted("timing", &text, &[("timing.standby_retries", "3")]);
         assert_eq!(edited("timing", &text, &same), text);
-        let more = posted("timing", &text, &[("timing.standby_retries", "3")]);
+        let more = posted("timing", &text, &[("timing.standby_retries", "4")]);
         assert!(
-            edited("timing", &text, &more).contains("identify_retry_s = 10\nstandby_retries = 3\n")
+            edited("timing", &text, &more).contains("identify_retry_s = 10\nstandby_retries = 4\n")
         );
     }
 
@@ -4182,7 +4184,7 @@ mod tests {
         assert_eq!(raw.problems.first().map(|(at, _)| *at), Some(Some(line)));
         assert!(raw.changes.is_empty());
 
-        let bounded = EXAMPLE.replacen("standby_retries = 2", "standby_retries = 12", 1);
+        let bounded = EXAMPLE.replacen("standby_retries = 3", "standby_retries = 12", 1);
         let line = EXAMPLE
             .lines()
             .position(|l| l.starts_with("standby_retries"))
@@ -4256,11 +4258,11 @@ mod tests {
             1,
         );
         assert!(changes(&before, &written).is_empty());
-        let dropped = before.replacen("standby_retries = 2", "", 1);
+        let dropped = before.replacen("standby_retries = 3", "", 1);
         assert!(changes(&before, &dropped).is_empty());
-        let three = before.replacen("standby_retries = 2", "", 1).replacen(
+        let three = before.replacen("standby_retries = 3", "", 1).replacen(
             "[timing]",
-            "[timing]\nstandby_retries = 3",
+            "[timing]\nstandby_retries = 4",
             1,
         );
         assert_eq!(
@@ -4268,7 +4270,7 @@ mod tests {
                 .into_iter()
                 .map(|c| c.sentence)
                 .collect::<Vec<_>>(),
-            ["A displaced player gets 3 Standby retries instead of 2."]
+            ["A displaced player gets 4 Standby retries instead of 3."]
         );
     }
 
