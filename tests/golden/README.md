@@ -1,5 +1,42 @@
 # Golden replay corpus
 
+## 2026-11-10 — Calibrated receiver and CEC defaults
+
+Ran the corpus without blessing first: nine cases differ; startup-resync remains
+byte-identical. Existing configs keep their explicit values; absent keys inherit
+receiver On 5 s / Off 10 s and three standby retries (8 s at default settle).
+The following IDs change on both creation and settlement lines unless noted:
+
+| Case | Receiver On 10000→5000 ms | Receiver Off 20000→10000 ms | CEC standby 6000→8000 ms |
+| --- | --- | --- | --- |
+| `aether-console-late-takeover-baseline` | 1 | 7 | 4 |
+| `aether-console-swap-probe` | 1 | — | — |
+| `aether-console-wake-and-streamer-takeover` | 1, 8 | 7, 11 | — |
+| `aether-quick-cycles` | 5, 9 | 4, 8, 12 | — |
+| `aether-receiver-off-first` | 1 | 4 | — |
+| `aether-restart-mid-takeover` | 8, 12 | 7, 11 | — |
+| `aether-standby-retry` | — | 7 | 4 |
+| `aether-startup-resync-ignored` | — | — | — |
+| `aether-streamer-to-console-pause-standby` | 6 | 5, 12 | 9 |
+| `tasmota-console-and-kodi` | 1, 5 | 4, 8 | — |
+
+One intentional outcome exception, approved in review, is the motivating E1/830
+case: `aether-console-late-takeover-baseline` verdict 4's streamer standby changes
+from `missed { observed: "on" }` to `cec_only { observed: "standby" }`.
+The +6.7 s report now fits the 8 s window. Retry count changes 2→3 (four sends);
+settlement moves 12:58:32.624→12:58:33.153 UTC and aggregate verdict changes
+partial→achieved. Its console probe outcome is unchanged. All other outcomes,
+aggregate verdicts and settlement times remain unchanged.
+
+Stripped-field invariant checked across all ten cases: compare rows by decision
+`id` / `verdict_for`, remove expectation `deadline_ms` / `attempts` and verdict
+settlement `at`, and normalize only that exact verdict-4 streamer outcome and
+aggregate verdict. Every remaining field matches, including creation timestamps,
+IDs/parents/triggers, actions, roles, transitions, reasons, allowed sources and
+other outcomes/latencies. Row keys and counts are identical; no new decisions.
+The separate `off` tests cover evidence-only phantom starts, ordinary wake,
+E1 late reversal, repeats/expiry, and parity with superseded act.
+
 ## 2026-11-07 (evening) — Probe trust and same-field closure
 
 Initial golden test passed before implementation. Three existing settlement

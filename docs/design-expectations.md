@@ -86,9 +86,9 @@ Latency on the verdict = the slowest `met` expectation.
 
 | decision | expectations (subject.field = expect, via, default deadline) |
 | --- | --- |
-| off→on transition (wake) | `tv.power = on` only if `WakeTv` was sent (tv_direct with webOS, otherwise ha; 45 s) · `receiver.power = on` only if `turn_on` was sent (denon with observe, otherwise ha; 10 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` only for stopped CEC policies with verification enabled or any stopped role with a probe (CEC retry window, probe poll window, or their maximum; source policy below) |
+| off→on transition (wake) | `tv.power = on` only if `WakeTv` was sent (tv_direct with webOS, otherwise ha; 45 s) · `receiver.power = on` only if `turn_on` was sent (denon with observe, otherwise ha; 5 s) · `speakers.playback = stopped` if `media_stop` was sent (ha; 5 s) · `role:<displaced>.power = standby` only for stopped CEC policies with verification enabled or any stopped role with a probe (CEC retry window, probe poll window, or their maximum; source policy below) |
 | `takeover_settled` | `receiver.source = <role source>` if `select_source` was sent (ha; 10 s). Preset scripts have no observable → no expectation. |
-| `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct with webOS, otherwise ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (denon with observe, otherwise ha; 20 s) |
+| `off_timer_expired` | `tv.power = off` only if `TvOff` was sent (tv_direct with webOS, otherwise ha; 45 s) · `receiver.power = off` only if receiver `turn_off` was sent (denon with observe, otherwise ha; 10 s) |
 | `all_off`, `manual_standby` | Same standby eligibility: CEC policies with verification enabled, or probe-only for a stopped role with a probe; no CEC expectation for HA media-stop/none policies |
 | everything else | none |
 | `console_start` in act | Ordinary wake expectations; never the initiating console's own power |
@@ -96,9 +96,9 @@ Latency on the verdict = the slowest `met` expectation.
 | any core `would` row | None, verdict `none`; full hypothetical actions stay on the row, never dispatched |
 
 Receiver power uses `denon` when `[receiver].observe` is configured, otherwise
-`ha`. Receiver source remains HA in either configuration. Deadlines remain
-10 seconds On / 20 seconds Off; direct observations measure device latency,
-not HA polling delay.
+`ha`. Receiver source remains HA in either configuration. Calibrated deadlines
+are 5 seconds On / 10 seconds Off: device-direct on 1.03–1.09 s (n≈18),
+off max 2.2 s (n≈17), not HA polling delay.
 
 A role's own `on` is what triggered the decision, so it is not an expectation.
 Expectations describe actions actually emitted, not unchanged room state:
@@ -126,6 +126,8 @@ of `90 xx`, the retry sequence, or the lifetime of that slot.
 Standby deadlines follow the enabled legs: `[cec]` uses
 `takeover_settle_ms × (standby_retries + 1)`, `[ps5]` uses
 `verify.probe_window_s × 1000`, and `[ps5, cec]` uses the maximum.
+With default 2 s settle and three retries, CEC gets four attempts over 8 s,
+covering the measured 6.7 s streaming-box standby report.
 The probe therefore retains its full configured observation window after the
 CEC retry sequence exhausts; this does not extend or reschedule CEC retries.
 
@@ -161,9 +163,9 @@ HA uses `changed` for power/playback and `updated` for source; direct timestamps
 date query send. If all fields pre-settle, the decision immediately achieves.
 
 Deadlines are per-field config under `[verify]` with the defaults above;
-calibration may change the defaults in a later release, not the schema.
+receiver/CEC calibration changes defaults, not the schema or existing explicit values.
 The TV default remains 45 seconds for boot-to-service (observed 17–30 s),
-not HA reconnect allowance; tightening is on hold until roughly 2026-11-12.
+not HA reconnect allowance; cold-start calibration is still outstanding.
 HA power/playback freshness uses `changed > decision.at`; receiver source
 freshness uses `updated > decision.at` from HA `last_updated`. Trace
 `ha/state.updated` preserves that timestamp; old traces fall back to line `ts`.
@@ -196,7 +198,9 @@ New:
   to HA names. Missing/empty codes do not invalidate Power. Source observations
   and control remain HA. A single shared
   scheduler supports `receiver_poll_ms = 1000` (500–10000),
-  `receiver_window_s = 30` (5–300), `receiver_idle_poll_s = 15` (5–120).
+  `receiver_window_s = 15` (5–300), `receiver_idle_poll_s = 15` (5–120).
+  An omitted window resolves to `max(15, receiver_s, receiver_off_s)` so legacy
+  explicit deadlines remain valid; an explicit undersized window is rejected.
   Dispatched receiver turn_on/off replaces idle/window work; it polls for the full
   `receiver_window_s`, then resumes idle. Require
   `receiver_window_s >= max(receiver_s, receiver_off_s)`. Reload/shutdown aborts
@@ -238,7 +242,15 @@ Unchanged probe configuration preserves the probe run and settled-rest baseline
 across reload, including distrust from an earlier On frame. Changed probe
 configuration clears both; raw observations and start episodes are cleared either way.
 
-Per-probe `start_wake` defaults to `off` (ordering only). Enable `would` first:
+Per-probe `start_wake = "off"` is the default: no early wake and no
+`console_start*` rows. A console that may have started before the active device
+(ambiguous counts as before) and announces within `boot_s` is stopped per its
+takeover policy and the active source is restored, with bounded repeats.
+Its late announcements have real stop/stream-path/source actions, standby
+expectations and coalescing as act. Otherwise CEC frames wake normally, without
+an early-start parent. Rest-mode downloads/updates can mimic starts: stay on off.
+Would served its observation purpose; act is unsafe as designed (three phantom
+starts in nine observations). `would` remains available as an observation mode:
 `console_start` Off→Off lists the ordinary wake actions without executing or
 mutating control state, expectations or intent. Its later ordinary wake is
 parented to that row. Actionless `console_start_retracted` and
@@ -247,7 +259,8 @@ Would and act share eligibility: older/ambiguous start, warming, blocked,
 already On or an empty immediate action plan suppresses the early start silently.
 No LA is needed. Would never records an empty `console_start` action plan.
 `act` runs the normal wake immediately, or releases it normally on retraction/
-expiry (`timer/console_boot`). Remote Play can wake the room; no extra gate.
+expiry (`timer/console_boot`). Remote Play and background rest-mode activity can
+wake the room in act; no extra gate.
 
 A console wins only when its last Standby is newer than the active role's
 `on_since`; older/ambiguous boot intervals lose. Ordering resolution is idle
@@ -261,7 +274,7 @@ Coalesced/over-cap frames suppress only the hypothetical row in would mode;
 ordinary live takeover still runs. Short or untrusted Standby runs preserve a
 rejected episode/winner. Once a trusted run reaches `rest_s`, end the episode,
 even within a long `boot_s`, so the next dark phase can start a fresh episode.
-Act repeats require
+Off/act repeats require
 another current active role; if it released, end the episode and wake normally.
 Would may reuse the stored winner only while the losing console holds the live room.
 New same-field observations close older pending fields normally.

@@ -2,6 +2,50 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-10 — Stay on off after phantom starts; calibrated receiver/CEC defaults
+
+- Nine console-start observations over November 7–10 produced six parented real
+  wakes 7–10 seconds later and three phantom starts: row 1067 at 04:12 UTC
+  stayed dark 12 seconds then returned to Standby (retracted); 1069 at 06:22
+  stayed dark 45 seconds (expired); 1084 at 17:24, 60 seconds after console sleep,
+  expired. Rest-mode background downloads/updates can have the same discovery
+  signature as a controller start. Early wake would have powered the room with
+  nobody there; settled-rest filtering is not sufficient to make it safe.
+- Stay on `probe.start_wake = "off"`: act is unsafe as designed (three phantom
+  starts in nine), and would served its purpose. Off already means no early wake
+  or `console_start*` rows, while retaining real late-announcement ordering:
+  a console that may have started before the active device (ambiguous counts as
+  before) and announces within `boot_s` is stopped per its takeover policy and
+  the active source restored, with bounded repeats. No additional policy value
+  is needed. Probe reload semantics and bounds are unchanged.
+
+| Default | Old → new | Device-direct evidence / margin |
+| --- | --- | --- |
+| `verify.receiver_s` | 10 → 5 s | on 1.03–1.09 s, n≈18; >4× margin |
+| `verify.receiver_off_s` | 20 → 10 s | off max 2.2 s, n≈17 |
+| `verify.receiver_window_s` | 30 → 15 s | ≥ max(on, off), 5 s post-deadline samples |
+| `timing.standby_retries` | 2 → 3 | four attempts, 8 s at 2 s settle; streaming-box Standby at +6.7 s |
+
+- An omitted `verify.receiver_window_s` resolves to
+  `max(15, receiver_s, receiver_off_s)`, rather than blindly choosing 15 s.
+  Legacy files with explicit `receiver_off_s = 20` and no window still parse;
+  explicitly undersized windows still fail validation.
+
+- TV on 4–22 s and off 6.1 s (two unreachable cases), receiver source usually
+  30–60 ms (max 360 ms), and console standby 2–8 s were observed (n≈17–19
+  per series). Keep TV, source, speakers, probe and drift defaults unchanged:
+  cold TV starts are not yet measured.
+- Apple TV broadcast-Standby quirk when put to standby during its own boot
+  (17:25:04 UTC 11-09): Denon off, reported as drift, device-side, no action.
+- Goldens use the new defaults where keys are absent. The review-approved outcome
+  exception is E1/830 (`aether-console-late-takeover-baseline`, verdict 4):
+  missed/on → cec_only/standby, partial → achieved, retry count 2→3, settlement
+  12:58:32.624→12:58:33.153 UTC. The extended window now covers the motivating
+  report. All other differences are calibrated deadlines only; all remaining
+  fields match after stripping those fields and this exact exception (full row
+  inventory in `tests/golden/README.md`). No new golden is needed: ordering and
+  phantom-start cases are injected-time replay tests.
+
 ## 2026-11-08 — Phase 2 slice 5: Recorder timeline and the recorder script
 
 - One vendored, hand-written script, `src/web/static/recorder-2.js` (no dependencies, no
