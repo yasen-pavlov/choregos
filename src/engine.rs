@@ -1053,96 +1053,96 @@ impl Engine {
     fn handle_command(&mut self, command: Command, now: Instant) -> Vec<Action> {
         let mut actions = vec![];
         match command {
-            Command::SetMode(mode) => {
-                if mode == Mode::Shadow {
-                    self.release_unconfirmed_starts();
-                }
-                Arc::make_mut(&mut self.config).mode = mode;
-                if mode == Mode::Shadow {
-                    self.close_drifts();
-                    self.cancel_expectations();
-                    self.standby_verifications.clear();
-                    for state in self.roles.values_mut() {
-                        state.start = None;
-                        state.start_baseline = None;
-                        state.start_first = None;
-                    }
-                }
-                self.record(None, None, None, "command_set_mode", vec![], None);
-            }
-            Command::Identify(la) => {
-                if la < 15 && la != self.bus.bridge {
-                    actions.extend(self.bus.manual_identify(la, now));
-                    // Accepted commands remain visible even when their send is queued.
-                    self.record(None, None, None, "command_identify", actions.clone(), None);
-                }
-            }
-            Command::Forget(la) => {
-                if la < 15 && la != self.bus.bridge && self.bus.entries.remove(&la).is_some() {
-                    self.standby_verifications
-                        .retain(|pending| pending.la != la);
-                    self.signals.remove(&la);
-                    let previous_roles = self.identity.roles.clone();
-                    self.refresh_identity();
-                    for role in previous_roles.keys() {
-                        if !self.identity.roles.contains_key(role)
-                            && !self.identity.blocked.contains(role)
-                        {
-                            actions.extend(self.transition(
-                                role,
-                                RolePower::Off,
-                                "identity_lost",
-                                now,
-                            ));
-                        }
-                    }
-                    let newly_bound: Vec<_> = self
-                        .identity
-                        .roles
-                        .iter()
-                        .filter(|(role, la)| previous_roles.get(*role) != Some(*la))
-                        .filter_map(|(role, &la)| {
-                            self.buffered_power_event(role, la)
-                                .map(|(signal, power)| (role.clone(), signal, power))
-                        })
-                        .collect();
-                    for (role, signal, power) in newly_bound {
-                        actions.extend(self.apply_role_signal(
-                            &role,
-                            power,
-                            &format!("{signal:?}"),
-                            now,
-                        ));
-                    }
-                    self.record(None, None, None, "command_forget", vec![], None);
-                }
-            }
-            Command::SendRaw { to, data } => {
-                if to <= 15 && !data.is_empty() && data.len() <= self.config.bridge.max_raw_bytes()
-                {
-                    actions.push(Action::CecSend { to, data });
-                }
-            }
+            Command::SetMode(mode) => self.command_set_mode(mode),
+            Command::Identify(la) => self.command_identify(la, now, &mut actions),
+            Command::Forget(la) => self.command_forget(la, now, &mut actions),
+            Command::SendRaw { to, data } => self.command_send_raw(to, data, &mut actions),
             Command::Takeover(role) => {
                 actions.extend(self.transition(&role, RolePower::On, "manual_takeover", now));
             }
-            Command::Standby(role) => {
-                if !self.warming && !self.identity.blocked.contains(&role) {
-                    actions.extend(self.stop_role(&role, now));
-                    actions.extend(self.transition(&role, RolePower::Off, "manual_standby", now));
-                }
-            }
-            Command::AllOff => {
-                if !self.warming {
-                    for role in self.roles.keys().cloned().collect::<Vec<_>>() {
-                        actions.extend(self.stop_role(&role, now));
-                        actions.extend(self.transition(&role, RolePower::Off, "all_off", now));
-                    }
-                    self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
-                }
-            }
+            Command::Standby(role) => self.command_standby(&role, now, &mut actions),
+            Command::AllOff => self.command_all_off(now, &mut actions),
         }
         actions
+    }
+
+    fn command_set_mode(&mut self, mode: Mode) {
+        if mode == Mode::Shadow {
+            self.release_unconfirmed_starts();
+        }
+        Arc::make_mut(&mut self.config).mode = mode;
+        if mode == Mode::Shadow {
+            self.close_drifts();
+            self.cancel_expectations();
+            self.standby_verifications.clear();
+            for state in self.roles.values_mut() {
+                state.start = None;
+                state.start_baseline = None;
+                state.start_first = None;
+            }
+        }
+        self.record(None, None, None, "command_set_mode", vec![], None);
+    }
+
+    fn command_identify(&mut self, la: u8, now: Instant, actions: &mut Vec<Action>) {
+        if la < 15 && la != self.bus.bridge {
+            actions.extend(self.bus.manual_identify(la, now));
+            // Accepted commands remain visible even when their send is queued.
+            self.record(None, None, None, "command_identify", actions.clone(), None);
+        }
+    }
+
+    fn command_forget(&mut self, la: u8, now: Instant, actions: &mut Vec<Action>) {
+        if la < 15 && la != self.bus.bridge && self.bus.entries.remove(&la).is_some() {
+            self.standby_verifications
+                .retain(|pending| pending.la != la);
+            self.signals.remove(&la);
+            let previous_roles = self.identity.roles.clone();
+            self.refresh_identity();
+            for role in previous_roles.keys() {
+                if !self.identity.roles.contains_key(role) && !self.identity.blocked.contains(role)
+                {
+                    actions.extend(self.transition(role, RolePower::Off, "identity_lost", now));
+                }
+            }
+            let newly_bound: Vec<_> = self
+                .identity
+                .roles
+                .iter()
+                .filter(|(role, la)| previous_roles.get(*role) != Some(*la))
+                .filter_map(|(role, &la)| {
+                    self.buffered_power_event(role, la)
+                        .map(|(signal, power)| (role.clone(), signal, power))
+                })
+                .collect();
+            for (role, signal, power) in newly_bound {
+                actions.extend(self.apply_role_signal(&role, power, &format!("{signal:?}"), now));
+            }
+            self.record(None, None, None, "command_forget", vec![], None);
+        }
+    }
+
+    fn command_send_raw(&mut self, to: u8, data: Vec<u8>, actions: &mut Vec<Action>) {
+        if to <= 15 && !data.is_empty() && data.len() <= self.config.bridge.max_raw_bytes() {
+            actions.push(Action::CecSend { to, data });
+        }
+    }
+
+    fn command_standby(&mut self, role: &str, now: Instant, actions: &mut Vec<Action>) {
+        if !self.warming && !self.identity.blocked.contains(role) {
+            actions.extend(self.stop_role(role, now));
+            actions.extend(self.transition(role, RolePower::Off, "manual_standby", now));
+        }
+    }
+
+    fn command_all_off(&mut self, now: Instant, actions: &mut Vec<Action>) {
+        if !self.warming {
+            for role in self.roles.keys().cloned().collect::<Vec<_>>() {
+                actions.extend(self.stop_role(&role, now));
+                actions.extend(self.transition(&role, RolePower::Off, "all_off", now));
+            }
+            self.off_at = Some(now + Duration::from_secs(self.config.timing.off_delay_s));
+        }
     }
 
     fn command_reason(command: &Command) -> &'static str {
