@@ -1576,6 +1576,14 @@ impl Engine {
         actions
     }
 
+    fn clear_cec_power(&mut self, la: u8) {
+        self.signals.remove(&la);
+        if let Some(entry) = self.bus.entries.get_mut(&la) {
+            entry.power = BusPower::Unknown;
+            entry.power_at = None;
+        }
+    }
+
     fn poll_presence(&mut self, now: Instant, actions: &mut Vec<Action>) {
         for role in self.roles.keys().cloned().collect::<Vec<_>>() {
             if self.identity.blocked.contains(&role) {
@@ -1600,11 +1608,7 @@ impl Engine {
                 state.misses += 1;
             }
             if state.misses >= self.config.timing.presence_misses {
-                self.signals.remove(&la);
-                if let Some(entry) = self.bus.entries.get_mut(&la) {
-                    entry.power = BusPower::Unknown;
-                    entry.power_at = None;
-                }
+                self.clear_cec_power(la);
                 actions.extend(self.transition(&role, RolePower::Off, "presence_timeout", now));
             } else {
                 state.awaiting = true;

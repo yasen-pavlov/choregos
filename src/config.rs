@@ -374,6 +374,8 @@ pub enum ProbeConfig {
         boot_s: u64,
         #[serde(default = "default_probe_rest")]
         rest_s: u64,
+        #[serde(default)]
+        standby_off_s: u64,
     },
 }
 
@@ -413,6 +415,9 @@ impl ProbeConfig {
         if !(5..=300).contains(&self.rest_s()) {
             return invalid("probe rest_s must be in 5..=300 seconds");
         }
+        if self.standby_off_s() != 0 && !(10..=600).contains(&self.standby_off_s()) {
+            return invalid("probe standby_off_s must be 0 (disabled) or in 10..=600 seconds");
+        }
         Ok(())
     }
 
@@ -431,6 +436,12 @@ impl ProbeConfig {
     pub fn rest_s(&self) -> u64 {
         match self {
             Self::Ps5 { rest_s, .. } => *rest_s,
+        }
+    }
+
+    pub fn standby_off_s(&self) -> u64 {
+        match self {
+            Self::Ps5 { standby_off_s, .. } => *standby_off_s,
         }
     }
 
@@ -1014,6 +1025,7 @@ mod tests {
                 start_wake: StartWake::Off,
                 boot_s: 30,
                 rest_s: 30,
+                standby_off_s: 0,
             });
             assert_eq!(config.validate().is_ok(), valid);
         }
@@ -1533,6 +1545,7 @@ mod console_start_tests {
                 start_wake: StartWake::Act,
                 boot_s: boot,
                 rest_s: 30,
+                standby_off_s: 0,
             });
             assert_eq!(
                 Config::parse(&toml::to_string(&config).unwrap()).is_ok(),
@@ -1562,6 +1575,32 @@ mod console_start_tests {
             Config::parse(&text).is_err(),
             "a start policy outside probe is rejected"
         );
+    }
+
+    #[test]
+    fn probe_standby_off_accepts_legacy_files_and_validates_opt_in_bounds() {
+        let old = "kind='ps5'\nhost='console.example'";
+        let mut config = Config::parse(include_str!("../choregos.example.toml")).unwrap();
+        config.device[0].probe = Some(toml::from_str(old).unwrap());
+        assert!(config.validate().is_ok(), "old probe files remain valid");
+        assert_eq!(config.device[0].probe.as_ref().unwrap().standby_off_s(), 0);
+        for (seconds, valid) in [
+            (0, true),
+            (1, false),
+            (9, false),
+            (10, true),
+            (60, true),
+            (600, true),
+            (601, false),
+        ] {
+            config.device[0].probe =
+                Some(toml::from_str(&format!("{old}\nstandby_off_s={seconds}")).unwrap());
+            let result = Config::parse(&toml::to_string(&config).unwrap());
+            assert_eq!(result.is_ok(), valid, "standby_off_s={seconds}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("probe standby_off_s"));
+            }
+        }
     }
 
     #[test]

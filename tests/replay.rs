@@ -4401,6 +4401,7 @@ fn takeover_standby_uses_independent_console_evidence_or_honest_cec_only() {
             start_wake: choregos::config::StartWake::Off,
             boot_s: 30,
             rest_s: 30,
+            standby_off_s: 0,
         });
         identify_atv(&mut engine, start);
         verdict_event(
@@ -4730,6 +4731,7 @@ fn all_off_keeps_creation_met_rows_when_attaching_an_already_off_role() {
         start_wake: choregos::config::StartWake::Off,
         boot_s: 30,
         rest_s: 30,
+        standby_off_s: 0,
     });
     identify_atv(&mut engine, start);
     frame(&mut engine, start, 8, 15, "84240004");
@@ -4934,6 +4936,7 @@ fn already_standby_probe_settles_an_attached_command_expectation_at_creation() {
         start_wake: choregos::config::StartWake::Off,
         boot_s: 30,
         rest_s: 30,
+        standby_off_s: 0,
     });
     identify_atv(&mut engine, start);
     verdict_event(
@@ -5214,6 +5217,7 @@ fn opted_out_cec_standby_uses_only_a_configured_probe() {
             start_wake: choregos::config::StartWake::Off,
             boot_s: 30,
             rest_s: 30,
+            standby_off_s: 0,
         });
         identify_atv(&mut engine, start);
         verdict_event(
@@ -5407,6 +5411,7 @@ fn review_p7_confirmed_verification_releases_suppression_at_its_check() {
         start_wake: choregos::config::StartWake::Off,
         boot_s: 30,
         rest_s: 30,
+        standby_off_s: 0,
     });
     identify_atv(&mut engine, start);
     for (ms, event) in [
@@ -5697,6 +5702,7 @@ fn bridge_offline_cancels_cec_only_but_preserves_independent_probe_expectations(
                 start_wake: choregos::config::StartWake::Off,
                 boot_s: 30,
                 rest_s: 30,
+                standby_off_s: 0,
             });
         }
         identify_atv(&mut engine, start);
@@ -5827,6 +5833,7 @@ fn review_q6_only_checked_cec_confirmation_survives_a_later_user_wake() {
             start_wake: choregos::config::StartWake::Off,
             boot_s: 30,
             rest_s: 30,
+            standby_off_s: 0,
         });
         identify_atv(&mut engine, start);
         verdict_event(
@@ -5906,6 +5913,7 @@ fn probe_standby_verdict(cec: bool, probe_window_s: u64, settle_ms: u64) -> (Eng
         start_wake: choregos::config::StartWake::Off,
         boot_s: 30,
         rest_s: 30,
+        standby_off_s: 0,
     });
     identify_atv(&mut engine, start);
     verdict_event(
@@ -7544,6 +7552,7 @@ fn console_start_engine(policy: choregos::config::StartWake) -> (Engine, Instant
         start_wake: policy,
         boot_s: 30,
         rest_s: 30,
+        standby_off_s: 0,
     });
     console.verify_standby = false;
     console
@@ -9582,4 +9591,633 @@ fn calibrated_cec_window_accepts_the_six_point_seven_second_standby_report() {
             observed: "standby".into()
         }
     );
+}
+
+fn standby_backstop_engine(seconds: u64, mode: Mode) -> (Engine, Instant) {
+    let (mut engine, start) = console_start_engine(choregos::config::StartWake::Off);
+    let config = std::sync::Arc::make_mut(&mut engine.config);
+    config.mode = mode;
+    let probe = config
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_b")
+        .unwrap()
+        .probe
+        .as_mut()
+        .unwrap();
+    let choregos::config::ProbeConfig::Ps5 { standby_off_s, .. } = probe;
+    *standby_off_s = seconds;
+    (engine, start)
+}
+
+fn backstop_sample(
+    engine: &mut Engine,
+    start: Instant,
+    delivered_ms: u64,
+    sent_ms: u64,
+    state: choregos::state::ConsoleState,
+) -> Vec<Action> {
+    verdict_event(
+        engine,
+        start,
+        delivered_ms,
+        Event::ConsolePower {
+            role: "console_b".into(),
+            state,
+            at: wall() + chrono::Duration::milliseconds(sent_ms as i64),
+        },
+    )
+}
+
+#[test]
+fn probe_standby_backstop_matches_sleep_timings_in_both_modes() {
+    use choregos::state::ConsoleState::{Standby, Unreachable};
+    // Milliseconds after 19:24:00 in the incident. Query-send time, not delivery,
+    // controls both thresholds, including a delayed reply just before the boundary.
+    for seconds in [10, 60] {
+        for mode in [Mode::Active, Mode::Shadow] {
+            let (mut engine, start) = standby_backstop_engine(seconds, mode);
+            console_frame(&mut engine, start, 17973, 8, 0, "0D");
+            console_frame(&mut engine, start, 17987, 8, 15, "822400");
+            verdict_event(&mut engine, start, 19987, Event::Tick);
+            backstop_sample(&mut engine, start, 25027, 24925, Unreachable);
+            backstop_sample(&mut engine, start, 33026, 32924, Standby);
+            backstop_sample(&mut engine, start, 44023, 42923, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert!(engine.decisions.is_empty());
+            let fired_ms = if seconds == 10 {
+                assert!(backstop_sample(&mut engine, start, 44024, 42924, Standby).is_empty());
+                44024
+            } else {
+                backstop_sample(&mut engine, start, 48926, 47924, Unreachable);
+                assert_eq!(engine.roles["console_b"].power, RolePower::On);
+                backstop_sample(&mut engine, start, 91085, 90972, Standby);
+                backstop_sample(&mut engine, start, 152071, 150971, Standby);
+                assert_eq!(engine.roles["console_b"].power, RolePower::On);
+                assert!(engine.decisions.is_empty());
+                verdict_event(&mut engine, start, 152072, Event::Tick);
+                assert_eq!(
+                    engine.roles["console_b"].power,
+                    RolePower::On,
+                    "not timer-driven"
+                );
+                assert!(backstop_sample(&mut engine, start, 152073, 150972, Standby).is_empty());
+                152073
+            };
+            assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            let row = engine.decisions.last().unwrap();
+            assert_eq!(row.reason, "probe_standby");
+            assert_eq!(
+                (row.from, row.to),
+                (Some(RolePower::On), Some(RolePower::Off))
+            );
+            assert_eq!(row.trigger, Trigger::Observation { source: Via::Ps5 });
+            assert_eq!(row.parent, None);
+            assert!(row.actions.is_empty());
+            assert!(row.expectations.is_empty());
+            assert_eq!(row.verdict, Verdict::None);
+            assert_eq!(engine.intent.active_role, None);
+            assert_eq!(engine.intent.power, RoomPower::On);
+            backstop_sample(&mut engine, start, fired_ms + 1, fired_ms + 1, Standby);
+            assert!(engine.decisions.is_empty(), "Off cannot release twice");
+            let actions = verdict_event(&mut engine, start, fired_ms + 3000, Event::Tick);
+            assert!(actions.contains(&Action::TvOff));
+            assert!(actions.iter().any(|action| service(action, "turn_off")));
+            let off = engine.decisions.last().unwrap();
+            assert_eq!(off.reason, "off_timer_expired");
+            assert_eq!(engine.intent.power, RoomPower::Off);
+            assert_eq!(off.expectations.is_empty(), mode == Mode::Shadow);
+            console_frame(&mut engine, start, fired_ms + 4000, 8, 0, "0D");
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert_eq!(engine.decisions.last().unwrap().reason, "TextViewOn");
+        }
+    }
+}
+
+#[test]
+fn probe_standby_backstop_resets_on_awake_and_unreachable() {
+    use choregos::state::ConsoleState::{Awake, Standby, Unreachable};
+    for breaker in [Awake, Unreachable] {
+        let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
+        console_frame(&mut engine, start, 10000, 8, 0, "0D");
+        verdict_event(&mut engine, start, 12000, Event::Tick);
+        console_sample(&mut engine, start, 20000, Standby);
+        console_sample(&mut engine, start, 29999, breaker);
+        console_sample(&mut engine, start, 30000, Standby);
+        console_sample(&mut engine, start, 39999, Standby);
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert!(engine.decisions.is_empty());
+        console_sample(&mut engine, start, 40000, Standby);
+        assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+    }
+}
+
+#[test]
+fn probe_standby_backstop_distrusts_runs_before_or_equal_to_on_evidence() {
+    use choregos::state::ConsoleState::{Awake, Standby};
+    for already_on in [false, true] {
+        for run_start in [42632, 49150] {
+            let (mut engine, start) = standby_backstop_engine(60, Mode::Active);
+            if already_on {
+                console_frame(&mut engine, start, 10000, 8, 0, "0D");
+                verdict_event(&mut engine, start, 12000, Event::Tick);
+            }
+            // Counter-case: Standby at 20:50:42.632, On frame at 20:50:49.150.
+            console_sample(&mut engine, start, run_start, Standby);
+            console_frame(&mut engine, start, 49150, 8, 0, "0D");
+            verdict_event(&mut engine, start, 51150, Event::Tick);
+            console_sample(&mut engine, start, 120000, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert!(engine.decisions.is_empty());
+            // An entirely new run after the most recent On frame is trusted.
+            console_sample(&mut engine, start, 121000, Awake);
+            console_sample(&mut engine, start, 122000, Standby);
+            console_sample(&mut engine, start, 181999, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            console_sample(&mut engine, start, 182000, Standby);
+            assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+        }
+    }
+}
+
+#[test]
+fn probe_standby_backstop_is_inert_when_disabled_or_already_off() {
+    use choregos::state::ConsoleState::Standby;
+    for (seconds, awake) in [(0, true), (60, false)] {
+        let (mut engine, start) = standby_backstop_engine(seconds, Mode::Active);
+        if awake {
+            console_frame(&mut engine, start, 10000, 8, 0, "0D");
+            verdict_event(&mut engine, start, 12000, Event::Tick);
+        }
+        for ms in [20000, 80000, 620000] {
+            console_sample(&mut engine, start, ms, Standby);
+            assert!(engine.decisions.is_empty());
+            assert_eq!(engine.roles["console_b"].power == RolePower::On, awake);
+        }
+    }
+}
+
+#[test]
+fn probe_standby_backstop_never_duplicates_an_ordinary_inactive_source_release() {
+    use choregos::state::ConsoleState::Standby;
+    let (mut engine, start) = standby_backstop_engine(60, Mode::Active);
+    console_frame(&mut engine, start, 17973, 8, 0, "0D");
+    verdict_event(&mut engine, start, 19973, Event::Tick);
+    console_sample(&mut engine, start, 32924, Standby);
+    console_frame(&mut engine, start, 38318, 8, 0, "9D2400");
+    assert_eq!(engine.decisions.last().unwrap().reason, "InactiveSource");
+    verdict_event(&mut engine, start, 41318, Event::Tick);
+    for ms in [92924, 150972] {
+        console_sample(&mut engine, start, ms, Standby);
+        assert!(engine.decisions.is_empty());
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    }
+}
+
+#[test]
+fn probe_standby_backstop_reload_preserves_only_unchanged_probe_runs() {
+    use choregos::config::ProbeConfig;
+    use choregos::state::ConsoleState::Standby;
+    for changed in [false, true] {
+        let (mut engine, start) = standby_backstop_engine(60, Mode::Active);
+        // No cached CEC On: isolate probe-configuration preservation from the
+        // existing resync replay, which separately invalidates trust below.
+        verdict_event(
+            &mut engine,
+            start,
+            10000,
+            Event::Command(Command::Takeover("console_b".into())),
+        );
+        verdict_event(&mut engine, start, 12000, Event::Tick);
+        console_sample(&mut engine, start, 20000, Standby);
+        let mut config = (*engine.config).clone();
+        if changed {
+            let Some(ProbeConfig::Ps5 { standby_off_s, .. }) = &mut config
+                .device
+                .iter_mut()
+                .find(|device| device.role == "console_b")
+                .unwrap()
+                .probe
+            else {
+                unreachable!()
+            };
+            *standby_off_s = 59;
+        }
+        verdict_event(
+            &mut engine,
+            start,
+            70000,
+            Event::ConfigReloaded(config.into()),
+        );
+        verdict_event(&mut engine, start, 73000, Event::Tick);
+        console_sample(&mut engine, start, 80000, Standby);
+        assert_eq!(engine.roles["console_b"].power == RolePower::On, changed);
+        if changed {
+            assert!(engine.decisions.is_empty());
+            console_sample(&mut engine, start, 138999, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            console_sample(&mut engine, start, 139000, Standby);
+        }
+        assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+    }
+}
+
+#[test]
+fn probe_standby_backstop_retries_after_warming_or_identity_block_without_consuming_run() {
+    use choregos::state::ConsoleState::Standby;
+    for warming in [false, true] {
+        let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
+        console_frame(&mut engine, start, 10000, 8, 0, "0D");
+        verdict_event(&mut engine, start, 12000, Event::Tick);
+        console_sample(&mut engine, start, 20000, Standby);
+        if warming {
+            let config = engine.config.clone();
+            verdict_event(&mut engine, start, 29000, Event::ConfigReloaded(config));
+        } else {
+            engine.identity.blocked.insert("console_b".into());
+        }
+        let intent = engine.intent.clone();
+        assert!(console_sample(&mut engine, start, 30000, Standby).is_empty());
+        assert!(engine.decisions.is_empty());
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert_eq!(engine.intent, intent);
+        if warming {
+            assert!(engine.warming);
+        } else {
+            engine.identity.blocked.remove("console_b");
+        }
+        console_sample(&mut engine, start, 32000, Standby);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+    }
+}
+
+#[test]
+fn probe_standby_backstop_preserves_ordinary_pending_settle_and_expectation_lifecycle() {
+    use choregos::state::ConsoleState::Standby;
+    let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
+    std::sync::Arc::make_mut(&mut engine.config)
+        .timing
+        .takeover_settle_ms = 20000;
+    console_frame(&mut engine, start, 10000, 8, 0, "0D");
+    let wake = engine.decisions.last().unwrap().id;
+    console_sample(&mut engine, start, 10001, Standby);
+    console_sample(&mut engine, start, 20001, Standby);
+    assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+    assert_eq!(engine.intent.active_role, None);
+    assert!(
+        engine
+            .expectations(wake)
+            .unwrap()
+            .iter()
+            .any(|expectation| expectation.subject == "tv"
+                && expectation.outcome == Outcome::Pending)
+    );
+    verdict_event(&mut engine, start, 23001, Event::Tick);
+    let actions = verdict_event(&mut engine, start, 30000, Event::Tick);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| service(action, "select_source"))
+    );
+    assert!(
+        engine
+            .decisions
+            .iter()
+            .all(|row| row.reason != "takeover_settled")
+    );
+}
+
+#[test]
+fn probe_standby_backstop_keeps_start_retraction_ahead_of_its_own_threshold() {
+    use choregos::{config::StartWake, state::ConsoleState};
+    let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
+    let probe = std::sync::Arc::make_mut(&mut engine.config)
+        .device
+        .iter_mut()
+        .find(|device| device.role == "console_b")
+        .unwrap()
+        .probe
+        .as_mut()
+        .unwrap();
+    let choregos::config::ProbeConfig::Ps5 { start_wake, .. } = probe;
+    *start_wake = StartWake::Act;
+    console_sample(&mut engine, start, 6000, ConsoleState::Standby);
+    console_sample(&mut engine, start, 60000, ConsoleState::Unreachable);
+    console_sample(&mut engine, start, 61000, ConsoleState::Unreachable);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert_eq!(engine.decisions.last().unwrap().reason, "console_start");
+    console_sample(&mut engine, start, 62000, ConsoleState::Standby);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert_eq!(
+        engine.decisions.last().unwrap().reason,
+        "console_start_retracted"
+    );
+    verdict_event(&mut engine, start, 65000, Event::Tick);
+    console_sample(&mut engine, start, 72000, ConsoleState::Standby);
+    assert!(
+        engine.decisions.is_empty(),
+        "no delayed duplicate probe release"
+    );
+}
+
+#[test]
+fn probe_standby_backstop_waits_for_a_new_run_after_resync_replays_buffered_on() {
+    use choregos::state::ConsoleState::{Standby, Unreachable};
+    let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
+    console_frame(&mut engine, start, 10000, 8, 0, "0D");
+    verdict_event(&mut engine, start, 12000, Event::Tick);
+    console_sample(&mut engine, start, 20000, Standby);
+    let config = engine.config.clone();
+    verdict_event(&mut engine, start, 29000, Event::ConfigReloaded(config));
+    assert!(console_sample(&mut engine, start, 30000, Standby).is_empty());
+    assert!(engine.decisions.is_empty());
+    assert_eq!(engine.bus.entries[&8].power, BusPower::On);
+    // Warm-up replays the old On while the role is still On, refreshing awake_at.
+    verdict_event(&mut engine, start, 32000, Event::Tick);
+    console_sample(&mut engine, start, 100000, Standby);
+    assert!(engine.decisions.is_empty());
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    console_sample(&mut engine, start, 101000, Unreachable);
+    console_sample(&mut engine, start, 102000, Standby);
+    console_sample(&mut engine, start, 111999, Standby);
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    console_sample(&mut engine, start, 112000, Standby);
+    assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+}
+
+#[test]
+fn probe_standby_backstop_discards_stale_cec_on_before_reload_or_bridge_resync() {
+    use choregos::state::ConsoleState::Standby;
+    for reload in [false, true] {
+        let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
+        console_frame(&mut engine, start, 10000, 8, 0, "0D");
+        verdict_event(&mut engine, start, 12000, Event::Tick);
+        console_sample(&mut engine, start, 20000, Standby);
+        console_sample(&mut engine, start, 30000, Standby);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
+        assert_eq!(engine.bus.entries[&8].power_at, None);
+        let event = if reload {
+            Event::ConfigReloaded(engine.config.clone())
+        } else {
+            verdict_event(&mut engine, start, 31000, Event::BridgeOffline);
+            Event::BridgeOnline
+        };
+        verdict_event(&mut engine, start, 32000, event);
+        let actions = verdict_event(&mut engine, start, 35000, Event::Tick);
+        assert!(!actions.contains(&Action::WakeTv));
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert!(
+            engine
+                .decisions
+                .iter()
+                .all(|row| row.to != Some(RolePower::On))
+        );
+        console_frame(&mut engine, start, 36000, 8, 0, "0D");
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert_eq!(engine.decisions.last().unwrap().reason, "TextViewOn");
+    }
+}
+
+#[test]
+fn guarded_probe_backstop_keeps_the_latest_standby_baseline_for_start_ordering() {
+    use choregos::state::ConsoleState::{Standby, Unreachable};
+    let mut disabled = None;
+    for seconds in [0, 10] {
+        let (mut engine, start) = standby_backstop_engine(seconds, Mode::Active);
+        let mut events = vec![
+            (10000, Event::Frame(Frame::from_hex(8, 0, "0D").unwrap())),
+            (
+                12500,
+                Event::Frame(Frame::from_hex(11, 15, "84250004").unwrap()),
+            ),
+            (
+                12600,
+                Event::Frame(Frame::from_hex(11, 15, "87080046").unwrap()),
+            ),
+        ];
+        for second in 20..=50 {
+            let ms = second * 1000;
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+            if second == 40 {
+                events.push((40500, Event::Frame(Frame::from_hex(4, 0, "04").unwrap())));
+            }
+        }
+        for ms in [51000, 52000] {
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Unreachable,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+        }
+        events.push((53000, Event::Command(Command::Forget(11))));
+        let mut stream = Vec::new();
+        for (ms, event) in events {
+            let actions = verdict_event(&mut engine, start, ms, event);
+            assert!(
+                actions.iter().all(|action| {
+                    !matches!(action, Action::CecSend { to: 8, data } if data == &[0x36])
+                }),
+                "must not stop the newly announcing console at {ms}"
+            );
+            assert!(
+                engine
+                    .decisions
+                    .iter()
+                    .all(|row| row.reason != "late_announcement")
+            );
+            if (12600..53000).contains(&ms) {
+                assert!(engine.identity.blocked.contains("console_b"));
+            }
+            stream.push(serde_json::json!({
+                "actions": actions,
+                "rows": engine.decisions,
+                "verdicts": engine.verdicts,
+                "intent": engine.intent,
+            }));
+        }
+        assert!(!engine.identity.blocked.contains("console_b"));
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        if let Some(disabled) = &disabled {
+            assert_eq!(&stream, disabled, "guarded samples must behave as key = 0");
+        } else {
+            disabled = Some(stream);
+        }
+    }
+}
+
+#[test]
+fn guarded_probe_backstop_defers_to_a_single_pending_start_retraction() {
+    use choregos::{
+        config::StartWake,
+        state::ConsoleState::{Standby, Unreachable},
+    };
+    let mut disabled = None;
+    for seconds in [0, 10] {
+        let (mut engine, start) = standby_backstop_engine(seconds, Mode::Active);
+        let probe = std::sync::Arc::make_mut(&mut engine.config)
+            .device
+            .iter_mut()
+            .find(|device| device.role == "console_b")
+            .unwrap()
+            .probe
+            .as_mut()
+            .unwrap();
+        let choregos::config::ProbeConfig::Ps5 { start_wake, .. } = probe;
+        *start_wake = StartWake::Act;
+        let mut events = Vec::new();
+        for (ms, state) in [(6000, Standby), (60000, Unreachable), (61000, Unreachable)] {
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+        }
+        events.extend([
+            (
+                61500,
+                Event::Frame(Frame::from_hex(11, 15, "84250004").unwrap()),
+            ),
+            (
+                61600,
+                Event::Frame(Frame::from_hex(11, 15, "87080046").unwrap()),
+            ),
+        ]);
+        for second in 62..=75 {
+            let ms = second * 1000;
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+        }
+        events.push((75500, Event::Command(Command::Forget(11))));
+        for ms in [76000, 77000] {
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+        }
+        let mut stream = Vec::new();
+        let mut retractions = 0;
+        for (ms, event) in events {
+            let actions = verdict_event(&mut engine, start, ms, event);
+            if ms == 61000 {
+                assert_eq!(engine.decisions.last().unwrap().reason, "console_start");
+                assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            }
+            if (61600..75500).contains(&ms) {
+                assert!(engine.identity.blocked.contains("console_b"));
+            }
+            for row in &engine.decisions {
+                assert_ne!(row.reason, "probe_standby");
+                if row.reason == "console_start_retracted" {
+                    retractions += 1;
+                    assert_eq!(ms, 76000);
+                    assert_eq!(
+                        (row.from, row.to),
+                        (Some(RolePower::On), Some(RolePower::Off))
+                    );
+                }
+            }
+            stream.push(serde_json::json!({
+                "actions": actions,
+                "rows": engine.decisions,
+                "verdicts": engine.verdicts,
+                "intent": engine.intent,
+            }));
+        }
+        assert_eq!(retractions, 1);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        if let Some(disabled) = &disabled {
+            assert_eq!(&stream, disabled, "start retraction must behave as key = 0");
+        } else {
+            disabled = Some(stream);
+        }
+    }
+}
+
+#[test]
+fn due_standby_sample_ending_warmup_releases_before_buffered_on_can_replay() {
+    use choregos::state::ConsoleState::Standby;
+    for mode in [Mode::Active, Mode::Shadow] {
+        let (mut engine, start) = standby_backstop_engine(10, mode);
+        console_frame(&mut engine, start, 10000, 8, 0, "0D");
+        verdict_event(&mut engine, start, 12000, Event::Tick);
+        console_sample(&mut engine, start, 20000, Standby);
+        let config = engine.config.clone();
+        verdict_event(&mut engine, start, 29000, Event::ConfigReloaded(config));
+        for ms in [30000, 31000] {
+            assert!(console_sample(&mut engine, start, ms, Standby).is_empty());
+            assert!(engine.warming);
+            assert!(engine.decisions.is_empty());
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert_eq!(engine.bus.entries[&8].power, BusPower::On);
+        }
+        assert!(console_sample(&mut engine, start, 32001, Standby).is_empty());
+        assert!(!engine.warming);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
+        assert_eq!(engine.bus.entries[&8].power_at, None);
+        assert_eq!(engine.decisions.len(), 1);
+        assert_eq!(engine.decisions[0].reason, "probe_standby");
+        assert_eq!(engine.decisions[0].to, Some(RolePower::Off));
+        let actions = verdict_event(&mut engine, start, 35001, Event::Tick);
+        assert!(!actions.contains(&Action::WakeTv));
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert!(
+            engine
+                .decisions
+                .iter()
+                .all(|row| row.to != Some(RolePower::On))
+        );
+    }
+}
+
+#[test]
+fn changing_only_probe_standby_off_cancels_pending_console_standby_expectations() {
+    use choregos::config::ProbeConfig;
+    for seconds in [0, 10] {
+        let (mut engine, start, id) = probe_standby_verdict(false, 17, 2000);
+        let mut config = (*engine.config).clone();
+        let Some(ProbeConfig::Ps5 { standby_off_s, .. }) = &mut config.device[0].probe else {
+            unreachable!()
+        };
+        *standby_off_s = seconds;
+        verdict_event(
+            &mut engine,
+            start,
+            1300,
+            Event::ConfigReloaded(config.into()),
+        );
+        assert_eq!(
+            engine.expectations(id).unwrap().last().unwrap().outcome,
+            if seconds == 0 {
+                Outcome::Pending
+            } else {
+                Outcome::Unknown { observed: None }
+            }
+        );
+    }
 }

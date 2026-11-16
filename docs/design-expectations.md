@@ -294,6 +294,40 @@ to normal replay-on-bind buffers only for receiver On; otherwise discard with
 role None. A second resync reports the discard of existing holds before reset.
 Warm-up completion never replays still-held inputs.
 
+## Probe standby backstop
+
+Optional per-probe `standby_off_s` defaults to 0 (disabled); nonzero values must
+be 10–600 seconds. Each Standby observation while the role is On checks its
+existing trusted run: start strictly after `max(on_since, awake_at)`, and elapsed
+query-send time at least `standby_off_s`. Awake/Unreachable break the run; every
+configured On frame distrusts an older/equal run, even without a power transition.
+The ordinary Off transition records `probe_standby` with `observation/ps5`
+provenance and starts the normal room-off timer, in active and shadow alike.
+No CEC query or standby command is added. The existing start-evidence path runs
+first, including on guarded samples; a start retraction that releases the role
+takes precedence over the backstop. Warming/identity blocking defers the backstop
+without consuming control evidence; a later Standby sample retries it.
+
+Existing probe standby expectations confirm dispatched stops; they do not turn
+an On role Off, and role power is excluded from drift. This opt-in control input
+therefore neither duplicates those reports nor changes their evaluation/retries.
+A performed Off drops the bound LA's buffered signals and clears bus power/time
+to Unknown, exactly as presence timeout does; a stale On must not re-wake the
+room at the end of warm-up or a later resync. Rejected transitions leave these
+untouched. Ordinary Off lifecycle otherwise retains existing start-episode and
+verification-slot semantics. Reload preserves runs/baselines only for unchanged
+probe configuration; editing `standby_off_s` clears them and settles pending
+console standby expectations unknown, just like changing any other probe key.
+If a tick or another event ends warm-up while the role is still On, resync's
+buffered On replay refreshes `awake_at` and distrusts the preserved run; the
+backstop then waits for a new Standby run. The exception is a due Standby sample
+that ends warm-up: `handle` clears warming before dispatch, so the sample
+releases the role and clears stale signals before `finish_warming` can replay
+them. A later real configured On frame wakes normally.
+Known limit: a console returning On without a configured On frame while its
+responder keeps reporting Standby in a new trusted run would be turned Off.
+
+
 ## Room intent and drift
 
 `RoomIntent { power: unknown|on|off, active_role, receiver_source }` is derived
