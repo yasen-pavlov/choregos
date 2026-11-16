@@ -10221,3 +10221,104 @@ fn changing_only_probe_standby_off_cancels_pending_console_standby_expectations(
         );
     }
 }
+
+#[test]
+fn unbound_probe_backstop_matches_disabled_until_rebound_with_a_new_trusted_run() {
+    use choregos::state::ConsoleState::{Awake, Standby};
+    for mode in [Mode::Active, Mode::Shadow] {
+        let mut disabled = None;
+        for seconds in [0, 10] {
+            let (mut engine, start) = standby_backstop_engine(seconds, mode);
+            let original = engine.config.clone();
+            let mut changed = (*original).clone();
+            changed
+                .device
+                .iter_mut()
+                .find(|device| device.role == "console_b")
+                .unwrap()
+                .matches
+                .vendor = Some("FFFFFF".into());
+            let mut events = vec![
+                (10000, Event::Frame(Frame::from_hex(8, 0, "0D").unwrap())),
+                (12000, Event::Tick),
+                (20000, Event::ConfigReloaded(changed.into())),
+                (23000, Event::Tick),
+            ];
+            for second in 30..=40 {
+                let ms = second * 1000;
+                events.push((
+                    ms,
+                    Event::ConsolePower {
+                        role: "console_b".into(),
+                        state: Standby,
+                        at: wall() + chrono::Duration::milliseconds(ms as i64),
+                    },
+                ));
+            }
+            events.extend([
+                (43000, Event::Tick),
+                (60000, Event::ConfigReloaded(original)),
+                (63000, Event::Tick),
+                (
+                    69000,
+                    Event::ConsolePower {
+                        role: "console_b".into(),
+                        state: Standby,
+                        at: wall() + chrono::Duration::milliseconds(69000),
+                    },
+                ),
+            ]);
+            let mut stream = Vec::new();
+            for (ms, event) in events {
+                let actions = verdict_event(&mut engine, start, ms, event);
+                assert_eq!(engine.roles["console_b"].power, RolePower::On);
+                assert_eq!(
+                    engine.identity.roles.contains_key("console_b"),
+                    !(20000..60000).contains(&ms)
+                );
+                assert!(engine.decisions.iter().all(|row| {
+                    !matches!(row.reason.as_str(), "probe_standby" | "resync_complete")
+                }));
+                if ms > 10000 {
+                    assert!(!actions.contains(&Action::WakeTv));
+                    assert!(!actions.iter().any(|action| {
+                        matches!(action, Action::HaCall { domain, service, .. }
+                            if domain == "media_player" && service == "turn_on")
+                    }));
+                }
+                stream.push(serde_json::json!({
+                    "actions": actions,
+                    "rows": engine.decisions,
+                    "verdicts": engine.verdicts,
+                    "intent": engine.intent,
+                }));
+            }
+            if let Some(disabled) = &disabled {
+                assert_eq!(
+                    &stream, disabled,
+                    "unbound/rebound stream must match key = 0"
+                );
+            } else {
+                disabled = Some(stream);
+            }
+            // The buffered On replay at 63 s distrusts the old run. No new CEC
+            // frame is needed once a fresh, trusted Standby run reaches N.
+            console_sample(&mut engine, start, 70000, Awake);
+            console_sample(&mut engine, start, 71000, Standby);
+            console_sample(&mut engine, start, 80999, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert!(engine.decisions.is_empty());
+            console_sample(&mut engine, start, 81000, Standby);
+            if seconds == 0 {
+                assert_eq!(engine.roles["console_b"].power, RolePower::On);
+                assert!(engine.decisions.is_empty());
+            } else {
+                assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+                assert_eq!(engine.decisions.len(), 1);
+                assert_eq!(engine.decisions[0].reason, "probe_standby");
+                assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
+                assert_eq!(engine.bus.entries[&8].power_at, None);
+            }
+        }
+    }
+}

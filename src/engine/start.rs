@@ -111,7 +111,10 @@ impl Engine {
 
     fn probe_standby_off_due(&self, role: &str, sent_at: Instant) -> bool {
         let state = &self.roles[role];
-        if state.power != RolePower::On || !state.probe_standby_trusted() {
+        if state.power != RolePower::On
+            || !self.identity.roles.contains_key(role)
+            || !state.probe_standby_trusted()
+        {
             return false;
         }
         self.config

@@ -305,8 +305,9 @@ The ordinary Off transition records `probe_standby` with `observation/ps5`
 provenance and starts the normal room-off timer, in active and shadow alike.
 No CEC query or standby command is added. The existing start-evidence path runs
 first, including on guarded samples; a start retraction that releases the role
-takes precedence over the backstop. Warming/identity blocking defers the backstop
-without consuming control evidence; a later Standby sample retries it.
+takes precedence over the backstop. Warming, blocked identity and an unbound role
+defer the backstop without consuming control evidence; subsequent Standby samples
+retry once the guard clears.
 
 Existing probe standby expectations confirm dispatched stops; they do not turn
 an On role Off, and role power is excluded from drift. This opt-in control input

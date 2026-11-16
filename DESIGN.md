@@ -382,8 +382,8 @@ values must be 10–600 seconds. On each console observation, after updating the
 run and processing existing start evidence, a logically On role with a trusted
 Standby run lasting at least that long at the sample's query-send time transitions
 Off with reason `probe_standby`. Start retraction takes precedence.
-The ordinary transition guard defers it during warming/blocked identity without
-consuming the run; subsequent Standby samples retry. Tick never fires this rule.
+Warming, blocked identity and an unbound role defer the backstop without consuming
+the run; subsequent Standby samples retry. Tick never fires this rule.
 Every configured On frame distrusts an older/equal run; Awake and
 Unreachable break it. The rule runs in both modes, uses `observation/ps5`
 provenance, sends no CEC itself and follows the normal room-off timer/intent.

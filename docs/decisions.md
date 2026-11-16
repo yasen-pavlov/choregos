@@ -20,6 +20,8 @@ Deviations from DESIGN.md agreed in review. Newest first.
   subsequent qualifying Standby samples retry. The existing start-evidence path
   runs first, including on guarded samples, and a start retraction takes
   precedence over the backstop. Preserve verification and expectation lifecycle.
+  Warming, blocked identity and an unbound role guard the backstop; an unbound
+  role waits for a binding so its old LA's buffered On cannot survive a release.
 - Lead-approved lifecycle amendment: after a performed `probe_standby` release,
   drop the bound LA's buffered signals and reset bus power/time to Unknown,
   mirroring presence timeout. A trusted run is newer than the buffered On, so
