@@ -2746,6 +2746,43 @@ async fn decision_detail_renders_trigger_actions_expectations_and_family() {
     assert!(shadow.contains("recorded as would"));
 }
 
+#[tokio::test]
+async fn a_probe_standby_row_reads_as_a_standby_in_the_list_and_its_detail() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.push_back(DecisionView {
+        id: 40,
+        trigger: crate::action::Trigger::Observation {
+            source: crate::action::Via::Ps5,
+        },
+        role: Some("console".to_owned()),
+        from: Some(RolePower::On),
+        to: Some(RolePower::Off),
+        reason: "probe_standby".to_owned(),
+        actions: vec![],
+        ..shadow_decision()
+    });
+    h.state.publish(snapshot, []);
+    let list = ok_page(&h, &cookie, "/recorder").await;
+    let row = row_containing(&list, ">probe_standby<");
+    assert!(row.contains("<span class=\"grp\">standby</span>"), "{row}");
+    assert!(!row.contains("not in the glossary"), "{row}");
+    let detail = ok_page(&h, &cookie, "/recorder/40").await;
+    assert!(
+        detail.contains(
+            "<h1>Test Console marked off: its probe reported standby and no sleep announcement arrived</h1>"
+        ),
+        "{detail}"
+    );
+    assert!(detail.contains("Decision #40 · standby"), "{detail}");
+    let why = between(&detail, "id=\"why\"", "</section>");
+    assert!(
+        why.contains("no CEC sleep announcement arrived") && !why.contains("not in the glossary"),
+        "{why}"
+    );
+}
+
 /// A frame in the memory ring, `offset_ms` after `at`.
 fn wire(
     at: chrono::DateTime<chrono::Utc>,
@@ -2985,7 +3022,11 @@ async fn old_routes_are_gone_and_navigation_points_at_the_recorder() {
     );
     let glossary = body(h.get("/recorder/glossary", Some(&cookie)).await).await;
     assert!(glossary.contains("<dt id=\"r-off_timer_expired\"><a class=\"mono\" href=\"/recorder?reason=off_timer_expired\">off_timer_expired</a></dt>"));
-    assert_eq!(glossary.matches("<dt id=\"r-").count(), 38);
+    assert_eq!(glossary.matches("<dt id=\"r-").count(), 39);
+    assert!(
+        glossary.contains("<dt id=\"r-probe_standby\">"),
+        "{glossary}"
+    );
 }
 
 /// Publishes the current snapshot after `edit`; returns the polled top-bar status block.

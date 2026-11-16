@@ -704,6 +704,11 @@ pub(crate) fn headline(decision: &DecisionView, snapshot: &Snapshot) -> String {
         (ReasonGroup::Standby, "presence_timeout") => {
             format!("{who} stopped answering presence polls")
         }
+        (ReasonGroup::Standby, "probe_standby") => {
+            format!(
+                "{who} marked off: its probe reported standby and no sleep announcement arrived"
+            )
+        }
         (ReasonGroup::Standby, "manual_standby") => format!("{who} put in standby"),
         (ReasonGroup::Standby, "late_announcement") => {
             format!("{who} stopped: it announced itself late")
@@ -1366,6 +1371,15 @@ mod tests {
             ..standby.clone()
         };
         assert_eq!(headline(&taken), "Streamer taken over");
+        let backstop = DecisionView {
+            reason: "probe_standby".to_owned(),
+            trigger: Trigger::Observation { source: Via::Ps5 },
+            ..standby.clone()
+        };
+        assert_eq!(
+            headline(&backstop),
+            "Streamer marked off: its probe reported standby and no sleep announcement arrived"
+        );
         let settled = DecisionView {
             reason: "takeover_settled".to_owned(),
             from: None,

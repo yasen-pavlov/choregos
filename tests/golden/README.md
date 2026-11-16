@@ -1,5 +1,55 @@
 # Golden replay corpus
 
+## 2026-11-16 — Trusted probe standby backstop
+
+**`aether-console-sleep-probe-backstop` — 4 decisions + 2 verdict lines.**
+Authentic 18:40:30–19:26:45 UTC extraction with the standard public renames,
+`--node cec-bridge`, role `console_b` (protocol/via stays `ps5`), and the
+`aether-quick-cycles` configuration plus console `standby_off_s = 60`.
+The initially requested 19:24:00 start replayed no decisions: the unverified
+identity seed and re-announcement alone could not bind the role. With lead
+approval the window starts before the authentic wake/physical verification;
+no synthetic inputs or identity/extraction changes were made. Recorded foreign
+`w-17`–`w-20` probe-send outcomes and their replies are retained as evidence,
+not attributed to this engine. Existing cases are not re-blessed.
+
+The rows were explained against `trace.jsonl` before blessing:
+
+1. **18:40:55.238, id 1, `ActiveSource` Off→On.** Lines 39/41 contain the
+   console's Text View On (18:40:53.922) and Active Source (53.965). The restored
+   identity is still unverified, so Active Source supersedes the buffered wake.
+   Line 58's physical-address report verifies it and releases that buffered
+   signal, with the `84` frame as trigger. Unlike live's earlier Text View On,
+   replay wakes only now. It sends TV wake and receiver On; direct receiver On
+   at line 50 (query 55.021) pre-settles receiver met/0. Cold HA caches still
+   require the receiver command.
+2. **18:40:57.238, id 2, `takeover_settled`, parent 1.** The ordinary two-second
+   settle timer runs the daytime preset. Line 65 already reports receiver source
+   Console B, so no redundant source selection or source expectation is emitted.
+3. **18:40:58.146, verdict 1 achieved.** Line 92 supplies direct TV On, queried
+   at 57.925: 2687 ms after the reconstructed wake. Receiver was already met.
+4. **19:26:32.030, id 3, `probe_standby` On→Off.** Lines 3130/3131's 19:24:17
+   re-announcement is a duplicate On but refreshes trust provenance. The first
+   Standby run (19:24:32.924–47.924) is broken by Unreachable, far short of 60 s.
+   Line 3221 begins the new run at 19:25:30.972409674. Line 3289's sample at
+   19:26:30.925193952 is only 59.952784278 s later and cannot fire. Line 3290,
+   queried at 31.925186721 and delivered at 32.030, is the first qualifying
+   sample. The observation-triggered Off has no actions or expectations.
+5. **19:26:35.030, id 4, `off_timer_expired`.** Exactly three seconds after Off,
+   the ordinary timer sends TV Off and receiver Off, with direct expectations.
+6. **19:27:20.030, verdict 4 missed.** The recording predates this rule: no
+   counterfactual shutdown actually occurred. Lines 3297/3298 still observe TV
+   and receiver On after the replay's requested Off. Both expectations miss;
+   replay's reporting-only tail reaches the 45-second TV deadline without
+   inventing successful observations or additional control actions.
+
+Known limitation: a console that returns On without any configured On frame
+while its responder reports a new trusted Standby run can still be released.
+The opt-in key defaults to zero; all ten existing expected streams must remain
+byte-identical. Injected replay tests cover both modes, send/delivery timing,
+10/60-second thresholds, reset/distrust, ordinary CEC release, re-wake, reload,
+deferred warm-up/blocked-identity attempts and stale-buffer-free resync after Off.
+
 ## 2026-11-10 — Calibrated receiver and CEC defaults
 
 Ran the corpus without blessing first: nine cases differ; startup-resync remains

@@ -291,6 +291,11 @@ const REASONS: &[(&str, ReasonGroup, &str)] = &[
         "A polled device stopped answering presence polls; it is treated as having left the bus and its role is now off.",
     ),
     (
+        "probe_standby",
+        ReasonGroup::Standby,
+        "The network probe kept reporting standby for the role's standby backstop (standby_off_s) and no CEC sleep announcement arrived; its role is now off.",
+    ),
+    (
         "taken_over",
         ReasonGroup::Standby,
         "Another role took over the room; this role's stop actions, if any, were issued and it is now treated as off.",
@@ -1327,6 +1332,7 @@ username = "admin"
             ("manual_standby", Standby),
             ("all_off", Standby),
             ("presence_timeout", Standby),
+            ("probe_standby", Standby),
             ("taken_over", Standby),
             ("late_announcement", Standby),
             ("console_start_expired", Standby),
@@ -1352,7 +1358,7 @@ username = "admin"
             ("startup_source_ignored", Service),
             ("sonos_volume", Other),
         ];
-        assert_eq!(literals.len(), 38);
+        assert_eq!(literals.len(), 39);
         for (literal, group) in literals {
             assert_eq!(reason_group(literal), group, "{literal}");
             let sentence = reason_sentence(literal).unwrap_or_else(|| panic!("{literal}"));

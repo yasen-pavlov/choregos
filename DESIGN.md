@@ -349,7 +349,7 @@ roles involved until resolved. Unmatched LAs appear as "unidentified" devices.
 
 ### 5.3 Role power state
 Per role: `Off | On`, derived from configured `on`/`off` bus signals, commands,
-or opt-in console start evidence. State changes produce decisions;
+opt-in console start evidence or the opt-in probe standby backstop. State changes produce decisions;
 duplicates (same state) are ignored (replaces today's `rbe` nodes).
 `RoleState.on_since: Option<Instant>` records each Off→On transition.
 Every configured On frame also sets private `awake_at`, even when rejected or
@@ -376,6 +376,30 @@ Reload/entering Shadow release unconfirmed early wakes before clearing evidence.
 An unchanged per-role probe configuration preserves its `probe_run` and rest
 baseline across reload. A changed probe resets both. Raw direct observations and
 start episodes are still cleared; reload cannot turn an old Standby run trustworthy.
+
+Per-probe `standby_off_s = 0` disables the standby backstop by default; nonzero
+values must be 10–600 seconds. On each console observation, after updating the
+run and processing existing start evidence, a logically On role with a trusted
+Standby run lasting at least that long at the sample's query-send time transitions
+Off with reason `probe_standby`. Start retraction takes precedence.
+Warming, blocked identity and an unbound role defer the backstop without consuming
+the run; subsequent Standby samples retry. Tick never fires this rule.
+Every configured On frame distrusts an older/equal run; Awake and
+Unreachable break it. The rule runs in both modes, uses `observation/ps5`
+provenance, sends no CEC itself and follows the normal room-off timer/intent.
+Changing `standby_off_s` changes the probe configuration, resets its run/rest
+baseline and settles pending console standby expectations unknown on reload;
+unchanged probes preserve both. A later On frame wakes normally.
+A performed release drops the bound LA's buffered signals and clears its bus
+power/time to Unknown, like presence timeout, preventing stale On from re-waking
+the room on resync. Rejected transitions do neither. While a role is still On,
+resync's existing buffered On replay refreshes `awake_at` and distrusts the
+preserved Standby run; the backstop then needs a new run. If a due Standby sample
+ends warm-up, it instead releases the role and clears stale signals before that
+replay can run.
+This is separate from reporting-only standby expectations and drift (which does
+not monitor role power). A console returning On without any configured On frame
+while its responder reports a new trusted Standby run can still be released.
 
 ### 5.4 Takeover (role turns On)
 In order, as `Action`s:
@@ -831,7 +855,8 @@ it is captured as `tv/unavailable` with an empty object payload.
 `ReceiverPower{state: DirectPower, at: DateTime<Utc>, source_code: Option<String>}` updates only the
 receiver direct cache. TV uses the same shared `DirectPower` enum.
 `ConsolePower{role, state: Awake|Standby|Unreachable, at: DateTime<Utc>}`
-updates the role's direct observation and start-evidence classifier (§5.3–5.4).
+updates the role's direct observation, start-evidence classifier (§5.3–5.4),
+and optional standby backstop (§5.3).
 `Frame.ack` (observed ACK bit) and `Frame.t_us` (bridge-monotonic µs) are
 `None` on Tasmota; the engine never reads them — the aether adapter already reduced a NACK-cut directed `rx` to header-only before the engine sees it (§1).
 `SendResult.status: SendStatus = Ack | Nack | ArbLost | LineError | Busy`,

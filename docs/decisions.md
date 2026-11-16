@@ -2,6 +2,45 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-16 — Opt-in trusted probe standby backstop
+
+- A console can announce sleep only once; a lost CEC Inactive Source frame left
+  its role On and the room on indefinitely despite sustained network Standby.
+  Add per-probe `standby_off_s`: default 0 disables it; 10–600 seconds releases
+  an On role through ordinary `probe_standby` Off and room-off scheduling.
+  Network evidence closes the room late instead of never. No extra CEC queries.
+- Reuse the existing consecutive probe run and trust rule: its start must be
+  strictly after every configured On frame and the last Off→On transition.
+  Awake/Unreachable reset the run. Evaluate only on observations using query-send
+  time, in both engine modes, with observation provenance. Probe expectations
+  remain reporting-only and role power remains excluded from drift.
+- Lead-approved specification amendment: keep `Engine::transition`'s warm-up and
+  blocked-identity guards unchanged, rather than bypassing them for this rule.
+  A rejected transition records nothing and consumes no control evidence;
+  subsequent qualifying Standby samples retry. The existing start-evidence path
+  runs first, including on guarded samples, and a start retraction takes
+  precedence over the backstop. Preserve verification and expectation lifecycle.
+  Warming, blocked identity and an unbound role guard the backstop; an unbound
+  role waits for a binding so its old LA's buffered On cannot survive a release.
+- Lead-approved lifecycle amendment: after a performed `probe_standby` release,
+  drop the bound LA's buffered signals and reset bus power/time to Unknown,
+  mirroring presence timeout. A trusted run is newer than the buffered On, so
+  this prevents stale On from re-waking the room during warm-up completion,
+  reload or bridge reconnection without discarding a newer real wake.
+  Guarded attempts leave the buffer and bus power unchanged.
+- Unchanged probes preserve runs/rest baselines across reload. Changing
+  `standby_off_s` resets both and settles pending console standby expectations
+  unknown, like any other probe configuration change. Existing resync replay
+  semantics are unchanged: if a tick or another event ends warm-up while a role
+  is still On, replaying buffered On refreshes `awake_at`, distrusts the preserved
+  Standby run and postpones the backstop until a new run. A due Standby sample
+  ending warm-up is the exception: warming clears before event dispatch, so the
+  release clears stale signals before `finish_warming` can replay them.
+  A command-originated On with no buffered frame keeps its trusted run.
+- Known limit: if a console comes back On without any configured On frame while
+  its responder reports Standby in a new trusted run, the backstop turns it Off.
+  This is why the rule is opt-in, not a replacement for normal CEC release.
+
 ## 2026-11-10 — Stay on off after phantom starts; calibrated receiver/CEC defaults
 
 - Nine console-start observations over November 7–10 produced six parented real

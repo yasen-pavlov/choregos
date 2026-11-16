@@ -55,12 +55,26 @@ impl Engine {
         };
         state.direct = Some((sample, at));
         state.observe_probe_run(sample, sent_at);
-        if self.config.mode == Mode::Shadow {
+        let mut actions = if self.config.mode == Mode::Shadow {
             state.start = None;
             state.start_baseline = None;
             state.start_first = None;
-            return vec![];
+            vec![]
+        } else {
+            self.observe_console_start(role, sample, sent_at)
+        };
+        if self.probe_standby_off_due(role, sent_at) {
+            actions.extend(self.release_probe_standby(role));
         }
+        actions
+    }
+
+    fn observe_console_start(
+        &mut self,
+        role: &str,
+        sample: ConsoleState,
+        sent_at: Instant,
+    ) -> Vec<Action> {
         let Some((policy, boot)) = self.probe_policy(role) else {
             return vec![];
         };
@@ -93,6 +107,38 @@ impl Engine {
             return self.create_console_start(role, policy);
         }
         vec![]
+    }
+
+    fn probe_standby_off_due(&self, role: &str, sent_at: Instant) -> bool {
+        let state = &self.roles[role];
+        if state.power != RolePower::On
+            || !self.identity.roles.contains_key(role)
+            || !state.probe_standby_trusted()
+        {
+            return false;
+        }
+        self.config
+            .device
+            .iter()
+            .find(|device| device.role == role)
+            .and_then(|device| device.probe.as_ref())
+            .is_some_and(|probe| {
+                let seconds = probe.standby_off_s();
+                seconds > 0
+                    && state.probe_run.is_some_and(|(_, start)| {
+                        sent_at.saturating_duration_since(start) >= Duration::from_secs(seconds)
+                    })
+            })
+    }
+
+    fn release_probe_standby(&mut self, role: &str) -> Vec<Action> {
+        let actions = self.transition(role, RolePower::Off, "probe_standby", self.now);
+        if self.roles[role].power == RolePower::Off
+            && let Some(&la) = self.identity.roles.get(role)
+        {
+            self.clear_cec_power(la);
+        }
+        actions
     }
 
     fn observe_start_end(
