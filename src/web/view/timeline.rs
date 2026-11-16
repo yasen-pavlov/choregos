@@ -1282,6 +1282,42 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_standby_off_releases_the_active_role_and_names_itself_on_its_marker() {
+        let mut snapshot = snapshot();
+        let at = |seconds: i64| minute().from + TimeDelta::seconds(seconds);
+        let wake = DecisionView {
+            timestamp: at(5),
+            reason: "ReportPhysicalAddress".to_owned(),
+            ..row(1, Some("console"), vec![])
+        };
+        // Shadow mode records it as would; it is still a real On → Off of the active role.
+        let backstop = DecisionView {
+            timestamp: at(30),
+            trigger: Trigger::Observation { source: Via::Ps5 },
+            from: Some(RolePower::On),
+            to: Some(RolePower::Off),
+            would: true,
+            verdict: Verdict::None,
+            reason: "probe_standby".to_owned(),
+            ..row(2, Some("console"), vec![])
+        };
+        snapshot.decisions.extend([wake, backstop.clone()]);
+        let labels: Vec<String> = room(&snapshot, minute(), later())
+            .into_iter()
+            .map(|band| band.label)
+            .collect();
+        assert_eq!(labels, ["unknown", "on · console", "on · no active role"]);
+        let markers = markers(&snapshot, &[decision_entry(&backstop)], minute(), None);
+        assert!(
+            markers[0].headline.ends_with(
+                "marked off: its probe reported standby and no sleep announcement arrived"
+            ),
+            "{}",
+            markers[0].headline
+        );
+    }
+
+    #[test]
     fn observation_runs_merge_equal_samples_and_keep_the_settle_note() {
         let mut snapshot = snapshot();
         let mut entries = vec![

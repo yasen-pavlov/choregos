@@ -1064,7 +1064,7 @@ fn probe_sentences(probe: &ProbeConfig) -> Vec<Sentence> {
             .code("start_wake = act")
             .text(")."),
     };
-    vec![
+    let mut sentences = vec![
         start,
         Sentence::default()
             .text(format!(
@@ -1078,7 +1078,19 @@ fn probe_sentences(probe: &ProbeConfig) -> Vec<Sentence> {
             ))
             .code(format!("idle_poll_s = {}", probe.idle_poll_s()))
             .text(")."),
-    ]
+    ];
+    let backstop = probe.standby_off_s();
+    if backstop > 0 {
+        sentences.push(
+            Sentence::default()
+                .text(format!(
+                    "Marks the role off after {backstop} s of standby readings while it is on, when no CEC sleep announcement arrived ("
+                ))
+                .code(format!("standby_off_s = {backstop}"))
+                .text(")."),
+        );
+    }
+    sentences
 }
 
 /// How Choregos drives an output, from its configuration.
@@ -2133,7 +2145,26 @@ probe = { kind = "ps5", host = "console.test", start_wake = "would", boot_s = 40
         assert!(text[1].contains("is sent CEC Standby (`takeover = cec_standby`) and its CEC power status and the probe confirm it went to sleep (`verify_standby`)."), "{}", text[1]);
         assert!(text[2].contains("would wake the room but only logs it (`start_wake = would`)"));
         assert!(text[3].contains("allows 40 s to boot") && text[3].contains("`idle_poll_s = 3`"));
-        assert_eq!(text.len(), 4, "no presence or media-player sentence");
+        assert_eq!(
+            text.len(),
+            4,
+            "no presence, media-player or backstop sentence"
+        );
+        let mut backstopped = probed.clone();
+        let Some(ProbeConfig::Ps5 { standby_off_s, .. }) = &mut backstopped.probe else {
+            panic!("the test device has a probe");
+        };
+        *standby_off_s = 60;
+        let text: Vec<String> = quirk_sentences(&backstopped, &config)
+            .iter()
+            .map(Sentence::plain)
+            .collect();
+        assert_eq!(
+            text.last().map(String::as_str),
+            Some(
+                "Marks the role off after 60 s of standby readings while it is on, when no CEC sleep announcement arrived (`standby_off_s = 60`)."
+            )
+        );
         assert_eq!(kind_label(&probed), "player · input \"Console B\" · probe");
 
         let polled = device(

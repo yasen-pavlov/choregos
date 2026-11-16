@@ -367,6 +367,10 @@ pub(crate) static FIELDS: &[FieldDef] = &[
     def("device.*.probe.rest_s", "Rest", int(5, 300))
         .unit(SECONDS)
         .default("30"),
+    def("device.*.probe.standby_off_s", "Standby backstop", int(0, 600))
+        .unit(SECONDS)
+        .default("0")
+        .help("0 = off; otherwise 10–600 seconds: when the probe reads standby this long while the role is on and no CEC sleep announcement arrived, the role is marked off."),
 ];
 
 /// A path with array indexes or element ids (`device.2.on`, `device[kodi].on`) as the table's
@@ -835,6 +839,7 @@ pub(crate) fn apply_op(form: &mut FormData, op: &str, doc: &DocumentMut, snapsho
                 ("start_wake", "off"),
                 ("boot_s", "30"),
                 ("rest_s", "30"),
+                ("standby_off_s", "0"),
             ] {
                 form.set(&format!("device.{argument}.probe.{key}"), value);
             }
@@ -1515,6 +1520,7 @@ fn edit_devices(doc: &mut DocumentMut, editor: &mut Editor) {
                     "start_wake",
                     "boot_s",
                     "rest_s",
+                    "standby_off_s",
                 ],
             );
         } else if editor.form.dropped(&kind) && table.remove("probe").is_some() {
@@ -1608,6 +1614,7 @@ const MESSAGE_KEYS: &[(&str, &str)] = &[
     ("probe idle_poll_s", "device.*.probe.idle_poll_s"),
     ("probe boot_s", "device.*.probe.boot_s"),
     ("probe rest_s", "device.*.probe.rest_s"),
+    ("probe standby_off_s", "device.*.probe.standby_off_s"),
     ("probe host", "device.*.probe.host"),
     ("bridge logical address", "bridge.logical_address"),
     ("bridge topic", "bridge.topic"),
@@ -2585,6 +2592,7 @@ fn role_forms(
                     "probe.start_wake",
                     "probe.boot_s",
                     "probe.rest_s",
+                    "probe.standby_off_s",
                 ]
                 .iter()
                 .map(|k| builder.field(&p(k)))
@@ -4047,6 +4055,105 @@ mod tests {
         let text = edited("device", &rich, &form);
         assert!(Config::parse(&text).unwrap().device[2].probe.is_none());
         assert!(text.contains("# probe = { kind = \"ps5\""), "comments stay");
+    }
+
+    /// `rich()` with Console B's probe carrying `standby_off_s = 60`.
+    fn with_backstop(text: &str) -> String {
+        let text = text.replacen(
+            "host = \"console.lan\", start_wake = \"off\"",
+            "host = \"console.lan\", start_wake = \"off\", standby_off_s = 60",
+            1,
+        );
+        assert!(text.contains("standby_off_s = 60"), "{text}");
+        text
+    }
+
+    fn backstop(text: &str) -> u64 {
+        Config::parse(text).unwrap().device[2]
+            .probe
+            .as_ref()
+            .expect("Console B keeps its probe")
+            .standby_off_s()
+    }
+
+    #[test]
+    fn a_standby_backstop_in_the_file_survives_edits_of_other_keys() {
+        let rich = rich();
+        let file = with_backstop(&rich);
+        // Opened with the key in the file; other keys of the role and of its probe edited.
+        let form = posted(
+            "device",
+            &file,
+            &[
+                ("device.2.source", "Console B 2"),
+                ("device.2.probe.boot_s", "45"),
+            ],
+        );
+        let checked = validated("device", &file, &form);
+        assert!(checked.problems.is_empty(), "{checked:?}");
+        let text = checked.text.as_deref().unwrap();
+        assert_eq!(backstop(text), 60);
+        let mut paths: Vec<&str> = checked.changes.iter().map(|c| c.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["device[console_b].probe.boot_s", "device[console_b].source"]
+        );
+        // Opened before the key existed; it is added outside the form before the save.
+        let form = posted("device", &rich, &[("device.2.probe.rest_s", "40")]);
+        let checked = validated("device", &file, &form);
+        assert!(checked.problems.is_empty(), "{checked:?}");
+        assert_eq!(backstop(checked.text.as_deref().unwrap()), 60);
+        let paths: Vec<&str> = checked.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["device[console_b].probe.rest_s"]);
+    }
+
+    #[test]
+    fn editing_the_standby_backstop_writes_only_that_key() {
+        let rich = rich();
+        let form = posted("device", &rich, &[("device.2.probe.standby_off_s", "60")]);
+        let checked = validated("device", &rich, &form);
+        assert!(checked.problems.is_empty(), "{checked:?}");
+        let on = checked.text.clone().unwrap();
+        assert_eq!(on, with_backstop(&rich));
+        let paths: Vec<&str> = checked.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["device[console_b].probe.standby_off_s"]);
+        // Back to 0 is an edit like any default-valued key's: the value is written, not
+        // removed (as `boot_s = 30` would be), and it reads as the rule off.
+        let form = posted("device", &on, &[("device.2.probe.standby_off_s", "0")]);
+        let off = edited("device", &on, &form);
+        assert_eq!(
+            off,
+            on.replacen("standby_off_s = 60", "standby_off_s = 0", 1)
+        );
+        assert_eq!(backstop(&off), 0);
+    }
+
+    #[test]
+    fn a_standby_backstop_inside_the_disabled_gap_is_reported_on_its_field() {
+        let rich = rich();
+        let checked = validated(
+            "device",
+            &rich,
+            &posted("device", &rich, &[("device.2.probe.standby_off_s", "5")]),
+        );
+        assert_eq!(
+            checked
+                .errors
+                .get("device.2.probe.standby_off_s")
+                .map(String::as_str),
+            Some("probe standby_off_s must be 0 (disabled) or in 10–600 seconds"),
+            "{checked:?}"
+        );
+        let form = posted("device", &rich, &[("device.2.probe.standby_off_s", "601")]);
+        let errors = apply_edits(&mut parse(&rich), "device", &form).unwrap_err();
+        assert_eq!(
+            errors,
+            [FieldError {
+                name: "device.2.probe.standby_off_s".to_owned(),
+                message: "Must be between 0 and 600.".to_owned()
+            }]
+        );
     }
 
     #[test]
