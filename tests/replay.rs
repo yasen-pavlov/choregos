@@ -1301,6 +1301,69 @@ fn manual_resync_records_one_command_after_discarding_prior_holds() {
     assert!(engine.warming);
 }
 
+fn assert_resync_preserves_command_transition(
+    mode: Mode,
+    reconnect: bool,
+    role: &str,
+    command: Command,
+) {
+    let (mut engine, now) = setup();
+    std::sync::Arc::make_mut(&mut engine.config).mode = mode;
+    if role == "console_a" {
+        for data in ["84230004", "870009BF", "47436F6E736F6C652041"] {
+            frame(&mut engine, now, 8, 15, data);
+        }
+    } else {
+        identify_atv(&mut engine, now);
+        frame(&mut engine, now, 4, 0, "04");
+    }
+    engine.handle(Event::Tick, now + Duration::from_secs(2), wall());
+    assert_eq!(engine.roles[role].power, RolePower::On);
+    let takeover = matches!(command, Command::Takeover(_));
+    if takeover {
+        frame(&mut engine, now + Duration::from_secs(8), 4, 0, "36");
+        assert_eq!(engine.roles[role].power, RolePower::Off);
+    }
+    engine.handle(
+        Event::Command(command),
+        now + Duration::from_secs(10),
+        wall(),
+    );
+    for seconds in 11..60 {
+        engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
+    }
+    let power = if takeover {
+        RolePower::On
+    } else {
+        RolePower::Off
+    };
+    assert_eq!(engine.roles[role].power, power);
+    let intent = engine.intent.clone();
+    let at = now + Duration::from_secs(60);
+    let event = if reconnect {
+        engine.handle(Event::BridgeOffline, at - Duration::from_secs(1), wall());
+        Event::BridgeOnline
+    } else {
+        Event::Command(Command::Resync)
+    };
+    assert_eq!(engine.handle(event, at, wall()), [Action::Resync]);
+    if role == "console_a" {
+        assert!(frame(&mut engine, at + Duration::from_millis(300), 8, 0, "9001").is_empty());
+        assert!(engine.decisions.is_empty());
+    }
+    for seconds in [3, 7] {
+        let actions = engine.handle(Event::Tick, at + Duration::from_secs(seconds), wall());
+        assert!(
+            actions.is_empty(),
+            "{mode:?}, reconnect={reconnect}, {role}: {actions:?}"
+        );
+        assert!(engine.decisions.is_empty(), "{:?}", engine.decisions);
+        assert_eq!(engine.roles[role].power, power);
+        assert_eq!(engine.intent, intent);
+        assert!(!engine.warming);
+    }
+}
+
 #[test]
 fn resync_preserves_command_transitions_without_replaying_consumed_signals() {
     for mode in [Mode::Active, Mode::Shadow] {
@@ -1311,65 +1374,7 @@ fn resync_preserves_command_transitions_without_replaying_consumed_signals() {
                 ("streamer", Command::Standby("streamer".into())),
                 ("streamer", Command::Takeover("streamer".into())),
             ] {
-                let (mut engine, now) = setup();
-                std::sync::Arc::make_mut(&mut engine.config).mode = mode;
-                if role == "console_a" {
-                    for data in ["84230004", "870009BF", "47436F6E736F6C652041"] {
-                        frame(&mut engine, now, 8, 15, data);
-                    }
-                } else {
-                    identify_atv(&mut engine, now);
-                    frame(&mut engine, now, 4, 0, "04");
-                }
-                engine.handle(Event::Tick, now + Duration::from_secs(2), wall());
-                assert_eq!(engine.roles[role].power, RolePower::On);
-                let takeover = matches!(command, Command::Takeover(_));
-                if takeover {
-                    frame(&mut engine, now + Duration::from_secs(8), 4, 0, "36");
-                    assert_eq!(engine.roles[role].power, RolePower::Off);
-                }
-                engine.handle(
-                    Event::Command(command),
-                    now + Duration::from_secs(10),
-                    wall(),
-                );
-                for seconds in 11..60 {
-                    engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
-                }
-                let power = if takeover {
-                    RolePower::On
-                } else {
-                    RolePower::Off
-                };
-                assert_eq!(engine.roles[role].power, power);
-                let intent = engine.intent.clone();
-                let at = now + Duration::from_secs(60);
-                let event = if reconnect {
-                    engine.handle(Event::BridgeOffline, at - Duration::from_secs(1), wall());
-                    Event::BridgeOnline
-                } else {
-                    Event::Command(Command::Resync)
-                };
-                assert_eq!(engine.handle(event, at, wall()), [Action::Resync]);
-                if role == "console_a" {
-                    assert!(
-                        frame(&mut engine, at + Duration::from_millis(300), 8, 0, "9001")
-                            .is_empty()
-                    );
-                    assert!(engine.decisions.is_empty());
-                }
-                for seconds in [3, 7] {
-                    let actions =
-                        engine.handle(Event::Tick, at + Duration::from_secs(seconds), wall());
-                    assert!(
-                        actions.is_empty(),
-                        "{mode:?}, reconnect={reconnect}, {role}: {actions:?}"
-                    );
-                    assert!(engine.decisions.is_empty(), "{:?}", engine.decisions);
-                    assert_eq!(engine.roles[role].power, power);
-                    assert_eq!(engine.intent, intent);
-                    assert!(!engine.warming);
-                }
+                assert_resync_preserves_command_transition(mode, reconnect, role, command);
             }
         }
     }
@@ -10844,120 +10849,124 @@ fn changing_only_probe_standby_off_cancels_pending_console_standby_expectations(
     }
 }
 
-#[test]
-fn unbound_probe_backstop_matches_disabled_until_rebound_without_stale_on_replay() {
+fn assert_unbound_probe_backstop_matches_disabled(mode: Mode) {
     use choregos::state::ConsoleState::{Awake, Standby};
-    for mode in [Mode::Active, Mode::Shadow] {
-        let mut disabled = None;
-        for seconds in [0, 10] {
-            let (mut engine, start) = standby_backstop_engine(seconds, mode);
-            let original = engine.config.clone();
-            let mut changed = (*original).clone();
-            changed
-                .device
-                .iter_mut()
-                .find(|device| device.role == "console_b")
-                .unwrap()
-                .matches
-                .vendor = Some("FFFFFF".into());
-            let mut events = vec![
-                (10000, Event::Frame(Frame::from_hex(8, 0, "0D").unwrap())),
-                (12000, Event::Tick),
-                (20000, Event::ConfigReloaded(changed.into())),
-                (23000, Event::Tick),
-            ];
-            for second in 30..=40 {
-                let ms = second * 1000;
-                events.push((
-                    ms,
-                    Event::ConsolePower {
-                        role: "console_b".into(),
-                        state: Standby,
-                        at: wall() + chrono::Duration::milliseconds(ms as i64),
-                    },
-                ));
-            }
-            events.extend([
-                (43000, Event::Tick),
-                (60000, Event::ConfigReloaded(original)),
-                (63000, Event::Tick),
-                (
-                    69000,
-                    Event::ConsolePower {
-                        role: "console_b".into(),
-                        state: Standby,
-                        at: wall() + chrono::Duration::milliseconds(69000),
-                    },
-                ),
-            ]);
-            let mut stream = Vec::new();
-            for (ms, event) in events {
-                let actions = verdict_event(&mut engine, start, ms, event);
-                let released = seconds > 0 && ms == 69000;
-                assert_eq!(
-                    engine.roles["console_b"].power,
-                    if released {
-                        RolePower::Off
-                    } else {
-                        RolePower::On
-                    }
-                );
-                assert_eq!(
-                    engine.identity.roles.contains_key("console_b"),
-                    !(20000..60000).contains(&ms)
-                );
+    let mut disabled = None;
+    for seconds in [0, 10] {
+        let (mut engine, start) = standby_backstop_engine(seconds, mode);
+        let original = engine.config.clone();
+        let mut changed = (*original).clone();
+        changed
+            .device
+            .iter_mut()
+            .find(|device| device.role == "console_b")
+            .unwrap()
+            .matches
+            .vendor = Some("FFFFFF".into());
+        let mut events = vec![
+            (10000, Event::Frame(Frame::from_hex(8, 0, "0D").unwrap())),
+            (12000, Event::Tick),
+            (20000, Event::ConfigReloaded(changed.into())),
+            (23000, Event::Tick),
+        ];
+        for second in 30..=40 {
+            let ms = second * 1000;
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+        }
+        events.extend([
+            (43000, Event::Tick),
+            (60000, Event::ConfigReloaded(original)),
+            (63000, Event::Tick),
+            (
+                69000,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(69000),
+                },
+            ),
+        ]);
+        let mut stream = Vec::new();
+        for (ms, event) in events {
+            let actions = verdict_event(&mut engine, start, ms, event);
+            let released = seconds > 0 && ms == 69000;
+            assert_eq!(
+                engine.roles["console_b"].power,
                 if released {
-                    assert_eq!(engine.decisions.len(), 1);
-                    assert_eq!(engine.decisions[0].reason, "probe_standby");
+                    RolePower::Off
                 } else {
-                    assert!(engine.decisions.iter().all(|row| {
-                        !matches!(row.reason.as_str(), "probe_standby" | "resync_complete")
-                    }));
+                    RolePower::On
                 }
-                if ms > 10000 {
-                    assert!(!actions.contains(&Action::WakeTv));
-                    assert!(!actions.iter().any(|action| {
-                        matches!(action, Action::HaCall { domain, service, .. }
-                            if domain == "media_player" && service == "turn_on")
-                    }));
-                }
-                if ms < 69000 {
-                    stream.push(serde_json::json!({
-                        "actions": actions,
-                        "rows": engine.decisions,
-                        "verdicts": engine.verdicts,
-                        "intent": engine.intent,
-                    }));
-                }
-            }
-            if let Some(disabled) = &disabled {
-                assert_eq!(
-                    &stream, disabled,
-                    "unbound/rebound stream before the next sample must match key = 0"
-                );
-            } else {
-                disabled = Some(stream);
-            }
-            // E4 drops the old LA's On when reload unbinds it: warm-up no longer
-            // distrusts this preserved run. A real wake still needs a new run.
-            console_frame(&mut engine, start, 69500, 8, 0, "0D");
-            console_sample(&mut engine, start, 70000, Awake);
-            console_sample(&mut engine, start, 71000, Standby);
-            verdict_event(&mut engine, start, 71500, Event::Tick);
-            console_sample(&mut engine, start, 80999, Standby);
-            assert_eq!(engine.roles["console_b"].power, RolePower::On);
-            assert!(engine.decisions.is_empty());
-            console_sample(&mut engine, start, 81000, Standby);
-            if seconds == 0 {
-                assert_eq!(engine.roles["console_b"].power, RolePower::On);
-                assert!(engine.decisions.is_empty());
-            } else {
-                assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            );
+            assert_eq!(
+                engine.identity.roles.contains_key("console_b"),
+                !(20000..60000).contains(&ms)
+            );
+            if released {
                 assert_eq!(engine.decisions.len(), 1);
                 assert_eq!(engine.decisions[0].reason, "probe_standby");
-                assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
-                assert_eq!(engine.bus.entries[&8].power_at, None);
+            } else {
+                assert!(engine.decisions.iter().all(|row| {
+                    !matches!(row.reason.as_str(), "probe_standby" | "resync_complete")
+                }));
+            }
+            if ms > 10000 {
+                assert!(!actions.contains(&Action::WakeTv));
+                assert!(!actions.iter().any(|action| {
+                    matches!(action, Action::HaCall { domain, service, .. }
+                        if domain == "media_player" && service == "turn_on")
+                }));
+            }
+            if ms < 69000 {
+                stream.push(serde_json::json!({
+                    "actions": actions,
+                    "rows": engine.decisions,
+                    "verdicts": engine.verdicts,
+                    "intent": engine.intent,
+                }));
             }
         }
+        if let Some(disabled) = &disabled {
+            assert_eq!(
+                &stream, disabled,
+                "unbound/rebound stream before the next sample must match key = 0"
+            );
+        } else {
+            disabled = Some(stream);
+        }
+        // E4 drops the old LA's On when reload unbinds it: warm-up no longer
+        // distrusts this preserved run. A real wake still needs a new run.
+        console_frame(&mut engine, start, 69500, 8, 0, "0D");
+        console_sample(&mut engine, start, 70000, Awake);
+        console_sample(&mut engine, start, 71000, Standby);
+        verdict_event(&mut engine, start, 71500, Event::Tick);
+        console_sample(&mut engine, start, 80999, Standby);
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert!(engine.decisions.is_empty());
+        console_sample(&mut engine, start, 81000, Standby);
+        if seconds == 0 {
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert!(engine.decisions.is_empty());
+        } else {
+            assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            assert_eq!(engine.decisions.len(), 1);
+            assert_eq!(engine.decisions[0].reason, "probe_standby");
+            assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
+            assert_eq!(engine.bus.entries[&8].power_at, None);
+        }
+    }
+}
+
+#[test]
+fn unbound_probe_backstop_matches_disabled_until_rebound_without_stale_on_replay() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        assert_unbound_probe_backstop_matches_disabled(mode);
     }
 }
