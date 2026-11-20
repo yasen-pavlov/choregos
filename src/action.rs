@@ -104,6 +104,32 @@ pub struct DriftDetail {
     pub since: chrono::DateTime<chrono::Utc>,
 }
 
+/// An accepted identity change; reporting never changes bus-model policy.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IdentityDetail {
+    pub kind: IdentityKind,
+    pub la: IdentityPair<u8>,
+    pub pa: IdentityPair<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<IdentityPair<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub osd: Option<IdentityPair<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityKind {
+    LaMove,
+    PaChange,
+    Replaced,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IdentityPair<T> {
+    pub from: T,
+    pub to: T,
+}
+
 /// One observable effect of a decision. Values stay strings across adapters.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Expectation {
@@ -225,6 +251,8 @@ pub struct Decision {
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<DriftDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Box<IdentityDetail>>,
 }
 
 #[cfg(test)]

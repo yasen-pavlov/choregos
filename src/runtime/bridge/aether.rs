@@ -28,6 +28,7 @@ pub(super) struct Correlation {
     last_seq: Option<u32>,
     availability: Availability,
     last_status_t_us: Option<u64>,
+    online_at: Option<Instant>,
     pub telemetry_s: u64,
     warned_version: bool,
     warned_la: bool,
@@ -41,6 +42,7 @@ impl Default for Correlation {
             last_seq: None,
             availability: Availability::Unknown,
             last_status_t_us: None,
+            online_at: None,
             telemetry_s: DEFAULT_TELEMETRY_S,
             warned_version: false,
             warned_la: false,
@@ -75,7 +77,7 @@ impl Correlation {
         }
         self.pending.insert(id, (to, data, now));
     }
-    pub fn status(&mut self, payload: &Value) -> Decoded {
+    pub fn status(&mut self, payload: &Value, now: Instant) -> Decoded {
         #[derive(Deserialize)]
         struct Status {
             online: bool,
@@ -113,7 +115,13 @@ impl Correlation {
         let fresh_status = status
             .t_us
             .is_some_and(|t_us| self.last_status_t_us.is_none_or(|last| t_us > last));
-        if boot_changed || self.availability != Availability::Online || fresh_status {
+        let coalesced = !boot_changed
+            && self.availability == Availability::Online
+            && self
+                .online_at
+                .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(5));
+        if boot_changed || self.availability != Availability::Online || (fresh_status && !coalesced)
+        {
             if boot_changed && self.availability == Availability::Online {
                 decoded.events.push(Event::BridgeOffline);
             }
@@ -125,6 +133,7 @@ impl Correlation {
             self.availability = Availability::Online;
             self.boot = Some(boot);
             decoded.events.push(Event::BridgeOnline);
+            self.online_at = Some(now);
         }
         if let Some(t_us) = status.t_us {
             self.last_status_t_us = Some(self.last_status_t_us.map_or(t_us, |last| last.max(t_us)));
@@ -327,7 +336,10 @@ mod tests {
     use serde_json::json;
 
     fn online(c: &mut Correlation, boot: u32) -> Decoded {
-        c.status(&json!({"online":true,"v":1,"boot":boot,"bus":"ok","future":true}))
+        c.status(
+            &json!({"online":true,"v":1,"boot":boot,"bus":"ok","future":true}),
+            Instant::now(),
+        )
     }
     fn outcome(seq: u32, id: &str, status: &str) -> Value {
         json!({"ev":"tx","seq":seq,"t_us":123456,"id":id,"origin":"host","from":0,"to":4,"data":"36","status":status,"attempts":2})
@@ -345,7 +357,7 @@ mod tests {
             [Event::BridgeOffline, Event::BridgeOnline]
         ));
         assert!(matches!(
-            &c.status(&json!({"online":false})).events[..],
+            &c.status(&json!({"online":false}), Instant::now()).events[..],
             [Event::BridgeOffline]
         ));
         assert!(matches!(
@@ -353,12 +365,13 @@ mod tests {
             [Event::BridgeOnline]
         ));
         assert!(matches!(
-            &c.status(&json!({"online":true,"v":2,"boot":2})).events[..],
+            &c.status(&json!({"online":true,"v":2,"boot":2}), Instant::now())
+                .events[..],
             [Event::BridgeOffline]
         ));
         assert!(c.warned_version);
         assert!(
-            c.status(&json!({"online":true,"v":2,"boot":2}))
+            c.status(&json!({"online":true,"v":2,"boot":2}), Instant::now())
                 .events
                 .is_empty()
         );
@@ -511,7 +524,7 @@ mod tests {
         online(&mut c, 2);
         assert!(c.pending.is_empty());
         c.record("offline".into(), 4, vec![0x36], now);
-        c.status(&json!({"online":false}));
+        c.status(&json!({"online":false}), Instant::now());
         assert!(c.pending.is_empty());
         assert!(c.bus(&outcome(2, "offline", "ack"), now).events.is_empty());
     }
@@ -554,39 +567,97 @@ mod tests {
     }
 
     #[test]
+    fn boot_status_triple_preserves_pending_send_and_only_resyncs_once() {
+        let mut c = Correlation::default();
+        let now = Instant::now();
+        let status =
+            |boot, t_us, bus| json!({"online":true,"v":1,"boot":boot,"t_us":t_us,"bus":bus});
+        let first = c.status(&status(151, 172686, None::<&str>), now);
+        assert!(matches!(&first.events[..], [Event::BridgeOnline]));
+        c.record("s-1".into(), 4, vec![0x36], now);
+        let second = c.status(
+            &status(151, 1179919, Some("ok")),
+            now + Duration::from_millis(8),
+        );
+        let third = c.status(
+            &status(151, 16066323, Some("ok")),
+            now + Duration::from_millis(22),
+        );
+        assert!(second.events.is_empty() && third.events.is_empty());
+        assert_eq!(third.bus.as_deref(), Some("ok"));
+        assert_eq!(c.last_status_t_us, Some(16066323));
+        assert!(matches!(
+            &c.bus(&outcome(1, "s-1", "ack"), now + Duration::from_millis(23))
+                .events[..],
+            [Event::SendResult {
+                to: 4,
+                status: SendStatus::Ack,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            &c.status(
+                &status(151, 16066324, Some("ok")),
+                now + Duration::from_secs(5)
+            )
+            .events[..],
+            [Event::BridgeOnline]
+        ));
+        c.status(&json!({"online":false}), now + Duration::from_secs(5));
+        assert!(matches!(
+            &c.status(
+                &status(151, 16066325, Some("ok")),
+                now + Duration::from_secs(5)
+            )
+            .events[..],
+            [Event::BridgeOnline]
+        ));
+        assert!(matches!(
+            &c.status(&status(152, 1, Some("ok")), now + Duration::from_secs(5))
+                .events[..],
+            [Event::BridgeOffline, Event::BridgeOnline]
+        ));
+    }
+
+    #[test]
     fn same_boot_reconnect_deduplicates_and_newer_status_resyncs_without_resetting_seq() {
         let mut c = Correlation::default();
         let now = Instant::now();
         let status = |boot, t_us| json!({"online":true,"v":1,"boot":boot,"t_us":t_us});
         let rx = json!({"ev":"rx","seq":9,"from":4,"to":0,"data":"4441","ack":true});
         assert!(matches!(
-            &c.status(&status(1, 100)).events[..],
+            &c.status(&status(1, 100), now).events[..],
             [Event::BridgeOnline]
         ));
         assert_eq!(c.bus(&rx, now).events.len(), 1);
         c.record("old".into(), 4, vec![0x36], now);
-        c.status(&json!({"online":false}));
+        c.status(&json!({"online":false}), now);
         assert!(c.pending.is_empty());
         assert_eq!(c.boot, Some(1));
         assert_eq!(c.last_seq, Some(9));
         assert!(matches!(
-            &c.status(&status(1, 200)).events[..],
+            &c.status(&status(1, 200), now).events[..],
             [Event::BridgeOnline]
         ));
         assert!(c.bus(&rx, now).events.is_empty());
         for t_us in [200, 199] {
-            assert!(c.status(&status(1, t_us)).events.is_empty());
+            assert!(c.status(&status(1, t_us), now).events.is_empty());
         }
         c.record("stale".into(), 4, vec![0x36], now);
         assert!(matches!(
-            &c.status(&status(1, 201)).events[..],
+            &c.status(&status(1, 201), now + Duration::from_secs(5))
+                .events[..],
             [Event::BridgeOnline]
         ));
         assert!(c.pending.is_empty());
         assert_eq!(c.last_seq, Some(9));
-        assert!(c.status(&status(1, 200)).events.is_empty());
+        assert!(
+            c.status(&status(1, 200), now + Duration::from_secs(5))
+                .events
+                .is_empty()
+        );
         assert!(matches!(
-            &c.status(&status(2, 1)).events[..],
+            &c.status(&status(2, 1), now + Duration::from_secs(5)).events[..],
             [Event::BridgeOffline, Event::BridgeOnline]
         ));
         assert_eq!(c.last_seq, None);
@@ -599,14 +670,14 @@ mod tests {
         let now = Instant::now();
         let status = json!({"online":true,"v":1,"boot":1,"t_us":100});
         let rx = json!({"ev":"rx","seq":100,"from":4,"to":5,"data":"4441","ack":true});
-        c.status(&status);
+        c.status(&status, now);
         assert_eq!(c.bus(&rx, now).events.len(), 1);
         c.record("s-1".into(), 4, vec![0x36], now);
         c.reconnect();
         assert!(c.pending.is_empty());
         // Retained status redelivered with the same boot and t_us: online again.
         assert!(matches!(
-            &c.status(&status).events[..],
+            &c.status(&status, now).events[..],
             [Event::BridgeOnline]
         ));
         // The board's QoS 1 redelivery of seq 100 around the broker restart.
@@ -634,7 +705,7 @@ mod tests {
                 ..
             })]
         ));
-        c.status(&json!({"online":false}));
+        c.status(&json!({"online":false}), now);
         assert!(
             c.bus(&json!({"ev":"rx","seq":2,"from":4,"to":0,"data":"04"}), now)
                 .events
@@ -712,7 +783,7 @@ mod diagnostic_tests {
     #[test]
     fn duplicates_are_dropped_after_gaps_and_unsupported_versions_block_bus_events() {
         let mut c = Correlation::default();
-        c.status(&json!({"online":true,"v":2,"boot":1}));
+        c.status(&json!({"online":true,"v":2,"boot":1}), Instant::now());
         assert!(c.warned_version && c.availability == Availability::Offline);
         assert!(
             c.bus(&json!({"ev":"line","seq":1,"bus":"ok"}), Instant::now())
@@ -721,7 +792,7 @@ mod diagnostic_tests {
             "bus events are ignored on an unsupported version"
         );
         c = Correlation::default();
-        c.status(&json!({"online":true,"v":1,"boot":1}));
+        c.status(&json!({"online":true,"v":1,"boot":1}), Instant::now());
         let now = Instant::now();
         let seen: Vec<bool> = [1, 4, 4, 5, 8, 8]
             .into_iter()

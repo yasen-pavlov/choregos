@@ -6,8 +6,8 @@ use openidconnect::url::form_urlencoded;
 use serde::Serialize;
 
 use super::{
-    ActionSummary, REASONS, ReasonGroup, drift_lasted, drift_row, hex_bytes, is_migrated, latency,
-    max_latency, reason_group, role_name, transition,
+    ActionSummary, REASONS, ReasonGroup, change_text, drift_lasted, drift_row, hex_bytes,
+    identity_row, identity_summary, is_migrated, latency, max_latency, reason_group, role_name,
 };
 use crate::{
     action::{Expectation, Outcome, Trigger, Verdict},
@@ -474,10 +474,7 @@ pub(crate) fn list_items(
                 .role
                 .as_deref()
                 .map(|role| role_name(snapshot, role)),
-            change: match (decision.from, decision.to) {
-                (None, None) => "—".to_owned(),
-                (from, to) => transition(&from, &to),
-            },
+            change: change_text(decision).unwrap_or_else(|| "—".to_owned()),
             group: reason_group(&decision.reason).label(),
             trigger: trigger_compact(&decision.trigger),
             actions: ActionSummary::from_actions(&decision.actions).text(),
@@ -495,6 +492,7 @@ pub(crate) fn list_items(
 fn command_text(command: &Command) -> String {
     match command {
         Command::AllOff => "all_off".to_owned(),
+        Command::Resync => "resync".to_owned(),
         Command::SetMode(mode) => format!("set_mode {mode}"),
         Command::Identify(la) => format!("identify {la}"),
         Command::Forget(la) => format!("forget {la}"),
@@ -675,6 +673,7 @@ fn command_headline(decision: &DecisionView, snapshot: &Snapshot) -> String {
     };
     match command {
         Command::AllOff => "All off requested".to_owned(),
+        Command::Resync => "Bridge resync requested".to_owned(),
         Command::SetMode(mode) => format!("Mode set to {mode}"),
         Command::Identify(la) => format!("Identify LA {la} requested"),
         Command::Forget(la) => format!("LA {la} forgotten"),
@@ -723,6 +722,13 @@ pub(crate) fn headline(decision: &DecisionView, snapshot: &Snapshot) -> String {
         (ReasonGroup::Identity, "conflict") => "Identity conflict".to_owned(),
         (ReasonGroup::Identity, "conflict_resolved") => "Identity conflict resolved".to_owned(),
         (ReasonGroup::Identity, "command_identify") => "Identify requested".to_owned(),
+        (ReasonGroup::Identity, "identity_moved" | "identity_replaced") => {
+            match identity_row(decision) {
+                Some(identity) => identity_summary(identity),
+                None if reason == "identity_moved" => format!("{who}: device moved"),
+                None => format!("{who}: a different device took its address"),
+            }
+        }
         (ReasonGroup::Identity, _) => "Device forgotten".to_owned(),
         (ReasonGroup::Drift, _) => match drift_row(decision) {
             Some(drift) if reason == "drift" => format!(
@@ -1435,6 +1441,23 @@ mod tests {
         assert_eq!(
             headline(&command(Command::AllOff, "command_all_off")),
             "All off requested — room off"
+        );
+        let resync = command(Command::Resync, "command_resync");
+        assert_eq!(headline(&resync), "Bridge resync requested");
+        assert_eq!(trigger_compact(&resync.trigger), "command resync");
+        // An identity row that lost its detail still reads as what it is, never as unknown.
+        let bare_move = DecisionView {
+            reason: "identity_moved".to_owned(),
+            ..row(9, Some("console"), vec![])
+        };
+        assert_eq!(headline(&bare_move), "Console: device moved");
+        let bare_replace = DecisionView {
+            reason: "identity_replaced".to_owned(),
+            ..bare_move
+        };
+        assert_eq!(
+            headline(&bare_replace),
+            "Console: a different device took its address"
         );
         let started = DecisionView {
             reason: "service_started".to_owned(),

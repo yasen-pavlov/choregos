@@ -1089,6 +1089,14 @@ fn conflict_blocks_power_and_resolves_after_address_replacement() {
     let resolved = frame(&mut engine, now, 8, 15, "84250004");
     assert!(engine.identity.conflicts.is_empty());
     assert!(resolved.contains(&Action::WakeTv));
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .map(|row| row.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["conflict_resolved", "identity_replaced", "ImageViewOn"]
+    );
     assert!(!frame(&mut engine, now, 4, 0, "04").contains(&Action::WakeTv));
 }
 
@@ -1174,6 +1182,396 @@ fn config_reload_reinterrogates_and_discards_removed_roles() {
     assert!(!engine.roles.contains_key("streamer"));
     assert!(engine.warming);
     assert!(actions.is_empty());
+}
+
+#[test]
+fn room_off_deadline_only_exposes_an_actionable_release() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        let (mut engine, now) = setup();
+        std::sync::Arc::make_mut(&mut engine.config).mode = mode;
+        identify_atv(&mut engine, now);
+        frame(&mut engine, now, 4, 0, "04");
+        assert_eq!(engine.off_deadline(), None);
+        let delay = Duration::from_secs(engine.config.timing.off_delay_s);
+        frame(&mut engine, now, 4, 0, "36");
+        assert_eq!(engine.off_deadline(), Some(now + delay));
+        frame(&mut engine, now, 4, 0, "04");
+        assert_eq!(engine.off_deadline(), None);
+        engine.roles.get_mut("kodi").unwrap().power = RolePower::On;
+        frame(&mut engine, now, 4, 0, "36");
+        assert_eq!(engine.off_deadline(), None, "another role is still On");
+        engine.handle(Event::Command(Command::Standby("kodi".into())), now, wall());
+        assert_eq!(engine.off_deadline(), Some(now + delay));
+        let actions = engine.handle(Event::Tick, now + delay, wall());
+        assert!(actions.contains(&Action::TvOff));
+        assert_eq!(engine.off_deadline(), None);
+        engine.handle(Event::Command(Command::AllOff), now + delay, wall());
+        assert_eq!(engine.off_deadline(), Some(now + delay * 2));
+    }
+}
+
+#[test]
+fn manual_resync_guards_boundaries_and_records_sent_shadow_actions() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        let (mut engine, now) = setup();
+        std::sync::Arc::make_mut(&mut engine.config).mode = mode;
+        engine.bus.restore(vec![restored_identity(4, 0x2100)], now);
+        let actions = engine.handle(Event::Command(Command::Resync), now, wall());
+        assert_eq!(
+            actions,
+            vec![
+                Action::Resync,
+                Action::Identify {
+                    la: 4,
+                    queries: IdentifyQueries {
+                        physical: true,
+                        vendor: false,
+                        osd: false
+                    }
+                },
+            ]
+        );
+        assert!(engine.warming);
+        assert_eq!(engine.decisions.len(), 1);
+        let row = &engine.decisions[0];
+        assert_eq!(row.reason, "command_resync");
+        assert_eq!(
+            row.trigger,
+            Trigger::Command {
+                command: Command::Resync
+            }
+        );
+        assert_eq!(row.actions, actions);
+        assert_eq!(row.role, None);
+        assert!(!row.would);
+        assert_eq!(row.verdict, Verdict::None);
+        assert!(row.expectations.is_empty());
+        assert!(actions.iter().all(|a| a.allowed_in_shadow()));
+        let rejected = engine.handle(
+            Event::Command(Command::Resync),
+            now + Duration::from_millis(4900),
+            wall(),
+        );
+        assert!(rejected.is_empty());
+        assert!(engine.decisions.is_empty());
+        let accepted = engine.handle(
+            Event::Command(Command::Resync),
+            now + Duration::from_secs(5),
+            wall(),
+        );
+        assert_eq!(accepted, actions);
+        assert!(engine.warming);
+        assert_eq!(engine.decisions[0].reason, "command_resync");
+        engine.handle(Event::BridgeOffline, now + Duration::from_secs(6), wall());
+        assert!(
+            engine
+                .handle(
+                    Event::Command(Command::Resync),
+                    now + Duration::from_secs(10),
+                    wall()
+                )
+                .is_empty()
+        );
+        assert!(engine.decisions.is_empty());
+        assert!(!engine.bridge_online);
+    }
+}
+
+#[test]
+fn manual_resync_records_one_command_after_discarding_prior_holds() {
+    let (mut engine, start) = startup_unbound_source(None);
+    let actions = verdict_event(&mut engine, start, 5000, Event::Command(Command::Resync));
+    assert!(actions.contains(&Action::Resync));
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .map(|row| row.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["startup_source_ignored", "command_resync"]
+    );
+    let command = &engine.decisions[1];
+    assert_eq!(
+        command.trigger,
+        Trigger::Command {
+            command: Command::Resync
+        }
+    );
+    assert_eq!(command.actions, actions);
+    assert!(engine.warming);
+}
+
+fn assert_resync_preserves_command_transition(
+    mode: Mode,
+    reconnect: bool,
+    role: &str,
+    command: Command,
+) {
+    let (mut engine, now) = setup();
+    std::sync::Arc::make_mut(&mut engine.config).mode = mode;
+    if role == "console_a" {
+        for data in ["84230004", "870009BF", "47436F6E736F6C652041"] {
+            frame(&mut engine, now, 8, 15, data);
+        }
+    } else {
+        identify_atv(&mut engine, now);
+        frame(&mut engine, now, 4, 0, "04");
+    }
+    engine.handle(Event::Tick, now + Duration::from_secs(2), wall());
+    assert_eq!(engine.roles[role].power, RolePower::On);
+    let takeover = matches!(command, Command::Takeover(_));
+    if takeover {
+        frame(&mut engine, now + Duration::from_secs(8), 4, 0, "36");
+        assert_eq!(engine.roles[role].power, RolePower::Off);
+    }
+    engine.handle(
+        Event::Command(command),
+        now + Duration::from_secs(10),
+        wall(),
+    );
+    for seconds in 11..60 {
+        engine.handle(Event::Tick, now + Duration::from_secs(seconds), wall());
+    }
+    let power = if takeover {
+        RolePower::On
+    } else {
+        RolePower::Off
+    };
+    assert_eq!(engine.roles[role].power, power);
+    let intent = engine.intent.clone();
+    let at = now + Duration::from_secs(60);
+    let event = if reconnect {
+        engine.handle(Event::BridgeOffline, at - Duration::from_secs(1), wall());
+        Event::BridgeOnline
+    } else {
+        Event::Command(Command::Resync)
+    };
+    assert_eq!(engine.handle(event, at, wall()), [Action::Resync]);
+    if role == "console_a" {
+        assert!(frame(&mut engine, at + Duration::from_millis(300), 8, 0, "9001").is_empty());
+        assert!(engine.decisions.is_empty());
+    }
+    for seconds in [3, 7] {
+        let actions = engine.handle(Event::Tick, at + Duration::from_secs(seconds), wall());
+        assert!(
+            actions.is_empty(),
+            "{mode:?}, reconnect={reconnect}, {role}: {actions:?}"
+        );
+        assert!(engine.decisions.is_empty(), "{:?}", engine.decisions);
+        assert_eq!(engine.roles[role].power, power);
+        assert_eq!(engine.intent, intent);
+        assert!(!engine.warming);
+    }
+}
+
+#[test]
+fn resync_preserves_command_transitions_without_replaying_consumed_signals() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        for reconnect in [false, true] {
+            for (role, command) in [
+                ("console_a", Command::AllOff),
+                ("streamer", Command::AllOff),
+                ("streamer", Command::Standby("streamer".into())),
+                ("streamer", Command::Takeover("streamer".into())),
+            ] {
+                assert_resync_preserves_command_transition(mode, reconnect, role, command);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_new_signal_during_resync_warmup_replays_after_the_guard_clears() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    engine.handle(Event::Command(Command::Resync), now, wall());
+    assert!(frame(&mut engine, now + Duration::from_millis(100), 4, 0, "04").is_empty());
+    assert!(engine.warming);
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(3), wall());
+    assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    assert!(actions.contains(&Action::WakeTv));
+    assert_eq!(engine.decisions.len(), 1);
+    assert_eq!(engine.decisions[0].reason, "resync_complete");
+}
+
+#[test]
+fn room_off_deadline_waits_for_warmup_but_uses_off_at_after_an_early_reply() {
+    for delay in [1, 10] {
+        let (mut engine, now) = setup();
+        std::sync::Arc::make_mut(&mut engine.config)
+            .timing
+            .off_delay_s = delay;
+        identify_atv(&mut engine, now);
+        engine.handle(Event::Command(Command::AllOff), now, wall());
+        let deadline = now + Duration::from_secs(delay);
+        assert_eq!(engine.off_deadline(), Some(deadline));
+        engine.handle(Event::ConfigReloaded(engine.config.clone()), now, wall());
+        assert!(engine.warming);
+        assert_eq!(
+            engine.off_deadline(),
+            Some(deadline.max(now + Duration::from_secs(3)))
+        );
+        frame(&mut engine, now + Duration::from_millis(500), 4, 0, "9001");
+        assert!(!engine.warming);
+        assert_eq!(engine.off_deadline(), Some(deadline));
+    }
+}
+
+#[test]
+fn unchanged_reload_preserves_buffered_wake() {
+    let (mut engine, now) = setup();
+    identify_atv(&mut engine, now);
+    engine.handle(Event::ConfigReloaded(engine.config.clone()), now, wall());
+    frame(&mut engine, now, 4, 0, "04");
+    assert_eq!(engine.roles["streamer"].power, RolePower::Off);
+    engine.handle(
+        Event::ConfigReloaded(engine.config.clone()),
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert_eq!(engine.roles["streamer"].power, RolePower::On);
+    assert!(actions.contains(&Action::WakeTv));
+    assert_eq!(engine.decisions[0].reason, "resync_complete");
+}
+
+#[test]
+fn reload_drops_previous_signals_even_when_another_role_binds_that_address() {
+    let (mut engine, now) = setup();
+    let mut config = (*engine.config).clone();
+    config
+        .device
+        .retain(|d| ["console_a", "console_b"].contains(&d.role.as_str()));
+    let other = config
+        .device
+        .iter_mut()
+        .find(|d| d.role == "console_b")
+        .unwrap();
+    other.matches.vendor = None;
+    other.matches.osd = None;
+    other.matches.physical = Some("2.5.0.0".into());
+    engine.handle(Event::ConfigReloaded(config.clone().into()), now, wall());
+    frame(&mut engine, now, 8, 15, "84230004");
+    frame(&mut engine, now, 11, 15, "84250004");
+    frame(&mut engine, now, 11, 0, "36");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    for device in &mut config.device {
+        device.matches.physical = Some(
+            if device.role == "console_a" {
+                "2.5.0.0"
+            } else {
+                "2.3.0.0"
+            }
+            .into(),
+        );
+    }
+    engine.handle(
+        Event::ConfigReloaded(config.into()),
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert_eq!(engine.identity.roles["console_b"], 8);
+    assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert!(!actions.contains(&Action::WakeTv));
+}
+
+fn reload_binding_does_not_replay_previous_address(with_cec_off: bool) {
+    let (mut engine, now) = setup();
+    let mut config = (*engine.config).clone();
+    config.device.retain(|d| d.role == "console_a");
+    engine.handle(Event::ConfigReloaded(config.clone().into()), now, wall());
+    frame(&mut engine, now, 8, 15, "84230004");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert!(frame(&mut engine, now, 8, 0, "04").is_empty());
+    assert!(engine.decisions.is_empty());
+    frame(&mut engine, now, 11, 15, "84250004");
+    frame(&mut engine, now, 11, 0, "36");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    config.device[0].matches.physical = Some("2.5.0.0".into());
+    engine.handle(
+        Event::ConfigReloaded(config.clone().into()),
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+    if with_cec_off {
+        frame(&mut engine, now + Duration::from_secs(5), 11, 0, "36");
+    }
+    engine.handle(Event::Tick, now + Duration::from_secs(7), wall());
+    config.device[0].matches.physical = Some("2.3.0.0".into());
+    engine.handle(
+        Event::ConfigReloaded(config.into()),
+        now + Duration::from_secs(8),
+        wall(),
+    );
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(11), wall());
+    assert_eq!(
+        engine.roles["console_a"].power,
+        RolePower::Off,
+        "stale buffered On replayed: {:?}; actions: {actions:?}",
+        engine.decisions
+    );
+    assert!(!actions.contains(&Action::WakeTv));
+    assert!(engine.decisions.is_empty());
+}
+
+#[test]
+fn reload_binding_discards_old_on_after_unbinding() {
+    let (mut engine, now) = setup();
+    let mut config = (*engine.config).clone();
+    config.device.retain(|d| d.role == "console_a");
+    engine.handle(Event::ConfigReloaded(config.clone().into()), now, wall());
+    frame(&mut engine, now, 8, 15, "84230004");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert!(frame(&mut engine, now, 8, 0, "04").is_empty());
+    assert!(engine.decisions.is_empty());
+    config.device[0].matches.physical = Some("6.0.0.0".into());
+    engine.handle(
+        Event::ConfigReloaded(config.clone().into()),
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert!(!engine.warming);
+    assert!(!engine.identity.roles.contains_key("console_a"));
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    engine.handle(
+        Event::Command(Command::AllOff),
+        now + Duration::from_secs(5),
+        wall(),
+    );
+    assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+    engine.handle(Event::Tick, now + Duration::from_secs(8), wall());
+    config.device[0].matches.physical = Some("2.3.0.0".into());
+    engine.handle(
+        Event::ConfigReloaded(config.into()),
+        now + Duration::from_secs(9),
+        wall(),
+    );
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(12), wall());
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    assert_eq!(
+        engine.roles["console_a"].power,
+        RolePower::Off,
+        "stale buffered On replayed: {:?}; actions: {actions:?}",
+        engine.decisions
+    );
+    assert!(!actions.contains(&Action::WakeTv));
+    assert!(engine.decisions.is_empty());
+}
+
+#[test]
+fn reload_binding_discards_old_on_without_cec_off() {
+    reload_binding_does_not_replay_previous_address(false);
+}
+
+#[test]
+fn reload_binding_discards_old_on_with_cec_off() {
+    reload_binding_does_not_replay_previous_address(true);
 }
 
 #[test]
@@ -2637,6 +3035,147 @@ fn console_before_address_move() -> (Engine, Instant) {
     (engine, now + Duration::from_secs(3))
 }
 
+fn identity_row(engine: &Engine, reason: &str) -> serde_json::Value {
+    let row = engine
+        .decisions
+        .iter()
+        .find(|row| row.reason == reason)
+        .unwrap();
+    assert!(row.actions.is_empty());
+    assert!(row.expectations.is_empty());
+    assert_eq!(row.verdict, Verdict::None);
+    assert!(!row.would);
+    assert_eq!(row.from, None);
+    assert_eq!(row.to, None);
+    assert_eq!(row.parent, None);
+    serde_json::to_value(row).unwrap()
+}
+
+#[test]
+fn identity_move_onto_occupied_address_records_replacement_before_move() {
+    let (mut engine, now) = console_before_address_move();
+    frame(&mut engine, now, 11, 15, "84240004");
+    let replaced = identity_row(&engine, "identity_replaced");
+    let moved = identity_row(&engine, "identity_moved");
+    assert_eq!(
+        engine
+            .decisions
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["identity_replaced", "identity_moved"]
+    );
+    assert_eq!(replaced["role"], Value::Null);
+    assert_eq!(
+        replaced["identity"],
+        serde_json::json!({
+            "kind":"replaced", "la":{"from":11,"to":11},
+            "pa":{"from":"2.3.0.0","to":"2.4.0.0"}
+        })
+    );
+    assert_eq!(moved["role"], "console_b");
+    assert_eq!(
+        moved["trigger"],
+        serde_json::json!({"kind":"frame","from":11,"to":15,"data":"84240004"})
+    );
+    assert_eq!(
+        moved["identity"],
+        serde_json::json!({
+            "kind":"la_move", "la":{"from":8,"to":11},
+            "pa":{"from":"2.4.0.0","to":"2.4.0.0"}
+        })
+    );
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert_eq!(engine.off_deadline(), None);
+}
+
+#[test]
+fn identity_move_to_empty_address_is_one_row_and_keeps_running_role() {
+    let (mut engine, now) = console_before_address_move();
+    frame(&mut engine, now, 12, 15, "84240004");
+    assert_eq!(engine.decisions.len(), 1);
+    assert_eq!(
+        identity_row(&engine, "identity_moved")["identity"]["la"],
+        serde_json::json!({"from":8,"to":12})
+    );
+    assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    assert_eq!(engine.identity.roles["console_b"], 12);
+}
+
+#[test]
+fn identity_pa_change_and_off_role_replacement_report_old_binding() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        let (mut engine, now) = console_before_physical_change(mode);
+        frame(&mut engine, now, 8, 15, "84100004");
+        let changed = identity_row(&engine, "identity_moved");
+        assert_eq!(changed["role"], "console_a");
+        assert_eq!(
+            changed["identity"],
+            serde_json::json!({
+                "kind":"pa_change", "la":{"from":8,"to":8},
+                "pa":{"from":"2.3.0.0","to":"1.0.0.0"}
+            })
+        );
+        assert_eq!(engine.roles["console_a"].power, RolePower::On);
+        frame(&mut engine, now, 8, 0, "36");
+        frame(&mut engine, now, 8, 15, "84110004");
+        let replaced = identity_row(&engine, "identity_replaced");
+        assert_eq!(replaced["role"], "console_a");
+        assert_eq!(
+            replaced["identity"]["pa"],
+            serde_json::json!({"from":"1.0.0.0","to":"1.1.0.0"})
+        );
+        assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+        assert!(engine.decisions.iter().all(|r| r.to.is_none()));
+    }
+}
+
+#[test]
+fn identity_vendor_and_osd_replacements_precede_identity_lost() {
+    for (data, key, old, new) in [
+        ("87000001", "vendor", "080046", "000001"),
+        ("474F74686572", "osd", "Console B", "Other"),
+    ] {
+        let (mut engine, now) = console_before_address_move();
+        frame(&mut engine, now, 8, 15, data);
+        let row = identity_row(&engine, "identity_replaced");
+        assert_eq!(row["role"], "console_b");
+        assert_eq!(
+            row["identity"]["pa"],
+            serde_json::json!({"from":"2.4.0.0","to":"2.4.0.0"})
+        );
+        assert_eq!(
+            row["identity"][key],
+            serde_json::json!({"from":old,"to":new})
+        );
+        let other = if key == "vendor" { "osd" } else { "vendor" };
+        assert!(row["identity"].get(other).is_none());
+        assert_eq!(engine.decisions[0].reason, "identity_replaced");
+        assert_eq!(engine.decisions[1].reason, "identity_lost");
+    }
+}
+
+#[test]
+fn unbound_identity_changes_are_recorded_during_warmup_but_reannouncements_are_not() {
+    let (mut engine, now) = setup();
+    frame(&mut engine, now, 12, 15, "84600004");
+    frame(&mut engine, now, 12, 15, "87000001");
+    engine.handle(Event::BridgeOnline, now, wall());
+    assert!(engine.warming);
+    frame(&mut engine, now, 12, 0, "4741");
+    engine.handle(Event::BridgeOnline, now, wall());
+    frame(&mut engine, now, 12, 0, "4742");
+    assert_eq!(
+        identity_row(&engine, "identity_replaced")["role"],
+        Value::Null
+    );
+    assert_eq!(engine.decisions.len(), 1);
+    for data in ["84600004", "87000001", "4742"] {
+        frame(&mut engine, now, 12, 15, data);
+        assert!(engine.decisions.is_empty());
+    }
+}
+
 fn assert_console_move_retained(engine: &Engine) {
     assert_eq!(engine.roles["console_b"].power, RolePower::On);
     assert_eq!(engine.identity.roles["console_b"], 11);
@@ -2931,7 +3470,8 @@ fn moved_identity_is_corrected_when_the_new_address_reports_a_different_vendor()
             queries: IdentifyQueries::ALL
         }]
     );
-    assert!(engine.decisions.is_empty());
+    assert_eq!(engine.decisions.len(), 1);
+    assert_eq!(identity_row(&engine, "identity_moved")["role"], "console_b");
     let actions = frame(&mut engine, now + Duration::from_secs(1), 4, 15, "870010FA");
     assert!(actions.is_empty());
     assert!(!engine.identity.roles.contains_key("console_b"));
@@ -2948,12 +3488,15 @@ fn moved_identity_is_corrected_when_the_new_address_reports_a_different_vendor()
                 decision.reason.as_str()
             ))
             .collect::<Vec<_>>(),
-        vec![(
-            Some("console_b"),
-            Some(RolePower::On),
-            Some(RolePower::Off),
-            "identity_lost"
-        )]
+        vec![
+            (Some("console_b"), None, None, "identity_replaced"),
+            (
+                Some("console_b"),
+                Some(RolePower::On),
+                Some(RolePower::Off),
+                "identity_lost"
+            ),
+        ]
     );
     frame(&mut engine, now + Duration::from_secs(2), 4, 15, "84240004");
     assert_eq!(engine.identity.roles["streamer"], 4);
@@ -3115,7 +3658,15 @@ fn console_address_hop_during_receiver_power_up_keeps_room_on() {
                 .map(|decision| decision.reason.clone()),
         );
     }
-    assert_eq!(reasons, vec!["TextViewOn", "takeover_settled"]);
+    assert_eq!(
+        reasons,
+        vec![
+            "TextViewOn",
+            "takeover_settled",
+            "identity_replaced",
+            "identity_moved"
+        ]
+    );
 }
 
 #[test]
@@ -3270,7 +3821,15 @@ fn physical_address_flap_during_receiver_power_up_keeps_role_on() {
         };
         collect(&mut engine, effects);
     }
-    assert_eq!(reasons, ["ReportPhysicalAddress", "takeover_settled"]);
+    assert_eq!(
+        reasons,
+        [
+            "ReportPhysicalAddress",
+            "takeover_settled",
+            "identity_moved",
+            "identity_moved"
+        ]
+    );
     assert_eq!(actions.iter().filter(|a| **a == Action::WakeTv).count(), 1);
     assert!(actions.iter().any(|action| service(action, "turn_on")));
     assert_eq!(engine.bus.entries[&8].physical, Some(0x2300));
@@ -3292,7 +3851,11 @@ fn physical_address_change_requeries_and_a_different_device_is_corrected() {
                     queries: IdentifyQueries::ALL
                 }]
             );
-            assert!(engine.decisions.is_empty());
+            assert_eq!(engine.decisions.len(), 1);
+            assert_eq!(
+                identity_row(&engine, "identity_moved")["identity"]["kind"],
+                "pa_change"
+            );
             frame(
                 &mut engine,
                 now + Duration::from_secs(1),
@@ -3386,7 +3949,11 @@ fn physical_address_change_via_active_source_preserves_confirmation_and_keys() {
     assert_eq!(after.last_seen, Some(now));
     assert_eq!(engine.bus.active_source, Some(0x1000));
     assert_eq!(engine.identity.roles["console_a"], 8);
-    assert!(engine.decisions.is_empty());
+    assert_eq!(engine.decisions.len(), 1);
+    assert_eq!(
+        identity_row(&engine, "identity_moved")["identity"]["kind"],
+        "pa_change"
+    );
     assert_eq!(
         actions,
         vec![Action::Identify {
@@ -3491,12 +4058,20 @@ fn different_device_claiming_a_known_address_does_not_wake_the_old_role() {
             let effects = frame(&mut engine, now + Duration::from_millis(ms), 8, to, data);
             assert_eq!(engine.roles["console_a"].power, RolePower::Off);
             assert!(!engine.identity.roles.contains_key("console_a"));
-            assert!(
-                engine
-                    .decisions
-                    .iter()
-                    .all(|decision| decision.role.as_deref() != Some("console_a"))
-            );
+            if ms == 100 {
+                assert_eq!(engine.decisions.len(), 1);
+                assert_eq!(
+                    identity_row(&engine, "identity_replaced")["role"],
+                    "console_a"
+                );
+            } else {
+                assert!(
+                    engine
+                        .decisions
+                        .iter()
+                        .all(|decision| decision.role.as_deref() != Some("console_a"))
+                );
+            }
             if ms <= 300 {
                 assert!(
                     effects
@@ -9922,28 +10497,130 @@ fn probe_standby_backstop_keeps_start_retraction_ahead_of_its_own_threshold() {
 }
 
 #[test]
-fn probe_standby_backstop_waits_for_a_new_run_after_resync_replays_buffered_on() {
+fn releasing_unconfirmed_start_during_warmup_preserves_the_real_buffered_wake() {
+    use choregos::{
+        config::StartWake,
+        state::ConsoleState::{Standby, Unreachable},
+    };
+    for reload in [false, true] {
+        let (mut engine, start) = console_start_engine(StartWake::Act);
+        console_sample(&mut engine, start, 6000, Standby);
+        console_sample(&mut engine, start, 60000, Unreachable);
+        console_sample(&mut engine, start, 61000, Unreachable);
+        assert_eq!(engine.decisions.last().unwrap().reason, "console_start");
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        verdict_event(&mut engine, start, 89000, Event::BridgeOnline);
+        assert!(console_frame(&mut engine, start, 91500, 8, 0, "0D").is_empty());
+        assert!(engine.warming);
+        assert!(engine.decisions.is_empty());
+        let event = if reload {
+            Event::ConfigReloaded(engine.config.clone())
+        } else {
+            Event::Command(Command::SetMode(Mode::Shadow))
+        };
+        verdict_event(&mut engine, start, 91600, event);
+        assert!(engine.warming);
+        assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+        assert!(engine.decisions.iter().any(|row| {
+            row.reason == "console_start_expired"
+                && row.from == Some(RolePower::On)
+                && row.to == Some(RolePower::Off)
+        }));
+        let actions = verdict_event(&mut engine, start, 95000, Event::Tick);
+        assert!(actions.contains(&Action::WakeTv));
+        assert!(!actions.contains(&Action::TvOff));
+        assert!(!engine.warming);
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert_eq!(engine.intent.active_role.as_deref(), Some("console_b"));
+        assert_eq!(engine.decisions.len(), 1);
+        let row = &engine.decisions[0];
+        assert_eq!(row.reason, "resync_complete");
+        assert_eq!(row.from, Some(RolePower::Off));
+        assert_eq!(row.to, Some(RolePower::On));
+        let actions = verdict_event(&mut engine, start, 100000, Event::Tick);
+        assert!(!actions.contains(&Action::TvOff));
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+    }
+}
+
+#[test]
+fn repeated_on_replayed_after_resync_conservatively_distrusts_probe_standby() {
+    use choregos::state::ConsoleState::Standby;
+    for mode in [Mode::Active, Mode::Shadow] {
+        for repeat in [false, true] {
+            let (mut engine, start) = standby_backstop_engine(10, mode);
+            verdict_event(&mut engine, start, 4000, Event::BridgeOnline);
+            console_frame(&mut engine, start, 10000, 8, 0, "0D");
+            verdict_event(&mut engine, start, 12000, Event::Tick);
+            if repeat {
+                assert!(console_frame(&mut engine, start, 15000, 8, 0, "0D").is_empty());
+                assert!(engine.decisions.is_empty());
+            }
+            console_sample(&mut engine, start, 20000, Standby);
+            verdict_event(&mut engine, start, 29000, Event::Command(Command::Resync));
+            assert!(engine.warming);
+            verdict_event(&mut engine, start, 32000, Event::Tick);
+            assert!(engine.decisions.is_empty());
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            console_sample(&mut engine, start, 100000, Standby);
+            if repeat {
+                assert_eq!(engine.roles["console_b"].power, RolePower::On);
+                assert!(engine.decisions.is_empty());
+            } else {
+                assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+                assert_eq!(engine.decisions.len(), 1);
+                assert_eq!(engine.decisions[0].reason, "probe_standby");
+            }
+        }
+    }
+}
+
+#[test]
+fn probe_standby_backstop_preserves_trust_across_resync_but_not_a_real_wake() {
     use choregos::state::ConsoleState::{Standby, Unreachable};
-    let (mut engine, start) = standby_backstop_engine(10, Mode::Active);
-    console_frame(&mut engine, start, 10000, 8, 0, "0D");
-    verdict_event(&mut engine, start, 12000, Event::Tick);
-    console_sample(&mut engine, start, 20000, Standby);
-    let config = engine.config.clone();
-    verdict_event(&mut engine, start, 29000, Event::ConfigReloaded(config));
-    assert!(console_sample(&mut engine, start, 30000, Standby).is_empty());
-    assert!(engine.decisions.is_empty());
-    assert_eq!(engine.bus.entries[&8].power, BusPower::On);
-    // Warm-up replays the old On while the role is still On, refreshing awake_at.
-    verdict_event(&mut engine, start, 32000, Event::Tick);
-    console_sample(&mut engine, start, 100000, Standby);
-    assert!(engine.decisions.is_empty());
-    assert_eq!(engine.roles["console_b"].power, RolePower::On);
-    console_sample(&mut engine, start, 101000, Unreachable);
-    console_sample(&mut engine, start, 102000, Standby);
-    console_sample(&mut engine, start, 111999, Standby);
-    assert_eq!(engine.roles["console_b"].power, RolePower::On);
-    console_sample(&mut engine, start, 112000, Standby);
-    assert_eq!(engine.decisions.last().unwrap().reason, "probe_standby");
+    for mode in [Mode::Active, Mode::Shadow] {
+        for reload in [false, true] {
+            let (mut engine, start) = standby_backstop_engine(10, mode);
+            verdict_event(&mut engine, start, 4000, Event::BridgeOnline);
+            console_frame(&mut engine, start, 10000, 8, 0, "0D");
+            verdict_event(&mut engine, start, 12000, Event::Tick);
+            console_sample(&mut engine, start, 20000, Standby);
+            let event = if reload {
+                Event::ConfigReloaded(engine.config.clone())
+            } else {
+                Event::Command(Command::Resync)
+            };
+            verdict_event(&mut engine, start, 29000, event);
+            assert!(engine.warming);
+            assert!(console_sample(&mut engine, start, 30000, Standby).is_empty());
+            assert!(engine.decisions.is_empty());
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert_eq!(engine.bus.entries[&8].power, BusPower::On);
+            verdict_event(&mut engine, start, 32000, Event::Tick);
+            assert!(engine.decisions.is_empty());
+            // The applied On was consumed, so warm-up cannot refresh awake_at.
+            console_sample(&mut engine, start, 100000, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            assert_eq!(engine.decisions.len(), 1);
+            assert_eq!(engine.decisions[0].reason, "probe_standby");
+            console_frame(&mut engine, start, 100100, 8, 0, "0D");
+            verdict_event(&mut engine, start, 102100, Event::Tick);
+            console_sample(&mut engine, start, 110000, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert!(
+                engine.decisions.is_empty(),
+                "a real wake distrusts the preserved run"
+            );
+            console_sample(&mut engine, start, 111000, Unreachable);
+            console_sample(&mut engine, start, 112000, Standby);
+            console_sample(&mut engine, start, 121999, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::On);
+            assert!(engine.decisions.is_empty());
+            console_sample(&mut engine, start, 122000, Standby);
+            assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            assert_eq!(engine.decisions[0].reason, "probe_standby");
+        }
+    }
 }
 
 #[test]
@@ -10222,70 +10899,82 @@ fn changing_only_probe_standby_off_cancels_pending_console_standby_expectations(
     }
 }
 
-#[test]
-fn unbound_probe_backstop_matches_disabled_until_rebound_with_a_new_trusted_run() {
+fn assert_unbound_probe_backstop_matches_disabled(mode: Mode) {
     use choregos::state::ConsoleState::{Awake, Standby};
-    for mode in [Mode::Active, Mode::Shadow] {
-        let mut disabled = None;
-        for seconds in [0, 10] {
-            let (mut engine, start) = standby_backstop_engine(seconds, mode);
-            let original = engine.config.clone();
-            let mut changed = (*original).clone();
-            changed
-                .device
-                .iter_mut()
-                .find(|device| device.role == "console_b")
-                .unwrap()
-                .matches
-                .vendor = Some("FFFFFF".into());
-            let mut events = vec![
-                (10000, Event::Frame(Frame::from_hex(8, 0, "0D").unwrap())),
-                (12000, Event::Tick),
-                (20000, Event::ConfigReloaded(changed.into())),
-                (23000, Event::Tick),
-            ];
-            for second in 30..=40 {
-                let ms = second * 1000;
-                events.push((
-                    ms,
-                    Event::ConsolePower {
-                        role: "console_b".into(),
-                        state: Standby,
-                        at: wall() + chrono::Duration::milliseconds(ms as i64),
-                    },
-                ));
-            }
-            events.extend([
-                (43000, Event::Tick),
-                (60000, Event::ConfigReloaded(original)),
-                (63000, Event::Tick),
-                (
-                    69000,
-                    Event::ConsolePower {
-                        role: "console_b".into(),
-                        state: Standby,
-                        at: wall() + chrono::Duration::milliseconds(69000),
-                    },
-                ),
-            ]);
-            let mut stream = Vec::new();
-            for (ms, event) in events {
-                let actions = verdict_event(&mut engine, start, ms, event);
-                assert_eq!(engine.roles["console_b"].power, RolePower::On);
-                assert_eq!(
-                    engine.identity.roles.contains_key("console_b"),
-                    !(20000..60000).contains(&ms)
-                );
+    let mut disabled = None;
+    for seconds in [0, 10] {
+        let (mut engine, start) = standby_backstop_engine(seconds, mode);
+        let original = engine.config.clone();
+        let mut changed = (*original).clone();
+        changed
+            .device
+            .iter_mut()
+            .find(|device| device.role == "console_b")
+            .unwrap()
+            .matches
+            .vendor = Some("FFFFFF".into());
+        let mut events = vec![
+            (10000, Event::Frame(Frame::from_hex(8, 0, "0D").unwrap())),
+            (12000, Event::Tick),
+            (20000, Event::ConfigReloaded(changed.into())),
+            (23000, Event::Tick),
+        ];
+        for second in 30..=40 {
+            let ms = second * 1000;
+            events.push((
+                ms,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(ms as i64),
+                },
+            ));
+        }
+        events.extend([
+            (43000, Event::Tick),
+            (60000, Event::ConfigReloaded(original)),
+            (63000, Event::Tick),
+            (
+                69000,
+                Event::ConsolePower {
+                    role: "console_b".into(),
+                    state: Standby,
+                    at: wall() + chrono::Duration::milliseconds(69000),
+                },
+            ),
+        ]);
+        let mut stream = Vec::new();
+        for (ms, event) in events {
+            let actions = verdict_event(&mut engine, start, ms, event);
+            let released = seconds > 0 && ms == 69000;
+            assert_eq!(
+                engine.roles["console_b"].power,
+                if released {
+                    RolePower::Off
+                } else {
+                    RolePower::On
+                }
+            );
+            assert_eq!(
+                engine.identity.roles.contains_key("console_b"),
+                !(20000..60000).contains(&ms)
+            );
+            if released {
+                assert_eq!(engine.decisions.len(), 1);
+                assert_eq!(engine.decisions[0].reason, "probe_standby");
+            } else {
                 assert!(engine.decisions.iter().all(|row| {
                     !matches!(row.reason.as_str(), "probe_standby" | "resync_complete")
                 }));
-                if ms > 10000 {
-                    assert!(!actions.contains(&Action::WakeTv));
-                    assert!(!actions.iter().any(|action| {
-                        matches!(action, Action::HaCall { domain, service, .. }
-                            if domain == "media_player" && service == "turn_on")
-                    }));
-                }
+            }
+            if ms > 10000 {
+                assert!(!actions.contains(&Action::WakeTv));
+                assert!(!actions.iter().any(|action| {
+                    matches!(action, Action::HaCall { domain, service, .. }
+                        if domain == "media_player" && service == "turn_on")
+                }));
+            }
+            if ms < 69000 {
                 stream.push(serde_json::json!({
                     "actions": actions,
                     "rows": engine.decisions,
@@ -10293,32 +10982,41 @@ fn unbound_probe_backstop_matches_disabled_until_rebound_with_a_new_trusted_run(
                     "intent": engine.intent,
                 }));
             }
-            if let Some(disabled) = &disabled {
-                assert_eq!(
-                    &stream, disabled,
-                    "unbound/rebound stream must match key = 0"
-                );
-            } else {
-                disabled = Some(stream);
-            }
-            // The buffered On replay at 63 s distrusts the old run. No new CEC
-            // frame is needed once a fresh, trusted Standby run reaches N.
-            console_sample(&mut engine, start, 70000, Awake);
-            console_sample(&mut engine, start, 71000, Standby);
-            console_sample(&mut engine, start, 80999, Standby);
+        }
+        if let Some(disabled) = &disabled {
+            assert_eq!(
+                &stream, disabled,
+                "unbound/rebound stream before the next sample must match key = 0"
+            );
+        } else {
+            disabled = Some(stream);
+        }
+        // E4 drops the old LA's On when reload unbinds it: warm-up no longer
+        // distrusts this preserved run. A real wake still needs a new run.
+        console_frame(&mut engine, start, 69500, 8, 0, "0D");
+        console_sample(&mut engine, start, 70000, Awake);
+        console_sample(&mut engine, start, 71000, Standby);
+        verdict_event(&mut engine, start, 71500, Event::Tick);
+        console_sample(&mut engine, start, 80999, Standby);
+        assert_eq!(engine.roles["console_b"].power, RolePower::On);
+        assert!(engine.decisions.is_empty());
+        console_sample(&mut engine, start, 81000, Standby);
+        if seconds == 0 {
             assert_eq!(engine.roles["console_b"].power, RolePower::On);
             assert!(engine.decisions.is_empty());
-            console_sample(&mut engine, start, 81000, Standby);
-            if seconds == 0 {
-                assert_eq!(engine.roles["console_b"].power, RolePower::On);
-                assert!(engine.decisions.is_empty());
-            } else {
-                assert_eq!(engine.roles["console_b"].power, RolePower::Off);
-                assert_eq!(engine.decisions.len(), 1);
-                assert_eq!(engine.decisions[0].reason, "probe_standby");
-                assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
-                assert_eq!(engine.bus.entries[&8].power_at, None);
-            }
+        } else {
+            assert_eq!(engine.roles["console_b"].power, RolePower::Off);
+            assert_eq!(engine.decisions.len(), 1);
+            assert_eq!(engine.decisions[0].reason, "probe_standby");
+            assert_eq!(engine.bus.entries[&8].power, BusPower::Unknown);
+            assert_eq!(engine.bus.entries[&8].power_at, None);
         }
+    }
+}
+
+#[test]
+fn unbound_probe_backstop_matches_disabled_until_rebound_without_stale_on_replay() {
+    for mode in [Mode::Active, Mode::Shadow] {
+        assert_unbound_probe_backstop_matches_disabled(mode);
     }
 }

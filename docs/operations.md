@@ -134,6 +134,21 @@ corrective actions or overwrite CEC-derived logical role power.
 
 
 
+## Bridge resync and rollback
+
+The bridge drawer's resync button requests a fresh bus interrogation and warm-up,
+not a device wake or room-off. It is available in both modes and sends the same
+read-only resync/identify frames in shadow. The runtime rejects an offline bridge
+or another resync started less than five seconds ago. Accepted requests appear
+as `command_resync` with no verdict or `would` marker.
+Resync does not undo an already-performed All off, Standby or Takeover. A genuinely
+new power signal received during warm-up still applies when its guard clears.
+
+Back up `choregos.state.json` before upgrading. **Before rolling back to 0.4.2,
+restore that backup if the ring contains a `command_resync` row.** Its unknown
+command variant makes 0.4.2 start with an empty ring and learned identities.
+New `identity` detail fields alone are additive and do not require restoration.
+
 ## Reading the decision ring
 
 Read the host-side state file (use `sudo` for its mode-0600 permissions):
@@ -153,6 +168,9 @@ not executed effects (`would` marks suppression).
 | `off_timer_expired` | The last-role-off delay expired with no unblocked role On; request TV and receiver off. |
 | `presence_timeout` | An On role with polling enabled missed the configured number of polls; mark it Off and its bus power Unknown. |
 | `identity_lost` | An On role lost its identity binding; it becomes Off and may start the room-off timer. Investigate identity/address traffic. |
+| `identity_moved` | Accepted LA move or same-LA PA change; inspect `identity.la` and `identity.pa`. No power transition or action. |
+| `identity_replaced` | The destination's previous identity was reset; the detail shows old/new PA and the changed vendor or OSD pair when relevant. |
+| `command_resync` | Operator requested the normal read-only resync and warm-up; allowed in shadow, no power intent change. |
 | `service_started` | Runtime startup marker appended after the restored ring. |
 | `resync_complete` | A buffered role power transition was applied when startup/bridge resync warming finished. |
 

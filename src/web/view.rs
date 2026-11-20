@@ -13,7 +13,10 @@ use chrono::{DateTime, Utc};
 
 use super::auth::{Ctx, SessionUser};
 use crate::{
-    action::{DriftDetail, Expectation, Field, Outcome, ServiceKind, Trigger, Verdict},
+    action::{
+        DriftDetail, Expectation, Field, IdentityDetail, IdentityKind, IdentityPair, Outcome,
+        ServiceKind, Trigger, Verdict,
+    },
     state::{
         BridgeTelemetry, BusEntryView, BusPower, DecisionView, DirectPower, FrameDirection,
         HaEntityView, Health, Mode, RolePower, RoleView, RoomPower, Snapshot,
@@ -366,6 +369,16 @@ const REASONS: &[(&str, ReasonGroup, &str)] = &[
         "An operator made Choregos forget a learned device.",
     ),
     (
+        "identity_moved",
+        ReasonGroup::Identity,
+        "A known device moved to another logical address, or changed its physical address, and kept its identity; reporting only, its role is unchanged.",
+    ),
+    (
+        "identity_replaced",
+        ReasonGroup::Identity,
+        "A logical address now holds a different device (another physical address, vendor or OSD name), so the old identity there was dropped; reporting only, a role that loses its device gets its own identity_lost row.",
+    ),
+    (
         "drift",
         ReasonGroup::Drift,
         "The room has disagreed with its intended state for longer than the grace period; reporting only.",
@@ -399,6 +412,11 @@ const REASONS: &[(&str, ReasonGroup, &str)] = &[
         "command_standby",
         ReasonGroup::Command,
         "An operator's standby command; this row carries its stop actions.",
+    ),
+    (
+        "command_resync",
+        ReasonGroup::Command,
+        "An operator asked for a bridge resync.",
     ),
     (
         "service_started",
@@ -996,6 +1014,16 @@ pub(crate) fn transition(from: &Option<RolePower>, to: &Option<RolePower>) -> St
     }
 }
 
+/// A decision row's "change" column: an identity row's summary, else the role's power
+/// transition; `None` when the row changes neither.
+pub(crate) fn change_text(decision: &DecisionView) -> Option<String> {
+    match (identity_row(decision), decision.from, decision.to) {
+        (Some(identity), ..) => Some(identity_summary(identity)),
+        (None, None, None) => None,
+        (None, from, to) => Some(transition(&from, &to)),
+    }
+}
+
 pub(crate) fn bus_power(power: &BusPower) -> &'static str {
     match power {
         BusPower::Unknown => "unknown",
@@ -1044,6 +1072,101 @@ pub(crate) fn drift_lasted(decision: &DecisionView) -> Option<String> {
         .as_ref()
         .filter(|_| decision.reason == "drift_resolved")
         .map(|drift| duration(decision.timestamp - drift.since))
+}
+
+/// The identity detail of an `identity_moved` / `identity_replaced` row; `None` for any other
+/// reason, so a stray detail never replaces an ordinary row's reason.
+pub(crate) fn identity_row(decision: &DecisionView) -> Option<&IdentityDetail> {
+    decision.identity.as_deref().filter(|_| {
+        matches!(
+            decision.reason.as_str(),
+            "identity_moved" | "identity_replaced"
+        )
+    })
+}
+
+/// A nullable physical address as text; a missing one reads `none`.
+fn or_none(value: Option<&str>) -> &str {
+    value.unwrap_or("none")
+}
+
+/// `from → to` of a physical-address pair, either end possibly missing.
+fn pair_text(pair: &IdentityPair<Option<String>>) -> String {
+    format!(
+        "{} → {}",
+        or_none(pair.from.as_deref()),
+        or_none(pair.to.as_deref())
+    )
+}
+
+/// `from → to` of a vendor or OSD pair (both ends always present).
+fn key_text(pair: &IdentityPair<String>) -> String {
+    format!("{} → {}", pair.from, pair.to)
+}
+
+/// What an identity row changed, in words: `Moved from LA 8 to LA 11 (PA 2.4.0.0)`,
+/// `Physical address changed 1.0.0.0 → 2.3.0.0 on LA 8`, `LA 11 now holds a different
+/// device: vendor 0009BF → 080046`.
+pub(crate) fn identity_summary(detail: &IdentityDetail) -> String {
+    let pa_changed = detail.pa.from != detail.pa.to;
+    match detail.kind {
+        IdentityKind::LaMove => {
+            let pa = if pa_changed {
+                pair_text(&detail.pa)
+            } else {
+                or_none(detail.pa.to.as_deref()).to_owned()
+            };
+            format!(
+                "Moved from LA {} to LA {} (PA {pa})",
+                detail.la.from, detail.la.to
+            )
+        }
+        IdentityKind::PaChange => format!(
+            "Physical address changed {} on LA {}",
+            pair_text(&detail.pa),
+            detail.la.to
+        ),
+        IdentityKind::Replaced => {
+            let mut changes = Vec::new();
+            if let Some(vendor) = &detail.vendor {
+                changes.push(format!("vendor {}", key_text(vendor)));
+            }
+            if let Some(osd) = &detail.osd {
+                changes.push(format!("OSD {}", key_text(osd)));
+            }
+            if pa_changed || changes.is_empty() {
+                changes.push(format!("PA {}", pair_text(&detail.pa)));
+            }
+            format!(
+                "LA {} now holds a different device: {}",
+                detail.la.to,
+                changes.join(", ")
+            )
+        }
+    }
+}
+
+/// The structured detail of an identity row for the decision page: the kind word, then
+/// `LA 8 → 11`, `PA … → …` and, when recorded, the vendor and OSD pairs.
+pub(crate) fn identity_parts(
+    detail: &IdentityDetail,
+) -> (&'static str, Vec<(&'static str, String)>) {
+    let kind = match detail.kind {
+        IdentityKind::LaMove => "la_move",
+        IdentityKind::PaChange => "pa_change",
+        IdentityKind::Replaced => "replaced",
+    };
+    let mut parts = vec![
+        ("LA", format!("{} → {}", detail.la.from, detail.la.to)),
+        ("PA", pair_text(&detail.pa)),
+    ];
+    if let Some(vendor) = &detail.vendor {
+        parts.push(("vendor", key_text(vendor)));
+    }
+    if let Some(osd) = &detail.osd {
+        parts.push(("OSD", key_text(osd)));
+    }
+    (kind, parts)
 }
 
 /// How long an open drift has held so far.
@@ -1347,6 +1470,8 @@ username = "admin"
             ("conflict_resolved", Identity),
             ("command_identify", Identity),
             ("command_forget", Identity),
+            ("identity_moved", Identity),
+            ("identity_replaced", Identity),
             ("drift", Drift),
             ("drift_resolved", Drift),
             ("command_all_off", Command),
@@ -1354,11 +1479,12 @@ username = "admin"
             ("command_send_raw", Command),
             ("command_takeover", Command),
             ("command_standby", Command),
+            ("command_resync", Command),
             ("service_started", Service),
             ("startup_source_ignored", Service),
             ("sonos_volume", Other),
         ];
-        assert_eq!(literals.len(), 39);
+        assert_eq!(literals.len(), 42);
         for (literal, group) in literals {
             assert_eq!(reason_group(literal), group, "{literal}");
             let sentence = reason_sentence(literal).unwrap_or_else(|| panic!("{literal}"));
@@ -1453,6 +1579,7 @@ username = "admin"
             expectations,
             verdict: Verdict::Achieved,
             drift: None,
+            identity: None,
         }
     }
 

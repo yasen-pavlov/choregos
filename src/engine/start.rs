@@ -6,7 +6,7 @@ use super::{
     StartWake, Takeover, TimerKind, Utc, Value, Verdict, json,
 };
 
-const RESYNC_WINDOW: Duration = Duration::from_secs(5);
+pub(super) const RESYNC_WINDOW: Duration = Duration::from_secs(5);
 const LATE_REPEATS: u8 = 3;
 
 impl Engine {
@@ -563,6 +563,7 @@ impl Engine {
             expectations: vec![],
             verdict: Verdict::None,
             drift: None,
+            identity: None,
         });
         id
     }

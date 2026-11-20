@@ -4,7 +4,7 @@ use crate::{
         Trigger, Verdict, VerdictUpdate, Via,
     },
     cec::{
-        bus::{BusModel, LearnedIdentity},
+        bus::{BusModel, IdentityChange, LearnedIdentity},
         frame::Frame,
         opcode::{
             ACTIVE_SOURCE, CEC_VERSION, DEVICE_VENDOR_ID, GET_CEC_VERSION, GET_MENU_LANGUAGE,
@@ -26,6 +26,7 @@ use std::{
 };
 
 mod expectations;
+mod identity_rows;
 mod start;
 use expectations::PendingDecision;
 /// HA attributes read by the decision engine and therefore needed in replay traces.
@@ -485,6 +486,31 @@ impl Engine {
         }
     }
 
+    /// A pending release that would actually turn the room off.
+    /// During warm-up the timer cannot act before `warm_until`.
+    pub fn off_deadline(&self) -> Option<Instant> {
+        self.off_at
+            .filter(|_| self.room_can_turn_off())
+            .map(|deadline| {
+                if self.warming {
+                    deadline.max(self.warm_until)
+                } else {
+                    deadline
+                }
+            })
+    }
+
+    fn room_can_turn_off(&self) -> bool {
+        self.roles.iter().all(|(role, state)| {
+            self.identity.blocked.contains(role) || state.power == RolePower::Off
+        })
+    }
+
+    pub fn resync_running(&self, now: Instant) -> bool {
+        self.resync_at
+            .is_some_and(|at| now.saturating_duration_since(at) < start::RESYNC_WINDOW)
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         let identify = self
             .bridge_online
@@ -754,6 +780,39 @@ impl Engine {
             track.since = None;
         }
         self.standby_verifications.clear();
+        self.reload_roles(&previous_config, now);
+        if bridge_changed {
+            self.bus = BusModel::new(
+                self.config.bridge.logical_address(),
+                self.config.timing.identify_retry_s,
+                Self::required_queries(&self.config),
+            );
+            self.signals.clear();
+            self.intent.active_role = None;
+            for role in self.roles.values_mut() {
+                role.power = RolePower::Off;
+                role.last_event = None;
+                role.poll_at = None;
+            }
+        } else {
+            self.bus.configure_identification(
+                self.config.timing.identify_retry_s,
+                Self::required_queries(&self.config),
+            );
+        }
+        let previous = std::mem::replace(
+            &mut self.identity,
+            identity::resolve(&self.config.device, &self.bus),
+        );
+        if !bridge_changed {
+            self.discard_remapped_signals(previous);
+        }
+        self.warming = true;
+        self.warm_until = now + Duration::from_secs(3);
+        vec![]
+    }
+
+    fn reload_roles(&mut self, previous_config: &Config, now: Instant) {
         self.roles
             .retain(|role, _| self.config.device.iter().any(|d| &d.role == role));
         for device in &self.config.device {
@@ -775,29 +834,14 @@ impl Engine {
             role.awaiting = false;
             role.misses = 0;
         }
-        if bridge_changed {
-            self.bus = BusModel::new(
-                self.config.bridge.logical_address(),
-                self.config.timing.identify_retry_s,
-                Self::required_queries(&self.config),
-            );
-            self.signals.clear();
-            self.intent.active_role = None;
-            for role in self.roles.values_mut() {
-                role.power = RolePower::Off;
-                role.last_event = None;
-                role.poll_at = None;
+    }
+
+    fn discard_remapped_signals(&mut self, previous: Resolution) {
+        for (role, old) in previous.roles {
+            if self.identity.roles.get(&role) != Some(&old) {
+                self.signals.remove(&old);
             }
-        } else {
-            self.bus.configure_identification(
-                self.config.timing.identify_retry_s,
-                Self::required_queries(&self.config),
-            );
         }
-        self.identity = identity::resolve(&self.config.device, &self.bus);
-        self.warming = true;
-        self.warm_until = now + Duration::from_secs(3);
-        vec![]
     }
 
     fn handle_frame(&mut self, frame: Frame, now: Instant, wall: DateTime<Utc>) -> Vec<Action> {
@@ -808,7 +852,10 @@ impl Engine {
         let keep_running = previous_roles
             .iter()
             .any(|(role, &la)| la == frame.from && self.roles[role].power == RolePower::On);
-        if let Some(previous_la) = self.prepare_address_change(&frame, keep_running) {
+        let change = self.bus.identity_change(&frame, keep_running);
+        let moved_from = self.bus.address_move_from(&frame);
+        let changes = self.capture_identity_changes(&frame, change, moved_from);
+        if let Some(previous_la) = self.prepare_address_change(&frame, change, moved_from) {
             // A continuous role binding must not replay its historical wake signals.
             for la in previous_roles.values_mut() {
                 if *la == previous_la {
@@ -817,6 +864,7 @@ impl Engine {
             }
         }
         let mut actions = self.learn_frame(&frame, now, wall, keep_running);
+        self.record_identity_changes(changes, frame.from);
         self.reconcile_frame_roles(&previous_roles, &frame, now, &mut actions);
         actions.extend(self.fake_tv(&frame));
         self.forward_volume(&frame, &mut actions);
@@ -852,9 +900,13 @@ impl Engine {
         actions
     }
 
-    fn prepare_address_change(&mut self, frame: &Frame, keep_running: bool) -> Option<u8> {
-        let moved_from = self.bus.address_move_from(frame);
-        if self.bus.replaces_identity(frame, keep_running) || moved_from.is_some() {
+    fn prepare_address_change(
+        &mut self,
+        frame: &Frame,
+        change: IdentityChange,
+        moved_from: Option<u8>,
+    ) -> Option<u8> {
+        if change == IdentityChange::Replace || moved_from.is_some() {
             self.signals.remove(&frame.from);
         }
         if let Some(previous_la) = moved_from {
@@ -1054,6 +1106,7 @@ impl Engine {
         let mut actions = vec![];
         match command {
             Command::SetMode(mode) => self.command_set_mode(mode),
+            Command::Resync => self.command_resync(now, &mut actions),
             Command::Identify(la) => self.command_identify(la, now, &mut actions),
             Command::Forget(la) => self.command_forget(la, now, &mut actions),
             Command::SendRaw { to, data } => self.command_send_raw(to, data, &mut actions),
@@ -1064,6 +1117,14 @@ impl Engine {
             Command::AllOff => self.command_all_off(now, &mut actions),
         }
         actions
+    }
+
+    fn command_resync(&mut self, now: Instant, actions: &mut Vec<Action>) {
+        if self.bridge_online && !self.resync_running(now) {
+            actions.extend(self.resync(now));
+            // Discarding held startup sources can already have recorded a row.
+            self.record_command_actions("command_resync", actions.clone());
+        }
     }
 
     fn command_set_mode(&mut self, mode: Mode) {
@@ -1149,6 +1210,7 @@ impl Engine {
         match command {
             Command::AllOff => "command_all_off",
             Command::SetMode(_) => "command_set_mode",
+            Command::Resync => "command_resync",
             Command::Identify(_) => "command_identify",
             Command::Forget(_) => "command_forget",
             Command::SendRaw { .. } => "command_send_raw",
@@ -1249,6 +1311,11 @@ impl Engine {
         }
         let previous = state.power;
         state.power = target;
+        if !self.warming
+            && let Some(la) = self.identity.roles.get(role)
+        {
+            self.signals.remove(la);
+        }
         if target == RolePower::On {
             state.on_since = Some(now);
         }
@@ -1514,9 +1581,7 @@ impl Engine {
             return vec![];
         }
         self.off_at = None;
-        if !self.roles.iter().all(|(role, state)| {
-            self.identity.blocked.contains(role) || state.power == RolePower::Off
-        }) {
+        if !self.room_can_turn_off() {
             return vec![];
         }
         let actions = vec![
@@ -1909,6 +1974,7 @@ impl Engine {
             expectations,
             verdict,
             drift: None,
+            identity: None,
         });
         id
     }
