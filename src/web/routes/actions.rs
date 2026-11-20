@@ -143,6 +143,12 @@ pub(crate) async fn all_off(State(web): State<WebState>) -> Result<Response, Web
     run(&web, Command::AllOff, "All off requested.".to_owned()).await
 }
 
+/// The runtime refuses a resync while the bridge is offline or one is already running; its
+/// reason comes back as the `bad` toast.
+pub(crate) async fn resync(State(web): State<WebState>) -> Result<Response, WebError> {
+    run(&web, Command::Resync, "Bridge resync sent.".to_owned()).await
+}
+
 pub(crate) async fn identify(
     State(web): State<WebState>,
     Path(la): Path<String>,

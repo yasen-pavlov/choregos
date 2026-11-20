@@ -158,6 +158,8 @@ struct RecentRow {
     decision: DecisionView,
     separator: bool,
     role_name: Option<String>,
+    /// The recorder list's change text; `None` renders the dim dash.
+    change: Option<String>,
     actions: String,
     latency: Option<String>,
 }
@@ -726,6 +728,7 @@ fn recent(snapshot: &Snapshot) -> Vec<RecentRow> {
                 .role
                 .as_deref()
                 .map(|role| view::role_name(snapshot, role)),
+            change: view::change_text(decision),
             actions: ActionSummary::from_actions(&decision.actions).text(),
             latency: if decision.verdict == Verdict::Pending {
                 None

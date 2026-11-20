@@ -87,7 +87,7 @@ impl BusEntry {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum IdentityChange {
+pub(crate) enum IdentityChange {
     None,
     Physical,
     Replace,
@@ -204,7 +204,7 @@ impl BusModel {
                 .is_some_and(|entry| entry.physical.is_some() && entry.physical != frame.physical())
     }
 
-    fn identity_change(&self, frame: &Frame, keep_running: bool) -> IdentityChange {
+    pub(crate) fn identity_change(&self, frame: &Frame, keep_running: bool) -> IdentityChange {
         let Some(entry) = self.entries.get(&frame.from) else {
             return IdentityChange::None;
         };

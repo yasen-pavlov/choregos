@@ -47,6 +47,7 @@
         {% if let Some(sentence) = sentence %}<p><strong>{{ sentence }}</strong></p>{% else %}<p class="dim">This reason is not in the glossary.</p>{% endif %}
         <p class="dim">Rule applied: {{ rule }}</p>
         {% if let Some(drift) = view::drift_row(decision) %}<p class="small"><span class="mono">{{ drift.subject }}.{{ drift.field }}</span> intended {{ drift.intended }}, observed {{ drift.observed }} via {{ drift.via }} since {{ view::when_ms(drift.since) }}{% if let Some(lasted) = view::drift_lasted(decision) %} · lasted {{ lasted }}{% endif %}</p>{% endif %}
+        {% if let Some(identity) = view::identity_row(decision) %}{% let (kind, parts) = view::identity_parts(identity) %}<p class="small"><span class="mono">{{ kind }}</span>{% for (key, value) in parts %} · {{ key }} <span class="mono">{{ value }}</span>{% endfor %}</p>{% endif %}
         <a class="small" href="/recorder/glossary#r-{{ decision.reason }}">Glossary for every reason →</a>
       </div>
     </section>

@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, Utc};
 
 use super::{
-    age, bound_entry, bus_power, drift_row, duration, ha_power, is_migrated, is_restored, latency,
-    reason_sentence, recorder::outcome_word, role_identity, role_sources, transition,
+    age, bound_entry, bus_power, drift_row, duration, ha_power, identity_row, identity_summary,
+    is_migrated, is_restored, latency, reason_sentence, recorder::outcome_word, role_identity,
+    role_sources, transition,
 };
 use crate::{
     action::{Field, Outcome, Verdict, Via},
@@ -770,12 +771,18 @@ pub(crate) fn service_started(snapshot: &Snapshot) -> Option<DateTime<Utc>> {
         .map(|decision| decision.timestamp)
 }
 
-/// Identity history of a role, newest first. Recorded: its `identity_lost` rows, plus
-/// `conflict`, `conflict_resolved`, `command_identify` and `command_forget` rows (they carry
-/// no role) whose trigger names an address of the role: its current or last one, its restored
-/// entry's, one of a conflict it is part of, or one a loss row names. Synthetic: `verified`
-/// at the bound entry's confirmation, `restored` at the service start when the identity came
-/// from the state file. Address moves leave no row.
+/// Identity history of a role, newest first. Recorded: its `identity_lost` rows; its
+/// `identity_moved` / `identity_replaced` rows, where the row's role is authoritative: a row
+/// naming this role is in, a row naming another role is out, and a row naming no role is in
+/// when its old or new address is an address of the role; and `conflict`,
+/// `conflict_resolved`, `command_identify` and `command_forget` rows (they carry no role)
+/// whose trigger names an address of the role. The role's addresses: its current or last
+/// one, its restored entry's, one of a conflict it is part of, one a loss row names, and
+/// both ends of its own identity rows, so the history follows the role across a move.
+/// Synthetic: `verified` at the bound entry's confirmation, `restored` at the service start
+/// when the identity came from the state file. Rows of one instant (one frame can record a
+/// replacement and then a move) are newest id first; synthetic lines follow the recorded
+/// rows of their instant.
 pub(crate) fn identity_events(
     snapshot: &Snapshot,
     role: &RoleView,
@@ -787,9 +794,8 @@ pub(crate) fn identity_events(
             .iter()
             .filter(|decision| !is_migrated(decision))
     };
-    let lost = |decision: &DecisionView| {
-        decision.reason == "identity_lost" && decision.role.as_deref() == Some(role.role.as_str())
-    };
+    let own = |decision: &DecisionView| decision.role.as_deref() == Some(role.role.as_str());
+    let lost = |decision: &DecisionView| decision.reason == "identity_lost" && own(decision);
     let mut addresses: BTreeSet<u8> = role
         .logical_address
         .into_iter()
@@ -808,16 +814,32 @@ pub(crate) fn identity_events(
             .filter(|decision| lost(decision))
             .filter_map(DecisionView::trigger_logical_address),
     );
+    addresses.extend(
+        rows()
+            .filter(|decision| own(decision))
+            .filter_map(identity_row)
+            .flat_map(|identity| [identity.la.from, identity.la.to]),
+    );
+    let ours = |la: u8| addresses.contains(&la);
+    let identity_change = |decision: &DecisionView| {
+        matches!(
+            decision.reason.as_str(),
+            "identity_moved" | "identity_replaced"
+        ) && match decision.role.as_deref() {
+            Some(owner) => owner == role.role,
+            None => identity_row(decision)
+                .is_some_and(|identity| ours(identity.la.from) || ours(identity.la.to)),
+        }
+    };
 
     let mut events: Vec<IdentityEvent> = rows()
         .filter(|decision| {
             lost(decision)
+                || identity_change(decision)
                 || (matches!(
                     decision.reason.as_str(),
                     "conflict" | "conflict_resolved" | "command_identify" | "command_forget"
-                ) && decision
-                    .trigger_logical_address()
-                    .is_some_and(|la| addresses.contains(&la)))
+                ) && decision.trigger_logical_address().is_some_and(ours))
         })
         .map(|decision| {
             let sentence = reason_sentence(&decision.reason).unwrap_or_default();
@@ -825,14 +847,15 @@ pub(crate) fn identity_events(
                 at: decision.timestamp,
                 word: decision.reason.replacen("command_", "command ", 1),
                 tone: match decision.reason.as_str() {
-                    "identity_lost" => "warn",
+                    "identity_lost" | "identity_replaced" => "warn",
                     "conflict" => "bad",
                     "conflict_resolved" => "ok",
                     _ => "dim",
                 },
-                sentence: match decision.trigger_logical_address() {
-                    Some(la) => format!("LA {la}: {sentence}"),
-                    None => sentence.to_owned(),
+                sentence: match (identity_row(decision), decision.trigger_logical_address()) {
+                    (Some(identity), _) => identity_summary(identity),
+                    (None, Some(la)) => format!("LA {la}: {sentence}"),
+                    (None, None) => sentence.to_owned(),
                 },
                 id: Some(decision.id),
             }
@@ -882,7 +905,13 @@ pub(crate) fn identity_events(
             ),
         ));
     }
-    events.sort_by_key(|event| std::cmp::Reverse(event.at));
+    events.sort_by_key(|event| {
+        (
+            std::cmp::Reverse(event.at),
+            event.id.is_none(),
+            std::cmp::Reverse(event.id),
+        )
+    });
     events
 }
 
@@ -1864,6 +1893,7 @@ mod tests {
             expectations: vec![],
             verdict: Verdict::None,
             drift: None,
+            identity: None,
         }
     }
 
@@ -2440,6 +2470,176 @@ presence = "events"
         assert!(events[0].sentence.starts_with("LA 4: "));
         role.last_logical_address = None;
         assert!(identity_events(&snapshot, &role, None).is_empty());
+    }
+
+    #[test]
+    fn identity_history_follows_a_move_and_lists_replacements_at_its_addresses() {
+        use crate::action::{IdentityDetail, IdentityKind, IdentityPair};
+        let mut snapshot = snapshot();
+        let mut role = snapshot.roles[0].clone();
+        role.logical_address = Some(11);
+        role.last_logical_address = None;
+        let pa = || Some("2.4.0.0".to_owned());
+        let change = |id, reason: &str, owner, kind, (from, to)| DecisionView {
+            identity: Some(Box::new(IdentityDetail {
+                kind,
+                la: IdentityPair { from, to },
+                pa: IdentityPair {
+                    from: pa(),
+                    to: pa(),
+                },
+                vendor: None,
+                osd: None,
+            })),
+            ..row(id, owner, reason)
+        };
+        let own_move = change(
+            2,
+            "identity_moved",
+            Some("streamer"),
+            IdentityKind::LaMove,
+            (8, 11),
+        );
+        let others = vec![
+            // At LA 8, before the move: joins only through the move row.
+            command(1, Command::Identify(8), "command_identify"),
+            // A different device took the old address afterwards.
+            change(3, "identity_replaced", None, IdentityKind::Replaced, (8, 8)),
+            // Another role's move and a replacement elsewhere stay out.
+            change(
+                4,
+                "identity_moved",
+                Some("console"),
+                IdentityKind::LaMove,
+                (5, 6),
+            ),
+            change(
+                5,
+                "identity_replaced",
+                None,
+                IdentityKind::Replaced,
+                (12, 12),
+            ),
+            // A replacement at its current address.
+            change(
+                6,
+                "identity_replaced",
+                None,
+                IdentityKind::Replaced,
+                (11, 11),
+            ),
+        ];
+        snapshot.decisions = others.iter().cloned().chain([own_move]).collect();
+        let events = identity_events(&snapshot, &role, None);
+        let seen: Vec<_> = events
+            .iter()
+            .map(|e| (e.id, e.word.as_str(), e.tone))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (Some(6), "identity_replaced", "warn"),
+                (Some(3), "identity_replaced", "warn"),
+                (Some(2), "identity_moved", "dim"),
+                (Some(1), "command identify", "dim"),
+            ]
+        );
+        assert_eq!(events[2].sentence, "Moved from LA 8 to LA 11 (PA 2.4.0.0)");
+        assert_eq!(
+            events[1].sentence,
+            "LA 8 now holds a different device: PA 2.4.0.0 → 2.4.0.0"
+        );
+
+        // Without its own move row, the old address is not the role's.
+        snapshot.decisions = others.into();
+        let ids: Vec<_> = identity_events(&snapshot, &role, None)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, [Some(6)]);
+    }
+
+    /// An identity row at `id` naming `owner`, LA `from` → `to`, PA unchanged.
+    fn identity_change(
+        id: u64,
+        reason: &str,
+        owner: Option<&str>,
+        kind: crate::action::IdentityKind,
+        (from, to): (u8, u8),
+    ) -> DecisionView {
+        use crate::action::{IdentityDetail, IdentityPair};
+        let pa = || Some("2.4.0.0".to_owned());
+        DecisionView {
+            identity: Some(Box::new(IdentityDetail {
+                kind,
+                la: IdentityPair { from, to },
+                pa: IdentityPair {
+                    from: pa(),
+                    to: pa(),
+                },
+                vendor: None,
+                osd: None,
+            })),
+            ..row(id, owner, reason)
+        }
+    }
+
+    #[test]
+    fn two_roles_swapping_addresses_each_keep_only_their_own_move() {
+        use crate::action::IdentityKind::{LaMove, Replaced};
+        let mut snapshot = snapshot();
+        // Streamer moved 8 → 11, console 11 → 8: both address sets hold both addresses.
+        let mut streamer = snapshot.roles[0].clone();
+        streamer.logical_address = Some(11);
+        let mut console = snapshot.roles[1].clone();
+        assert_eq!(console.role, "console");
+        console.logical_address = Some(8);
+        snapshot.decisions = [
+            identity_change(1, "identity_moved", Some("streamer"), LaMove, (8, 11)),
+            identity_change(2, "identity_moved", Some("console"), LaMove, (11, 8)),
+            // Role-less rows still follow the address rule; another role's replacement does not.
+            identity_change(3, "identity_replaced", None, Replaced, (11, 11)),
+            identity_change(4, "identity_replaced", Some("console"), Replaced, (11, 11)),
+        ]
+        .into();
+        let ids = |role: &RoleView| -> Vec<Option<u64>> {
+            identity_events(&snapshot, role, None)
+                .iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        assert_eq!(ids(&streamer), [Some(3), Some(1)]);
+        assert_eq!(ids(&console), [Some(4), Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn one_frames_replacement_and_move_read_newest_id_first_before_synthetic_lines() {
+        use crate::action::IdentityKind::{LaMove, Replaced};
+        let mut snapshot = snapshot();
+        let mut role = snapshot.roles[0].clone();
+        role.logical_address = Some(11);
+        let replaced = identity_change(7, "identity_replaced", None, Replaced, (11, 11));
+        let at = replaced.timestamp;
+        let moved = DecisionView {
+            timestamp: at,
+            ..identity_change(8, "identity_moved", Some("streamer"), LaMove, (8, 11))
+        };
+        snapshot.decisions = [replaced, moved].into();
+        // Confirmed by the same frame, after the service started (no restored line).
+        let bound = entry(11, Some(at));
+        let events = identity_events(&snapshot, &role, Some(&bound));
+        let seen: Vec<_> = events
+            .iter()
+            .map(|e| (e.at, e.id, e.word.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (at, Some(8), "identity_moved"),
+                (at, Some(7), "identity_replaced"),
+                (at, None, "verified"),
+            ]
+        );
     }
 
     #[test]

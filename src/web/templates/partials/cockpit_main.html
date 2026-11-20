@@ -122,7 +122,7 @@
             <td class="mono"><a href="/recorder/{{ row.decision.id }}">{{ row.decision.id }}</a>{% if let Some(parent) = row.decision.parent %} <a class="dim" href="/recorder/{{ parent }}">↳ {{ parent }}</a>{% endif %}</td>
             <td class="mono num" title="{{ view::iso(row.decision.timestamp) }}">{{ view::when_ms(row.decision.timestamp) }}</td>
             <td>{% if let Some(name) = row.role_name %}{{ name }}{% else %}<span class="dim">room</span>{% endif %}</td>
-            <td class="mono">{% if row.decision.from.is_none() && row.decision.to.is_none() %}<span class="dim">—</span>{% else %}{{ view::transition(row.decision.from, row.decision.to) }}{% endif %}</td>
+            <td class="mono">{% if let Some(change) = row.change %}{{ change }}{% else %}<span class="dim">—</span>{% endif %}</td>
             <td class="mono" title="{{ view::reason_title(row.decision.reason) }}">{{ row.decision.reason }}</td>
             <td class="mono dim">{{ row.actions }}</td>
             <td>{% if row.decision.would %}<span class="chip would">would</span>{% else %}<span class="chip {{ view::verdict_tone(row.decision.verdict) }}">{{ row.decision.verdict }}</span>{% endif %}</td>

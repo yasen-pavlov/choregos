@@ -532,7 +532,7 @@ impl Runtime {
                 return Ok(());
             }
             Input::Request(Request::Command(command, reply)) => {
-                self.handle_command(command, reply).await
+                self.handle_command(command, reply, now).await
             }
             Input::Request(Request::ReadConfig(reply)) => {
                 let _ = reply.send(read_config(&self.path).await);
@@ -566,8 +566,9 @@ impl Runtime {
         &mut self,
         command: Command,
         reply: Option<oneshot::Sender<Result<(), CommandError>>>,
+        now: Instant,
     ) -> Vec<Event> {
-        let result = match validate_command(&command, &self.engine) {
+        let result = match validate_command(&command, &self.engine, now) {
             Ok(()) => {
                 if let Command::SetMode(mode) = command {
                     persist_mode(mode, &self.path)
@@ -718,10 +719,14 @@ impl Runtime {
                     .collect(),
                 // A service-start boundary is an observed fact, not a shadow intent.
                 would: decision.would
-                    || (self.engine.mode() == Mode::Shadow && decision.reason != "service_started"),
+                    || (self.engine.mode() == Mode::Shadow
+                        && decision.reason != "service_started"
+                        && decision.reason != "command_resync"
+                        && decision.identity.is_none()),
                 expectations: decision.expectations.clone(),
                 verdict: decision.verdict,
                 drift: decision.drift.clone(),
+                identity: decision.identity.clone(),
             };
             if self.engine.config.trace.keep_days != 0 && self.trace.is_some() {
                 let mut payload = serde_json::to_value(decision).expect("serializable decision");
@@ -987,8 +992,10 @@ fn trace_ha_attrs(
     )
 }
 
-fn validate_command(command: &Command, engine: &Engine) -> Result<(), CommandError> {
+fn validate_command(command: &Command, engine: &Engine, now: Instant) -> Result<(), CommandError> {
     let error = match command {
+        Command::Resync if !engine.bridge_online => Some("bridge is offline"),
+        Command::Resync if engine.resync_running(now) => Some("a resync is already running"),
         Command::Identify(la) if *la >= 15 => Some("identify address must be 0–14"),
         Command::Forget(la) if *la >= 15 => Some("forget address must be 0–14"),
         Command::Forget(la) if *la == engine.bus.bridge => Some("cannot forget the bridge"),
@@ -1166,6 +1173,12 @@ fn update_snapshot(snapshot: &mut Snapshot, engine: &Engine, now: Instant, wall:
     snapshot.tv_direct = engine.tv_direct;
     snapshot.receiver_direct = engine.receiver_direct;
     snapshot.drift = engine.drift();
+    snapshot.off_deadline = engine.off_deadline().map(|deadline| {
+        let remaining = chrono::Duration::from_std(deadline.saturating_duration_since(now))
+            .unwrap_or(chrono::Duration::MAX);
+        wall.checked_add_signed(remaining)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    });
     snapshot.conflicts = engine.identity.conflicts.clone();
     snapshot.connections.bridge_online = engine.bridge_online;
     snapshot.connections.mode = engine.mode();
@@ -1336,6 +1349,8 @@ mod bridge_identity_tests;
 #[cfg(test)]
 mod loop_tests;
 #[cfg(test)]
+mod redesign_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1465,7 +1480,8 @@ mod tests {
     #[test]
     fn rejects_unsafe_manual_commands_before_acknowledging() {
         let config = Config::parse(include_str!("../../choregos.example.toml")).unwrap();
-        let engine = Engine::new(config, Instant::now(), vec![], 1);
+        let now = Instant::now();
+        let engine = Engine::new(config, now, vec![], 1);
         for command in [
             Command::Identify(15),
             Command::Identify(engine.bus.bridge),
@@ -1484,9 +1500,9 @@ mod tests {
             Command::Takeover("missing".into()),
             Command::AllOff,
         ] {
-            assert!(validate_command(&command, &engine).is_err());
+            assert!(validate_command(&command, &engine, now).is_err());
         }
-        assert!(validate_command(&Command::SetMode(Mode::Shadow), &engine).is_ok());
+        assert!(validate_command(&Command::SetMode(Mode::Shadow), &engine, now).is_ok());
         assert!(
             validate_command(
                 &Command::SendRaw {
@@ -1494,6 +1510,7 @@ mod tests {
                     data: vec![0; 14],
                 },
                 &engine,
+                now,
             )
             .is_ok()
         );
@@ -1510,7 +1527,7 @@ mod tests {
             (engine.bus.bridge, "cannot forget the bridge"),
             (3, "unknown logical address"),
         ] {
-            let error = validate_command(&Command::Forget(la), &engine).unwrap_err();
+            let error = validate_command(&Command::Forget(la), &engine, now).unwrap_err();
             assert_eq!(error.to_string(), format!("invalid command: {message}"));
         }
         engine.bus.restore(
@@ -1527,14 +1544,16 @@ mod tests {
         assert!(engine.warming);
         assert_eq!(engine.mode(), Mode::Shadow);
         assert_eq!(
-            validate_command(&Command::Forget(3), &engine)
+            validate_command(&Command::Forget(3), &engine, now)
                 .unwrap_err()
                 .to_string(),
             "invalid command: bridge is warming"
         );
         engine.handle(Event::Tick, now + Duration::from_secs(3), Utc::now());
         assert!(!engine.warming);
-        assert!(validate_command(&Command::Forget(3), &engine).is_ok());
+        assert!(
+            validate_command(&Command::Forget(3), &engine, now + Duration::from_secs(3)).is_ok()
+        );
     }
 
     #[test]
@@ -2065,6 +2084,7 @@ mod persistence_tests {
         assert_eq!(loaded.decisions.len(), 1);
         assert_eq!(loaded.decisions[0].reason, "service_started");
         assert_eq!(loaded.decisions[0].drift, None);
+        assert_eq!(loaded.decisions[0].identity, None);
     }
 
     #[tokio::test]
@@ -2148,6 +2168,7 @@ mod persistence_tests {
             expectations: vec![],
             verdict: crate::action::Verdict::None,
             drift: None,
+            identity: None,
         });
         let saved = PersistedState::capture(&engine, &ring);
         persist_bytes(&path, &serde_json::to_vec(&saved).unwrap())

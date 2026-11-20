@@ -319,12 +319,16 @@ untouched. Ordinary Off lifecycle otherwise retains existing start-episode and
 verification-slot semantics. Reload preserves runs/baselines only for unchanged
 probe configuration; editing `standby_off_s` clears them and settles pending
 console standby expectations unknown, just like changing any other probe key.
-If a tick or another event ends warm-up while the role is still On, resync's
-buffered On replay refreshes `awake_at` and distrusts the preserved run; the
-backstop then waits for a new Standby run. The exception is a due Standby sample
-that ends warm-up: `handle` clears warming before dispatch, so the sample
-releases the role and clears stale signals before `finish_warming` can replay
-them. A later real configured On frame wakes normally.
+Outside warm-up, each performed role transition consumes the buffered signals of
+its bound LA, preventing historical On/Off from undoing a command. Lifecycle
+transitions during warm-up preserve signals that could not yet be applied.
+Only an On that caused a transition is consumed: a repeated On while already On
+remains buffered and replays after warm-up, refreshing `awake_at` and conservatively
+distrusting an older Standby run. Without a repeat the run stays trusted across
+resync. A real configured On still distrusts the old run; warm-up still defers the
+backstop. Rejected warming/blocked transitions and unbound LAs retain signals for
+replay when usable. If warm-up expires inside a handle, that event's transition
+runs before replay and consumes the buffer; the newer event wins.
 Known limit: a console returning On without a configured On frame while its
 responder keeps reporting Standby in a new trusted run would be turned Off.
 
@@ -398,6 +402,15 @@ restored from historical ring rows; state remains version 2.
   migrated in place: ids assigned in ring order, `verdict = none`. Ring entries
   are mutable until their verdict is final; the state file is written on every
   verdict change (same single-slot writer).
+  Additive optional `identity` detail defaults to None and is omitted when
+  absent, like `drift`. `identity_moved`/`identity_replaced` and `command_resync`
+  have empty expectations and verdict `none` in both modes, never `would`.
+  Identity detail has `kind`, LA/PA `{from, to}` pairs and a vendor/OSD pair only
+  for the corresponding changed key (non-null string values). Within a frame,
+  `conflict`/`conflict_resolved` precedes `identity_replaced`, then `identity_moved`,
+  then transitions such as `identity_lost`. State version stays 2; the older command
+  enum in 0.4.2 cannot load `command_resync`, so restore the pre-upgrade state
+  backup before rollback. Additive identity fields alone remain compatible.
 - Trace gains two topics: `choregos/decision` (the row at creation) and
   `choregos/verdict` (`{id, verdict, expectations}` at settlement), plus
   `tv/state` and `receiver/state`. `extract` keeps them; `replay` ignores

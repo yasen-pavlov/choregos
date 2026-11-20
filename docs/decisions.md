@@ -2,6 +2,75 @@
 
 Deviations from DESIGN.md agreed in review. Newest first.
 
+## 2026-11-20 — Consume applied power signals before later resyncs
+
+- Outside warm-up, a performed role transition consumes the buffered signals of
+  its bound LA, after the duplicate-state early return. Historical On must not undo
+  All off or Standby during the next resync, and historical Off must not undo a
+  manual Takeover. This applies equally to manual resync and bridge reconnection.
+  Lifecycle releases during warm-up must preserve the real CEC wake buffered
+  behind the warm-up guard: releasing unconfirmed early-start evidence on reload
+  or Shadow entry is not evidence that the device's later real wake was applied.
+  Rejected warming/identity-blocked transitions and unbound senders also retain
+  signals for replay when usable. No bus or `learn_frame` restructuring.
+  When warm-up expires inside the handle that performs a transition, that event
+  runs before warm-up replay and consumes the buffer; the newer event wins.
+- Only the On that caused a transition outside warm-up is consumed. A repeated On
+  while already On remains buffered, replays after warm-up and refreshes `awake_at`,
+  conservatively distrusting an older Standby run. Without that repeat the run
+  stays trusted across resync. The regression
+  formerly stayed On at the 100-second sample after a 32-second warm-up replay;
+  it now releases Off with `probe_standby` at 100 seconds. A real On at 100.1
+  seconds distrusts that old run; a new run starting at 112 seconds is too short
+  at 121.999 and releases at 122 seconds. Warming still defers the backstop.
+- Clamp the displayed room-off deadline to `warm_until` while warming, without
+  changing timer scheduling or expiry. Validation uses the loop's injected
+  monotonic `now`, exactly the same instant as command handling at the five-second
+  resync boundary; remove the independent clock read.
+- Keep same-frame row order explicit: conflict changes, replacement, move,
+  then power transitions. Tighten vendor/OSD detail pairs to non-null strings;
+  physical-address pairs remain nullable. Serialized row shapes are unchanged.
+
+## 2026-11-20 — Explicit resync, boot-status coalescing and identity reporting
+
+- Add `Command::Resync` so the bridge drawer can request the existing resync
+  without pretending the bridge came online. Offline and five-second guards
+  protect the bus from unavailable sends and double clicks. Its sent-in-shadow
+  `command_resync` row has the resync actions, no role or expectations and
+  verdict `none`. Explicitly record it after any `startup_source_ignored` rows
+  from discarding previous holds; the generic command recorder otherwise misses it.
+- Coalesce fresh same-boot status updates while already online for less than
+  five host-monotonic seconds after emitted Online. A board can queue several
+  boot statuses before MQTT connects; these are not separate reconnects.
+  Keep pending-send correlation and update bus/time. Offline→online, boot
+  changes, our reconnect and fresh status at/after five seconds still resync.
+- Reload drops the old LA's buffered signals whenever a role changes or loses
+  its binding, even if another role now binds that LA. A stale replay after Save
+  can wake an empty room; missing one historical signal cannot, and a real wake
+  still works. Unchanged bindings keep their buffers. An unchanged probe's
+  trusted Standby run survives unbind/rebind: stale On replay is not new wake
+  evidence and must not refresh `awake_at`. In the regression, the former
+  63-second replay postponed release; without it, the preserved run releases
+  at the 69-second sample. A real wake after rebinding still distrusts that run
+  and requires a new one.
+- Add actionless `identity_moved` (`la_move`/`pa_change`) and
+  `identity_replaced` (`replaced`) rows for changes the bus already accepts.
+  Capture old values before learning; record replacement before move when
+  both apply, and identity rows before `identity_lost`. The optional typed
+  detail survives ring/state/trace/replay/extraction, absent in old v2 files.
+  No bus policy changes; eviction without inheritance remains unreported.
+  Store only this optional payload behind a Box so ordinary decisions/UI events
+  do not grow by its full inline size; JSON remains identical and no other
+  fields are boxed. This avoids allocating every ordinary UI event or hiding
+  the enum-size lint.
+- Coalescing legitimately advances rows timed from resync: the golden
+  `startup_source_ignored` boundary is five seconds after the first boot status,
+  rather than the last queued one. Review approved only this exact timestamp
+  arithmetic, in addition to identity-row additions and shifted ids.
+- Rollback to 0.4.2 must restore the state backup first if the ring includes
+  `command_resync`: the old unknown-command loader starts empty, losing both
+  ring and learned identities. Additive `identity` details alone remain readable.
+
 ## 2026-11-16 — Opt-in trusted probe standby backstop
 
 - A console can announce sleep only once; a lost CEC Inactive Source frame left
@@ -30,13 +99,10 @@ Deviations from DESIGN.md agreed in review. Newest first.
   Guarded attempts leave the buffer and bus power unchanged.
 - Unchanged probes preserve runs/rest baselines across reload. Changing
   `standby_off_s` resets both and settles pending console standby expectations
-  unknown, like any other probe configuration change. Existing resync replay
-  semantics are unchanged: if a tick or another event ends warm-up while a role
-  is still On, replaying buffered On refreshes `awake_at`, distrusts the preserved
-  Standby run and postpones the backstop until a new run. A due Standby sample
-  ending warm-up is the exception: warming clears before event dispatch, so the
-  release clears stale signals before `finish_warming` can replay them.
-  A command-originated On with no buffered frame keeps its trusted run.
+  unknown, like any other probe configuration change. The original implementation
+  replayed already-applied On after warm-up, refreshing `awake_at` and distrusting
+  the preserved run. Superseded by the 2026-11-20 signal-consumption rule above:
+  resync now preserves trust unless a real On or a buffered repeated On distrusts it.
 - Known limit: if a console comes back On without any configured On frame while
   its responder reports Standby in a new trusted run, the backstop turns it Off.
   This is why the rule is opt-in, not a replacement for normal CEC release.

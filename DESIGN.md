@@ -61,10 +61,12 @@ ignored):
   `online:false` → `BridgeOffline` (pending sends dropped; `boot`/`seq` kept so
   a same-boot reconnect still dedupes); a changed `boot` while online (retained
   LWT lost or missed) → `BridgeOffline` then `BridgeOnline`; the same `boot`
-  again with a newer `status.t_us` is a fresh publish from the board (it
-  publishes `status` on every broker connect, so this covers a broker restart
-  that left a stale retained `online:true`, and `la`/bus-state changes) →
-  `BridgeOnline` (resync); the same `boot` and `t_us` (retained redelivery) →
+  again with a newer `status.t_us` is a fresh publish from the board →
+  `BridgeOnline` (resync), except within five host-monotonic seconds of the
+  last emitted Online while already online on that same boot: those queued
+  status updates keep pending sends and only refresh status time/bus state.
+  At exactly five seconds a fresh status resyncs again. The same `boot` and
+  `t_us` (retained redelivery) →
   no event. `v` ≠ 1 → one error log per connection, no `BridgeOnline`, and
   `bus` events are ignored until a supported `status` arrives. `status.bus` →
   `Snapshot.bridge_bus`. On every MQTT (re)connect of its own the adapter
@@ -337,6 +339,21 @@ Learning rules (all from received frames; sender = `From`):
 - Entries age out of `power = On` only via explicit events or presence polling; never by time alone.
 - Operator `Forget(la)` removes a non-bridge LA entry, its identification retry/manual-query state, buffered power signals and pending standby verification; the removal itself sends no CEC frames. Reject the command while the bridge is warming so deferred role transitions cannot leave an On role unbound. Re-resolve roles; a role losing its binding follows the existing `identity_lost` Off transition and release timer. A newly bound role consumes its latest relevant buffered on/off signal through the normal role transition. Record `command_forget` with no actions. The next persisted state excludes the entry. This local model edit is allowed in shadow mode and does not blacklist the LA: subsequent traffic learns it afresh.
 
+Accepted identity changes are reported before any same-frame `identity_lost`
+transition, without changing bus policy. `identity_moved` carries
+`identity.kind = la_move` (inherited entry) or `pa_change` (same-LA continuity);
+`identity_replaced` carries `replaced` for a reset destination. A move onto a
+replaced destination records replacement first, move second. All are actionless
+in every mode, including warm-up: no expectations, verdict `none`, never `would`.
+Within one frame the row order is `conflict`/`conflict_resolved` first, then
+`identity_replaced`, then `identity_moved`, then transitions such as `identity_lost`.
+`IdentityDetail` carries `la: {from, to}`, `pa: {from, to}` (dotted strings or
+null), and only for a differing vendor/OSD reply, `vendor`/`osd: {from, to}`.
+Vendor and OSD pair values are non-null strings; vendor strings are six-digit
+uppercase hex. Moves use the old bound role,
+falling back to the new binding; replacements use the destination's old role.
+An eviction without inheritance is intentionally not a new identity row.
+
 ### 5.2 Identity → role
 A role matches a verified LA entry when every key in its `match` table matches
 (OSD exact after trimming, vendor hex, physical dotted). Restored entries
@@ -347,10 +364,24 @@ match one LA, or one role matches two LAs, the engine records a `Conflict`
 decision, exposes it in the UI/HA, and takes **no power actions** for the
 roles involved until resolved. Unmatched LAs appear as "unidentified" devices.
 
+On config reload, resolve the new bindings and discard the previous LA's
+buffered signals for every role whose binding changes or disappears, even if
+another role now binds that old LA. Unchanged bindings retain their buffers.
+Bridge changes already clear all signals. This prevents stale On replay on Save;
+the next real signal remains authoritative. An unchanged probe's trusted Standby
+run survives unbind/rebind; removing stale replay must not refresh `awake_at`.
+
 ### 5.3 Role power state
 Per role: `Off | On`, derived from configured `on`/`off` bus signals, commands,
 opt-in console start evidence or the opt-in probe standby backstop. State changes produce decisions;
 duplicates (same state) are ignored (replaces today's `rbe` nodes).
+Outside warm-up, a performed transition consumes the buffered signals of its bound
+LA, regardless of whether a frame or a command caused it. Resync must not undo an
+already-applied state with historical On/Off evidence. Lifecycle transitions during
+warm-up retain buffered signals that could not yet be applied, as do rejected
+warming/blocked transitions and unbound LAs. They replay when usable.
+When warm-up expires inside the same handle that performs a transition, that event's
+transition runs before warm-up replay and consumes the buffer: the newer event wins.
 `RoleState.on_since: Option<Instant>` records each Off→On transition.
 Every configured On frame also sets private `awake_at`, even when rejected or
 suppressed as a late announcement. Probe Standby is trusted only when its
@@ -392,11 +423,12 @@ baseline and settles pending console standby expectations unknown on reload;
 unchanged probes preserve both. A later On frame wakes normally.
 A performed release drops the bound LA's buffered signals and clears its bus
 power/time to Unknown, like presence timeout, preventing stale On from re-waking
-the room on resync. Rejected transitions do neither. While a role is still On,
-resync's existing buffered On replay refreshes `awake_at` and distrusts the
-preserved Standby run; the backstop then needs a new run. If a due Standby sample
-ends warm-up, it instead releases the role and clears stale signals before that
-replay can run.
+the room on resync. Rejected transitions do neither. Only an On that caused a
+transition outside warm-up is consumed. A repeated On while the role was already
+On remains buffered and replays at warm-up completion, refreshing `awake_at` and
+conservatively distrusting an older probe Standby run. Without such a repeated On,
+a trusted run stays trusted across resync. A real configured On still distrusts the
+old run and requires a new one. Warm-up continues to defer the backstop.
 This is separate from reporting-only standby expectations and drift (which does
 not monitor role power). A console returning On without any configured On frame
 while its responder reports a new trusted Standby run can still be released.
@@ -478,6 +510,11 @@ This is evidence, not phase-4 anticipatory prediction.
 
 ### 5.5 Release (role turns Off)
 Start/restart `off_delay_s` timer. On expiry, if no role is On: `TvOff` and `HaCall{media_player.turn_off, receiver}`. `TvOff` uses HA by default, or native webOS SSAP over TLS (default port 3001) with an environment-only pairing key. Native off has one five-second connect/register/request/close deadline per attempt, three attempts one second apart, and no HA fallback. If a role turned On meanwhile the timer is cancelled.
+`Engine::off_deadline()` exposes the pending timer only when every role is
+blocked or Off, sharing the expiry predicate. While warming, expose the later
+of `off_at` and `warm_until`, since the timer cannot act sooner. Runtime converts its remaining
+monotonic duration forward from the injected wall time with saturation into
+`Snapshot.off_deadline`; the countdown is equally visible in shadow mode.
 Before each native power-off attempt, query `getPowerState`; `Power Off`, `Suspend`
 and `Active Standby` succeed without `turnOff`, which can wake a standby TV.
 An unsupported-service/error response permits `turnOff` on older webOS.
@@ -730,6 +767,14 @@ expectation-only tail.
 ### 5.6 Startup / resync
 On start and on bridge online (Tasmota LWT `Online`; aether `status.online:true` or a `boot` change): send `85` (Request Active Source, bcast) and `8F` to LAs 1, 4, 8, 11 plus currently bound role LAs; the replies populate the model within ~1 s. Until the first reply or 3 s, no power actions are taken (`Warming` state shown in UI).
 Resync additionally sends `83` immediately to each unverified restored LA. This counts as its first query; without identification progress, the next `83` waits `identify_retry_s`, not merely the one-second send slot.
+Operator `Command::Resync` (`{"kind":"resync"}`) runs the same resync without
+changing bridge availability. Reject while offline (`bridge is offline`) or
+less than five seconds after the last resync (`a resync is already running`);
+exactly five seconds is allowed. The engine repeats these safety guards.
+Each accepted command records exactly one `command_resync` row with its actions,
+no role, empty expectations and verdict `none`, after any discarded-source row.
+It is sent in shadow mode and never marked `would`. No MQTT command topic or
+Home Assistant discovery entity is added.
 
 Every emitted Resync records `resync_at`. For five seconds thereafter, while
 intent is Unknown, hold role signals from broadcast `82`, `90 00`, and `84`:
@@ -750,8 +795,8 @@ Version 2 contains `next_decision_id`, learned identities (`la`, `physical`,
 `vendor`, `osd`, `device_type`, `confirmed_at`) and the newest 2000 `DecisionView`
 entries, newest last. Each has a monotonic `id`, tagged input/timer/service
 `trigger`, optional `parent`, additive `expectations` (missing defaults empty),
-`verdict` (missing defaults none), and optional `drift` detail (missing defaults
-None). Source-settle rows link to their wake
+`verdict` (missing defaults none), optional `drift` and optional `identity`
+details (missing default None, omitted when absent). Source-settle rows link to their wake
 decision; standby mechanics and outcomes belong to the decision dispatching
 the stop, including across address moves. Timer rows retain their timer
 trigger even when another input processes the deadline.
@@ -847,7 +892,7 @@ on `choregos/state/drift`: `state` is `ON` for a non-empty open set, otherwise
 `fields`/`details` arrays and null `since`; availability uses `choregos/status`.
 
 ### 5.12 Events into the engine
-`Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>, updated: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
+`Frame`, `SendResult{to, data, status, attempts}`, `BridgeOnline/Offline`, `HaState{entity, state, attrs, changed: Option<DateTime<Utc>>, updated: Option<DateTime<Utc>>}` (tv, receiver, sonos, kodi — subscribed via `subscribe_trigger`/`state_changed`), `Tick(now)`, `Command(AllOff | Resync | SetMode | Identify(la) | Forget(la) | SendRaw{to,data} | ManualTakeover(role))`, `ConfigReloaded`.
 `TvPower{state: On|Off|Unreachable, at: DateTime<Utc>}` is a direct observation
 only, independent of the HA cache and room intent.
 `TvDirectUnavailable` clears frozen TV evidence and selects HA until reload;
@@ -994,7 +1039,7 @@ impl AppState {
 }
 pub struct Snapshot { pub mode: Mode, pub warming: bool, pub bridge_online: bool, pub bridge_logical_address: u8, pub bridge_max_raw_bytes: usize /* selected adapter's raw-send limit */, pub bridge_bus: Option<String> /* aether: ok | stuck_low | no_pullup */, pub bridge_telemetry: Option<BridgeTelemetry> /* stale_after_s per adapter */, pub roles: Vec<RoleView>, pub bus: Vec<BusEntryView>, pub ha: HaView, pub active_role: Option<String>, pub intent: RoomIntent, pub tv_direct: Option<(DirectPower, DateTime<Utc>)>, pub receiver_direct: Option<(DirectPower, DateTime<Utc>)>, pub conflicts: Vec<Conflict>, pub recent_frames: VecDeque<FrameView> /* direction Received | Sent | Local; ack: Option<bool> */, pub decisions: VecDeque<DecisionView>, pub connections: Health }
 pub enum UiEvent { Frame(FrameView), Decision(DecisionView), Verdict { id: u64, verdict: Verdict, expectations: Vec<Expectation> } } // publish updated snapshot before events
-pub enum Command { AllOff, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
+pub enum Command { AllOff, Resync, SetMode(Mode), Identify(u8), Forget(u8), SendRaw { to: u8, data: Vec<u8> }, Takeover(String), Standby(String) }
 
 // src/web/mod.rs  (ui owns; core mounts)
 pub fn router(state: AppState) -> axum::Router;

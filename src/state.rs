@@ -332,6 +332,7 @@ pub enum UiEvent {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Command {
     AllOff,
+    Resync,
     SetMode(Mode),
     Identify(u8),
     Forget(u8),
@@ -597,6 +598,8 @@ pub struct DecisionView {
     pub verdict: crate::action::Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<crate::action::DriftDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Box<crate::action::IdentityDetail>>,
 }
 
 impl DecisionView {

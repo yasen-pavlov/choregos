@@ -1,9 +1,16 @@
 <aside class="drawer" aria-label="Bridge">
   <div class="ph"><h2 class="grow">Bridge</h2><button type="button" class="btn sm ghost" hx-get="/p/bridge?close=true" hx-target="#drawer" hx-swap="innerHTML" aria-label="Close the bridge drawer">✕</button></div>
   <div class="pb">
-    {# Only this block re-polls while the drawer is open, so the raw-send form keeps its input. #}
+    {# Only the two polled blocks re-poll while the drawer is open, so the raw-send form keeps
+       its input; the resync block polls on its own so its button follows the link. #}
     <div id="bridge-info" class="pb-flow" hx-get="/p/bridge" hx-trigger="every 3s" hx-select="#bridge-info" hx-swap="outerHTML">
       {% let info_id = "bridge" %}{% include "partials/bridge_info.html" %}
+    </div>
+    <hr>
+    <div id="bridge-resync" class="pb-flow" hx-get="/p/bridge" hx-trigger="every 3s" hx-select="#bridge-resync" hx-swap="outerHTML" hx-disinherit="*">
+      <div class="k">Resync</div>
+      <div class="row"><button type="button" id="bridge-resync-send" class="btn" hx-post="/actions/resync" hx-swap="none" hx-confirm="Resync the bus now?"{% if !snapshot.bridge_online %} disabled title="bridge offline: a resync needs the bridge online"{% endif %}>Resync…</button></div>
+      <p class="help">Choregos re-reads the bus: it asks each role for its power status, then warms for up to 3 s before it acts on power again. It wakes and sleeps nothing.</p>
     </div>
     <hr>
     <div class="k">Raw send</div>

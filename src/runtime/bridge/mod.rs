@@ -93,7 +93,7 @@ impl Correlation {
                     decoded.events.extend(event);
                 }
             }
-            TraceEntry::AetherStatus { payload, .. } => return self.aether.status(payload),
+            TraceEntry::AetherStatus { payload, .. } => return self.aether.status(payload, now),
             TraceEntry::AetherBus { payload, .. } => return self.aether.bus(payload, now),
             _ => {}
         }

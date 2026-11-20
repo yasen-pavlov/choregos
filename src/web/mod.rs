@@ -101,6 +101,7 @@ pub fn router(state: AppState) -> Router {
         .route("/config/save", post(routes::config::save))
         .route("/actions/mode", post(routes::actions::mode))
         .route("/actions/all-off", post(routes::actions::all_off))
+        .route("/actions/resync", post(routes::actions::resync))
         .route("/actions/identify/{la}", post(routes::actions::identify))
         .route("/actions/forget/{la}", post(routes::actions::forget))
         .route("/actions/takeover/{role}", post(routes::actions::takeover))

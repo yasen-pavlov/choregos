@@ -2242,6 +2242,7 @@ fn shadow_decision() -> DecisionView {
         expectations: vec![],
         verdict: crate::action::Verdict::None,
         drift: None,
+        identity: None,
     }
 }
 
@@ -3022,7 +3023,13 @@ async fn old_routes_are_gone_and_navigation_points_at_the_recorder() {
     );
     let glossary = body(h.get("/recorder/glossary", Some(&cookie)).await).await;
     assert!(glossary.contains("<dt id=\"r-off_timer_expired\"><a class=\"mono\" href=\"/recorder?reason=off_timer_expired\">off_timer_expired</a></dt>"));
-    assert_eq!(glossary.matches("<dt id=\"r-").count(), 39);
+    assert_eq!(glossary.matches("<dt id=\"r-").count(), 42);
+    for literal in ["command_resync", "identity_moved", "identity_replaced"] {
+        assert!(
+            glossary.contains(&format!("<dt id=\"r-{literal}\">")),
+            "{literal}"
+        );
+    }
     assert!(
         glossary.contains("<dt id=\"r-probe_standby\">"),
         "{glossary}"
@@ -4049,4 +4056,332 @@ async fn versioned_scripts_are_cached_immutably_and_old_versions_are_gone() {
             "{gone}"
         );
     }
+}
+
+#[tokio::test]
+async fn resync_sends_the_command_and_is_not_a_would_in_shadow() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    assert_eq!(h.state.snapshot().mode, crate::state::Mode::Shadow);
+    let received = answer_one_command(&h.state, Ok(()));
+    let response = h
+        .post_form("/actions/resync", &cookie, Some(&csrf), "")
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body(response).await;
+    assert!(html.contains("toast ok"), "{html}");
+    assert!(html.contains("Bridge resync sent."), "{html}");
+    assert!(
+        !html.contains("toast would") && !html.contains("nothing was sent"),
+        "{html}"
+    );
+    let command = received.await.expect("runtime received the command");
+    assert!(matches!(command, Command::Resync), "{command:?}");
+}
+
+#[tokio::test]
+async fn a_refused_resync_surfaces_the_runtime_reason_as_a_bad_toast() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, csrf) = h.login().await;
+    for reason in ["bridge is offline", "a resync is already running"] {
+        let _received = answer_one_command(&h.state, Err(CommandError::Invalid(reason.to_owned())));
+        let response = h
+            .post_form("/actions/resync", &cookie, Some(&csrf), "")
+            .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html = body(response).await;
+        assert!(html.contains("toast bad"), "{html}");
+        assert!(html.contains(reason), "{html}");
+        assert!(!html.contains("Bridge resync sent."), "{html}");
+    }
+}
+
+#[tokio::test]
+async fn the_drawer_resync_button_follows_the_link_in_its_own_polled_block() {
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let button = |drawer: &str| {
+        between(
+            drawer,
+            "<button type=\"button\" id=\"bridge-resync-send\"",
+            ">",
+        )
+        .to_owned()
+    };
+
+    let offline = drawer_after(&h, &cookie, |snapshot| snapshot.bridge_online = false).await;
+    let block = between(&offline, "<div id=\"bridge-resync\"", "</div>\n    <hr>");
+    // Its own poll, selecting only itself, so the raw-send inputs are never re-rendered.
+    assert!(
+        block.contains("hx-get=\"/p/bridge\" hx-trigger=\"every 3s\" hx-select=\"#bridge-resync\""),
+        "{block}"
+    );
+    assert!(!block.contains("raw-send"), "{block}");
+    assert!(block.contains("It wakes and sleeps nothing."), "{block}");
+    let disabled = button(&offline);
+    assert!(
+        disabled.contains("hx-post=\"/actions/resync\""),
+        "{disabled}"
+    );
+    assert!(disabled.contains("hx-confirm="), "{disabled}");
+    assert!(disabled.contains(" disabled"), "{disabled}");
+    assert!(
+        offline.find("id=\"bridge-info\"") < offline.find("id=\"bridge-resync\"")
+            && offline.find("id=\"bridge-resync\"") < offline.find("id=\"raw-send\""),
+        "between the status and raw send"
+    );
+
+    let online_drawer = drawer_after(&h, &cookie, online).await;
+    let enabled = button(&online_drawer);
+    assert!(!enabled.contains("disabled"), "{enabled}");
+
+    // The bridge page points at the drawer and has no button of its own.
+    let page = ok_page(&h, &cookie, "/devices/out/bridge").await;
+    assert!(!page.contains("/actions/resync"), "{page}");
+}
+
+fn identity_row(
+    id: u64,
+    reason: &str,
+    role: Option<&str>,
+    identity: crate::action::IdentityDetail,
+) -> DecisionView {
+    DecisionView {
+        id,
+        trigger: crate::action::Trigger::Frame {
+            from: identity.la.to,
+            to: 15,
+            data: "84".to_owned(),
+        },
+        role: role.map(str::to_owned),
+        from: None,
+        to: None,
+        reason: reason.to_owned(),
+        actions: vec![],
+        would: false,
+        identity: Some(Box::new(identity)),
+        ..shadow_decision()
+    }
+}
+
+fn identity_detail(
+    kind: crate::action::IdentityKind,
+    la: (u8, u8),
+    pa: (Option<&str>, Option<&str>),
+) -> crate::action::IdentityDetail {
+    use crate::action::IdentityPair;
+    crate::action::IdentityDetail {
+        kind,
+        la: IdentityPair {
+            from: la.0,
+            to: la.1,
+        },
+        pa: IdentityPair {
+            from: pa.0.map(str::to_owned),
+            to: pa.1.map(str::to_owned),
+        },
+        vendor: None,
+        osd: None,
+    }
+}
+
+#[tokio::test]
+async fn identity_rows_read_as_what_changed_in_the_list_and_their_detail() {
+    use crate::action::{IdentityKind, IdentityPair};
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let mut vendor = identity_detail(
+        IdentityKind::Replaced,
+        (11, 11),
+        (Some("2.4.0.0"), Some("2.4.0.0")),
+    );
+    vendor.vendor = Some(IdentityPair {
+        from: "0009BF".to_owned(),
+        to: "080046".to_owned(),
+    });
+    let mut osd = identity_detail(
+        IdentityKind::Replaced,
+        (4, 4),
+        (Some("2.5.0.0"), Some("2.5.0.0")),
+    );
+    osd.osd = Some(IdentityPair {
+        from: "Streamer".to_owned(),
+        to: "Player".to_owned(),
+    });
+    let cases = [
+        (
+            identity_row(
+                51,
+                "identity_moved",
+                Some("console"),
+                identity_detail(
+                    IdentityKind::LaMove,
+                    (8, 11),
+                    (Some("2.4.0.0"), Some("2.4.0.0")),
+                ),
+            ),
+            "Moved from LA 8 to LA 11 (PA 2.4.0.0)",
+            "<span class=\"mono\">la_move</span> · LA <span class=\"mono\">8 → 11</span> · PA <span class=\"mono\">2.4.0.0 → 2.4.0.0</span></p>",
+        ),
+        (
+            identity_row(
+                52,
+                "identity_moved",
+                None,
+                identity_detail(
+                    IdentityKind::PaChange,
+                    (8, 8),
+                    (Some("1.0.0.0"), Some("2.3.0.0")),
+                ),
+            ),
+            "Physical address changed 1.0.0.0 → 2.3.0.0 on LA 8",
+            "<span class=\"mono\">pa_change</span> · LA <span class=\"mono\">8 → 8</span> · PA <span class=\"mono\">1.0.0.0 → 2.3.0.0</span></p>",
+        ),
+        (
+            identity_row(53, "identity_replaced", Some("console"), vendor),
+            "LA 11 now holds a different device: vendor 0009BF → 080046",
+            " · vendor <span class=\"mono\">0009BF → 080046</span></p>",
+        ),
+        (
+            identity_row(54, "identity_replaced", Some("streamer"), osd),
+            "LA 4 now holds a different device: OSD Streamer → Player",
+            " · OSD <span class=\"mono\">Streamer → Player</span></p>",
+        ),
+        (
+            identity_row(
+                55,
+                "identity_replaced",
+                None,
+                identity_detail(IdentityKind::Replaced, (9, 9), (None, Some("3.1.0.0"))),
+            ),
+            "LA 9 now holds a different device: PA none → 3.1.0.0",
+            "<span class=\"mono\">replaced</span> · LA <span class=\"mono\">9 → 9</span> · PA <span class=\"mono\">none → 3.1.0.0</span></p>",
+        ),
+    ];
+    let mut snapshot = h.state.snapshot();
+    snapshot
+        .decisions
+        .extend(cases.iter().map(|(row, ..)| row.clone()));
+    h.state.publish(snapshot, []);
+
+    let list = ok_page(&h, &cookie, "/recorder").await;
+    for (row, summary, detail_line) in &cases {
+        let listed = row_containing(&list, &format!("<td class=\"mono\">{summary}</td>"));
+        assert!(
+            listed.contains(&format!(
+                ">{}</span> <span class=\"grp\">identity</span>",
+                row.reason
+            )),
+            "{listed}"
+        );
+        assert!(!listed.contains("not in the glossary"), "{listed}");
+        let detail = ok_page(&h, &cookie, &format!("/recorder/{}", row.id)).await;
+        assert!(detail.contains(&format!("<h1>{summary}</h1>")), "{detail}");
+        assert!(
+            detail.contains(&format!("Decision #{} · identity", row.id)),
+            "{detail}"
+        );
+        let why = between(&detail, "id=\"why\"", "</section>");
+        assert!(why.contains(detail_line), "{why}");
+        assert!(!why.contains("not in the glossary"), "{why}");
+    }
+}
+
+#[tokio::test]
+async fn rows_without_an_identity_detail_render_as_before() {
+    use crate::action::IdentityKind;
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let standby = DecisionView {
+        id: 60,
+        from: Some(RolePower::On),
+        to: Some(RolePower::Off),
+        reason: "Standby".to_owned(),
+        would: false,
+        ..shadow_decision()
+    };
+    // A stray detail on another reason never replaces the row's own reading.
+    let stray = DecisionView {
+        id: 61,
+        identity: Some(Box::new(identity_detail(
+            IdentityKind::LaMove,
+            (4, 9),
+            (None, None),
+        ))),
+        ..standby.clone()
+    };
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend([standby, stray]);
+    h.state.publish(snapshot, []);
+    let list = ok_page(&h, &cookie, "/recorder").await;
+    assert!(!list.contains("Moved from"), "{list}");
+    for id in [60, 61] {
+        let row = row_containing(&list, &format!("id=\"row-{id}\""));
+        assert!(row.contains("<td class=\"mono\">on → off</td>"), "{row}");
+        let detail = ok_page(&h, &cookie, &format!("/recorder/{id}")).await;
+        assert!(
+            detail.contains("<h1>Test Streamer went to standby</h1>"),
+            "{detail}"
+        );
+        assert!(!detail.contains("la_move"), "{detail}");
+    }
+}
+
+#[tokio::test]
+async fn the_cockpit_last_decisions_show_the_recorder_change_text() {
+    use crate::action::IdentityKind;
+    let h = harness(UNREACHABLE_ISSUER);
+    let (cookie, _) = h.login().await;
+    let moved = identity_row(
+        70,
+        "identity_moved",
+        Some("console"),
+        identity_detail(
+            IdentityKind::LaMove,
+            (8, 11),
+            (Some("2.4.0.0"), Some("2.4.0.0")),
+        ),
+    );
+    let standby = DecisionView {
+        id: 71,
+        from: Some(RolePower::On),
+        to: Some(RolePower::Off),
+        reason: "Standby".to_owned(),
+        would: false,
+        ..shadow_decision()
+    };
+    let resync = DecisionView {
+        id: 72,
+        trigger: crate::action::Trigger::Command {
+            command: Command::Resync,
+        },
+        role: None,
+        from: None,
+        to: None,
+        reason: "command_resync".to_owned(),
+        would: false,
+        ..shadow_decision()
+    };
+    let mut snapshot = h.state.snapshot();
+    snapshot.decisions.extend([moved, standby, resync]);
+    h.state.publish(snapshot, []);
+    let cockpit = ok_page(&h, &cookie, "/").await;
+    let list = ok_page(&h, &cookie, "/recorder").await;
+    for (id, cell) in [
+        (
+            70,
+            "<td class=\"mono\">Moved from LA 8 to LA 11 (PA 2.4.0.0)</td>",
+        ),
+        (71, "<td class=\"mono\">on → off</td>"),
+    ] {
+        let recent = row_containing(&cockpit, &format!("id=\"recent-{id}\""));
+        assert!(recent.contains(cell), "{recent}");
+        let listed = row_containing(&list, &format!("id=\"row-{id}\""));
+        assert!(listed.contains(cell), "{listed}");
+    }
+    let recent = row_containing(&cockpit, "id=\"recent-72\"");
+    assert!(
+        recent.contains("<td class=\"mono\"><span class=\"dim\">—</span></td>"),
+        "{recent}"
+    );
 }

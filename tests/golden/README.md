@@ -1,5 +1,34 @@
 # Golden replay corpus
 
+## 2026-11-20 — Identity rows and coalesced boot statuses
+
+Ran `cargo test --locked --test golden` without blessing first. Exactly two
+cases differ; all other expected streams remain byte-identical:
+
+- **`aether-standby-retry`: 10 → 12 lines.** New line 2, id 2, at
+  10:17:49.583 UTC: `identity_replaced`, LA 8 → 8, PA 2.3.0.0 → 2.4.0.0,
+  role null. LA 8 held the unverified restored Console A entry, so no role
+  was bound to that destination. New line 3, id 3, same frame/time:
+  `identity_moved`, LA 11 → 8, PA 2.4.0.0 unchanged, role `console_b` from
+  the resulting binding. The accepted physical report `84240004` replaces
+  the destination before inheriting Console B's restored identity from LA 11.
+  Both rows have no actions, transitions or expectations and verdict `none`.
+  Original line 1 stays unchanged. Original lines 2–10 become lines 4–12;
+  decision ids 2–7 become 4–9, with corresponding parent/verdict references
+  shifted by two. Every other field of every original row is unchanged.
+- **`aether-streamer-to-console-pause-standby`: still 19 lines.** Only line 1's
+  `startup_source_ignored.at` moves 22:07:28.095 → 22:07:28.017 UTC. Capture
+  boot 148's first status is 22:07:23.017Z, middle 22:07:23.028Z, last
+  22:07:23.095Z. First + five-second resync window = 22:07:28.017Z: exactly
+  78 ms earlier because queued statuses no longer restart the window.
+  Id, trigger, role, reason, actions and verdict are identical; lines 2–19
+  are unchanged. This exact resync-derived timestamp difference was approved.
+
+The existing replay test
+`destination_identity_keys_prevent_inheritance_without_physical_replacement`
+reaches eviction without inheritance. Its `identity_lost`-only row expectation
+is intentionally unchanged: the new identity-detail reporting excludes that path.
+
 ## 2026-11-16 — Trusted probe standby backstop
 
 **`aether-console-sleep-probe-backstop` — 4 decisions + 2 verdict lines.**
