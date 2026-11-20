@@ -1484,6 +1484,9 @@ fn reload_binding_does_not_replay_previous_address(with_cec_off: bool) {
     config.device.retain(|d| d.role == "console_a");
     engine.handle(Event::ConfigReloaded(config.clone().into()), now, wall());
     frame(&mut engine, now, 8, 15, "84230004");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert!(frame(&mut engine, now, 8, 0, "04").is_empty());
+    assert!(engine.decisions.is_empty());
     frame(&mut engine, now, 11, 15, "84250004");
     frame(&mut engine, now, 11, 0, "36");
     assert_eq!(engine.roles["console_a"].power, RolePower::On);
@@ -1498,13 +1501,14 @@ fn reload_binding_does_not_replay_previous_address(with_cec_off: bool) {
     if with_cec_off {
         frame(&mut engine, now + Duration::from_secs(5), 11, 0, "36");
     }
+    engine.handle(Event::Tick, now + Duration::from_secs(7), wall());
     config.device[0].matches.physical = Some("2.3.0.0".into());
     engine.handle(
         Event::ConfigReloaded(config.into()),
-        now + Duration::from_secs(6),
+        now + Duration::from_secs(8),
         wall(),
     );
-    let actions = engine.handle(Event::Tick, now + Duration::from_secs(9), wall());
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(11), wall());
     assert_eq!(
         engine.roles["console_a"].power,
         RolePower::Off,
@@ -1512,6 +1516,52 @@ fn reload_binding_does_not_replay_previous_address(with_cec_off: bool) {
         engine.decisions
     );
     assert!(!actions.contains(&Action::WakeTv));
+    assert!(engine.decisions.is_empty());
+}
+
+#[test]
+fn reload_binding_discards_old_on_after_unbinding() {
+    let (mut engine, now) = setup();
+    let mut config = (*engine.config).clone();
+    config.device.retain(|d| d.role == "console_a");
+    engine.handle(Event::ConfigReloaded(config.clone().into()), now, wall());
+    frame(&mut engine, now, 8, 15, "84230004");
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    assert!(frame(&mut engine, now, 8, 0, "04").is_empty());
+    assert!(engine.decisions.is_empty());
+    config.device[0].matches.physical = Some("6.0.0.0".into());
+    engine.handle(
+        Event::ConfigReloaded(config.clone().into()),
+        now + Duration::from_secs(1),
+        wall(),
+    );
+    engine.handle(Event::Tick, now + Duration::from_secs(4), wall());
+    assert!(!engine.warming);
+    assert!(!engine.identity.roles.contains_key("console_a"));
+    assert_eq!(engine.roles["console_a"].power, RolePower::On);
+    engine.handle(
+        Event::Command(Command::AllOff),
+        now + Duration::from_secs(5),
+        wall(),
+    );
+    assert_eq!(engine.roles["console_a"].power, RolePower::Off);
+    engine.handle(Event::Tick, now + Duration::from_secs(8), wall());
+    config.device[0].matches.physical = Some("2.3.0.0".into());
+    engine.handle(
+        Event::ConfigReloaded(config.into()),
+        now + Duration::from_secs(9),
+        wall(),
+    );
+    let actions = engine.handle(Event::Tick, now + Duration::from_secs(12), wall());
+    assert_eq!(engine.identity.roles["console_a"], 8);
+    assert_eq!(
+        engine.roles["console_a"].power,
+        RolePower::Off,
+        "stale buffered On replayed: {:?}; actions: {actions:?}",
+        engine.decisions
+    );
+    assert!(!actions.contains(&Action::WakeTv));
+    assert!(engine.decisions.is_empty());
 }
 
 #[test]
